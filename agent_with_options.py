@@ -51,7 +51,7 @@ the JSON. The JSON must have exactly these fields:
 
 
 def get_nearest_expiry() -> str:
-    """Get the nearest monthly options expiry (last Thursday of the month) in dd-Mon-yyyy format."""
+    """Get the nearest monthly options expiry (last Thursday of the month) in DDMONYYYY format."""
     from datetime import date, timedelta
     import calendar
 

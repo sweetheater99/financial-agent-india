@@ -74,11 +74,15 @@ def resolve_equity_token(smart_api, symbol: str) -> str | None:
     try:
         resp = smart_api.searchScrip("NSE", symbol)
         if resp and resp.get("data"):
+            # Prefer -EQ suffix (equity segment), fall back to first result
+            token = None
             for match in resp["data"]:
-                tsym = match.get("tradingsymbol", "")
-                if tsym.endswith("-EQ") or match.get("exchange") == "NSE":
-                    return match.get("symboltoken")
-            return resp["data"][0].get("symboltoken")
+                if match.get("tradingsymbol", "").endswith("-EQ"):
+                    token = match.get("symboltoken")
+                    break
+            if not token:
+                token = resp["data"][0].get("symboltoken")
+            return token
     except Exception as e:
         print(f"  searchScrip failed for {symbol}: {e}")
     return None

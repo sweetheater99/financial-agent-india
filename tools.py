@@ -94,7 +94,7 @@ TOOL_SCHEMAS = [
                 },
                 "expiry": {
                     "type": "string",
-                    "description": "Expiry date (DD-Mon-YYYY, e.g. '27-Feb-2025'). Empty for nearest.",
+                    "description": "Expiry date (DDMONYYYY, e.g. '26FEB2026'). Empty for nearest.",
                 },
             },
             "required": ["symbol"],
@@ -393,26 +393,9 @@ def handle_get_historical_data(smart_api, params):
         return {"error": str(e)}
 
 
-def get_nearest_expiry() -> str:
-    """Get the nearest monthly options expiry (last Thursday of the month) in dd-Mon-yyyy format."""
-    from datetime import date, timedelta
-    import calendar
-
-    today = date.today()
-    for month_offset in range(3):
-        y = today.year + (today.month + month_offset - 1) // 12
-        m = (today.month + month_offset - 1) % 12 + 1
-        last_day = calendar.monthrange(y, m)[1]
-        d = date(y, m, last_day)
-        while d.weekday() != 3:
-            d -= timedelta(days=1)
-        if d >= today:
-            return d.strftime("%d%b%Y").upper()
-    return ""
-
-
 def handle_get_option_chain(smart_api, params):
     symbol = params["symbol"]
+    from agent_with_options import get_nearest_expiry
     expiry = params.get("expiry", "") or get_nearest_expiry()
     try:
         response = smart_api.optionGreek({

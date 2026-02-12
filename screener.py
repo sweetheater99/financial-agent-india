@@ -305,11 +305,10 @@ def enrich_candidates(smart_api, candidates: list[dict]) -> list[dict]:
         try:
             search_resp = smart_api.searchScrip("NSE", symbol)
             if search_resp and search_resp.get("data"):
-                # Find the equity match (symbol ending in -EQ)
+                # Prefer -EQ suffix (equity segment), fall back to first result
                 token = None
                 for match in search_resp["data"]:
-                    tsym = match.get("tradingsymbol", "")
-                    if tsym.endswith("-EQ") or match.get("exchange") == "NSE":
+                    if match.get("tradingsymbol", "").endswith("-EQ"):
                         token = match.get("symboltoken")
                         break
                 if not token:
