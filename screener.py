@@ -17,6 +17,7 @@ import re
 import sys
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import config
 from connect import get_session
@@ -75,6 +76,8 @@ SIGNAL_WEIGHTS = {
     "PercPriceGainers": 1.0,
     "PercPriceLosers": 1.0,
 }
+
+SNAPSHOT_DIR = Path(__file__).parent / "data" / "snapshots"
 
 # Symbols to skip equity enrichment for (indices)
 INDEX_SYMBOLS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"}
@@ -332,6 +335,35 @@ def score_signals(signals: dict[str, list]) -> list[dict]:
     # Sort by absolute score, then by number of categories
     candidates.sort(key=lambda c: (c["score"], len(c["categories"])), reverse=True)
     return candidates
+
+
+def save_snapshot(candidates: list[dict], signals: dict[str, list]) -> Path:
+    """Save daily screener snapshot to data/snapshots/YYYY-MM-DD.json.
+
+    Saves ALL candidates (not just top N), stripped of bulky 'details' and
+    'candles' dicts to keep snapshots lean. Later runs on the same day
+    overwrite earlier snapshots (latest signals most relevant).
+    """
+    SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    today = datetime.now().strftime("%Y-%m-%d")
+    path = SNAPSHOT_DIR / f"{today}.json"
+
+    lean_candidates = []
+    for c in candidates:
+        lean = {k: v for k, v in c.items() if k not in ("details", "candles")}
+        lean_candidates.append(lean)
+
+    snapshot = {
+        "date": today,
+        "timestamp": datetime.now().isoformat(),
+        "signal_counts": {dt: len(signals.get(dt, [])) for dt in ALL_SIGNAL_NAMES},
+        "total_candidates": len(lean_candidates),
+        "candidates": lean_candidates,
+    }
+
+    path.write_text(json.dumps(snapshot, indent=2, default=str))
+    print(f"  Snapshot saved: {path}")
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -695,6 +727,9 @@ def run_screener(smart_api, top_n: int = 5, raw_only: bool = False) -> dict:
 
     if not candidates:
         return {"error": "No scorable candidates found."}
+
+    # Save snapshot for backtesting (all candidates, before filtering)
+    save_snapshot(candidates, all_signals)
 
     if raw_only:
         print_raw_signals(all_signals, candidates)
