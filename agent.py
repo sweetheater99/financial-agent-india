@@ -70,11 +70,7 @@ def analyze_stock(candles: list, symbol: str) -> dict:
 
     Returns a dict with trend, support, resistance, volume info, summary, and confidence.
     """
-    if not config.ANTHROPIC_API_KEY:
-        print("ANTHROPIC_API_KEY is not set in .env")
-        sys.exit(1)
-
-    client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+    client = config.get_anthropic_client()
 
     data_table = format_candles_for_prompt(candles, symbol)
     user_message = (

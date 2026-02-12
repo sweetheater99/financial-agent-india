@@ -136,11 +136,7 @@ def analyze_with_options(candles: list, options_data: list | None, symbol: str) 
     """
     Send both price data and options data to Claude for cross-referenced analysis.
     """
-    if not config.ANTHROPIC_API_KEY:
-        print("ANTHROPIC_API_KEY is not set in .env")
-        sys.exit(1)
-
-    client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+    client = config.get_anthropic_client()
 
     price_table = format_candles_for_prompt(candles, symbol)
 
