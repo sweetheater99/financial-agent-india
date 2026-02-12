@@ -314,9 +314,7 @@ def handle_get_quote(smart_api, params):
     symbol = params["symbol"]
     token = params["token"]
     try:
-        # Try ltpData first for a quick quote
-        ltp_resp = smart_api.ltpData(exchange, symbol, token)
-        # Also get full market data for more details
+        # Try full market data first (includes LTP + bid/ask + volume)
         try:
             market_resp = smart_api.getMarketData({
                 "mode": "FULL",
@@ -342,17 +340,19 @@ def handle_get_quote(smart_api, params):
         except Exception:
             pass
 
-        # Fall back to LTP data
+        # Fall back to LTP data if full market data failed
+        ltp_resp = smart_api.ltpData(exchange, symbol, token)
         if ltp_resp and ltp_resp.get("data"):
+            data = ltp_resp["data"]
             return {
                 "symbol": symbol,
                 "token": token,
                 "exchange": exchange,
-                "ltp": ltp_resp["data"].get("ltp"),
-                "open": ltp_resp["data"].get("open"),
-                "high": ltp_resp["data"].get("high"),
-                "low": ltp_resp["data"].get("low"),
-                "close": ltp_resp["data"].get("close"),
+                "ltp": data.get("ltp"),
+                "open": data.get("open"),
+                "high": data.get("high"),
+                "low": data.get("low"),
+                "close": data.get("close"),
             }
         return {"error": "No quote data returned"}
     except Exception as e:

@@ -310,15 +310,21 @@ def build_watchdog_prompt(
         # Raw signal details
         for cat in item["signals"]:
             det = item["signal_details"].get(cat, {})
-            pct = det.get("percentChange") or det.get("perChange")
-            oi = det.get("opnInterest") or det.get("openInterest")
-            ltp = det.get("ltp") or det.get("lastTradedPrice")
+            pct = det.get("percentChange")
+            if pct is None:
+                pct = det.get("perChange")
+            oi = det.get("opnInterest")
+            if oi is None:
+                oi = det.get("openInterest")
+            ltp = det.get("ltp")
+            if ltp is None:
+                ltp = det.get("lastTradedPrice")
             parts = []
-            if ltp:
+            if ltp is not None:
                 parts.append(f"LTP={ltp}")
-            if pct:
+            if pct is not None:
                 parts.append(f"Change={pct}%")
-            if oi:
+            if oi is not None:
                 parts.append(f"OI={oi}")
             if parts:
                 lines.append(f"    {cat}: {', '.join(parts)}")

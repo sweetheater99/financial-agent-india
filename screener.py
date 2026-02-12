@@ -261,7 +261,9 @@ def score_signals(signals: dict[str, list]) -> list[dict]:
                      "ShortBuildUp", "ShortCovering", "LongUnwinding"]:
             if cat in data["details"]:
                 rec = data["details"][cat]
-                pct = rec.get("percentChange") or rec.get("perChange")
+                pct = rec.get("percentChange")
+                if pct is None:
+                    pct = rec.get("perChange")
                 if pct is not None:
                     try:
                         price_change_pct = float(pct)
@@ -395,15 +397,23 @@ def build_claude_prompt(candidates: list[dict], pcr_data: dict | None,
         for cat in cand["categories"]:
             if cat in cand.get("details", {}):
                 rec = cand["details"][cat]
-                oi_val = rec.get("opnInterest") or rec.get("openInterest") or rec.get("oi")
-                pct = rec.get("percentChange") or rec.get("perChange")
-                ltp = rec.get("ltp") or rec.get("lastTradedPrice")
+                oi_val = rec.get("opnInterest")
+                if oi_val is None:
+                    oi_val = rec.get("openInterest")
+                if oi_val is None:
+                    oi_val = rec.get("oi")
+                pct = rec.get("percentChange")
+                if pct is None:
+                    pct = rec.get("perChange")
+                ltp = rec.get("ltp")
+                if ltp is None:
+                    ltp = rec.get("lastTradedPrice")
                 detail_parts = []
-                if ltp:
+                if ltp is not None:
                     detail_parts.append(f"LTP={ltp}")
-                if pct:
+                if pct is not None:
                     detail_parts.append(f"Change={pct}%")
-                if oi_val:
+                if oi_val is not None:
                     detail_parts.append(f"OI={oi_val}")
                 if detail_parts:
                     lines.append(f"    {cat}: {', '.join(detail_parts)}")
