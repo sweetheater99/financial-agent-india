@@ -83,6 +83,31 @@ INDEX_SYMBOLS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"}
 # e.g. RELIANCE26FEB26FUT -> RELIANCE, M&M26FEB26FUT -> M&M
 SYMBOL_REGEX = re.compile(r"^([A-Z&]+)\d")
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def get_field(record: dict, *names):
+    """Get the first non-None value from a record using multiple possible field names.
+
+    SmartAPI uses inconsistent names for the same data (e.g. percentChange vs
+    perChange, opnInterest vs openInterest vs oi). This avoids scattered
+    None-check chains throughout the codebase.
+    """
+    for name in names:
+        val = record.get(name)
+        if val is not None:
+            return val
+    return None
+
+
+def clear_signal_cache() -> None:
+    """Manually invalidate the signal cache (e.g. for testing or forced refresh)."""
+    _signal_cache["data"] = None
+    _signal_cache["timestamp"] = None
+
+
 SYSTEM_PROMPT = """You are a derivatives market analyst specializing in Indian F&O (NSE).
 
 You receive pre-processed screener data: stocks that appeared in today's gainers/losers
@@ -177,7 +202,7 @@ def fetch_all_signals(smart_api, use_cache: bool = True) -> dict[str, list]:
         except Exception as e:
             print(f"  {canonical}: FAILED ({e})")
             signals[canonical] = []
-        time.sleep(1.5)
+        time.sleep(config.API_DELAY)
 
     # Fetch buildup/unwinding patterns via oIBuildup endpoint
     for dtype in OI_BUILDUP_TYPES:
@@ -196,7 +221,7 @@ def fetch_all_signals(smart_api, use_cache: bool = True) -> dict[str, list]:
         except Exception as e:
             print(f"  {canonical}: FAILED ({e})")
             signals[canonical] = []
-        time.sleep(1.5)
+        time.sleep(config.API_DELAY)
 
     _signal_cache["data"] = signals
     _signal_cache["timestamp"] = datetime.now()
@@ -285,9 +310,7 @@ def score_signals(signals: dict[str, list]) -> list[dict]:
                      "ShortBuildUp", "ShortCovering", "LongUnwinding"]:
             if cat in data["details"]:
                 rec = data["details"][cat]
-                pct = rec.get("percentChange")
-                if pct is None:
-                    pct = rec.get("perChange")
+                pct = get_field(rec, "percentChange", "perChange")
                 if pct is not None:
                     try:
                         price_change_pct = float(pct)
@@ -368,7 +391,7 @@ def enrich_candidates(smart_api, candidates: list[dict]) -> list[dict]:
             cand["candles"] = None
             print(f"  {symbol}: enrichment failed ({e})")
 
-        time.sleep(1.5)
+        time.sleep(config.API_DELAY)
 
     return candidates
 
@@ -421,17 +444,9 @@ def build_claude_prompt(candidates: list[dict], pcr_data: dict | None,
         for cat in cand["categories"]:
             if cat in cand.get("details", {}):
                 rec = cand["details"][cat]
-                oi_val = rec.get("opnInterest")
-                if oi_val is None:
-                    oi_val = rec.get("openInterest")
-                if oi_val is None:
-                    oi_val = rec.get("oi")
-                pct = rec.get("percentChange")
-                if pct is None:
-                    pct = rec.get("perChange")
-                ltp = rec.get("ltp")
-                if ltp is None:
-                    ltp = rec.get("lastTradedPrice")
+                oi_val = get_field(rec, "opnInterest", "openInterest", "oi")
+                pct = get_field(rec, "percentChange", "perChange")
+                ltp = get_field(rec, "ltp", "lastTradedPrice")
                 detail_parts = []
                 if ltp is not None:
                     detail_parts.append(f"LTP={ltp}")
@@ -478,7 +493,7 @@ def analyze_with_claude(candidates: list[dict], pcr_data: dict | None,
 
     try:
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model=config.CLAUDE_MODEL,
             max_tokens=2048,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_message}],

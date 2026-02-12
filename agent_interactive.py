@@ -115,7 +115,7 @@ def run_agent_loop_sdk(smart_api, client, dry_run: bool, max_rounds: int = DEFAU
         for _round in range(max_rounds):
             try:
                 response = client.messages.create(
-                    model="claude-sonnet-4-20250514",
+                    model=config.CLAUDE_MODEL,
                     max_tokens=4096,
                     system=SYSTEM_PROMPT,
                     tools=TOOL_SCHEMAS,
@@ -187,7 +187,7 @@ def run_agent_loop_cli(smart_api, client, dry_run: bool, max_rounds: int = DEFAU
 
             try:
                 response = client.messages.create(
-                    model="claude-sonnet-4-20250514",
+                    model=config.CLAUDE_MODEL,
                     max_tokens=4096,
                     system=CLI_SYSTEM_PROMPT,
                     messages=[{"role": "user", "content": prompt_text}],

@@ -32,6 +32,7 @@ from screener import (
     extract_underlying,
     fetch_all_signals,
     fetch_index_pcr,
+    get_field,
 )
 from fetch_data import fetch_candles
 from agent_with_options import (
@@ -173,7 +174,7 @@ def fetch_portfolio(smart_api) -> tuple[list[dict], list[dict]]:
     except Exception as e:
         print(f"  Holdings fetch failed: {e}")
 
-    time.sleep(1.5)
+    time.sleep(config.API_DELAY)
 
     # Positions (F&O / intraday)
     try:
@@ -315,15 +316,9 @@ def build_watchdog_prompt(
         # Raw signal details
         for cat in item["signals"]:
             det = item["signal_details"].get(cat, {})
-            pct = det.get("percentChange")
-            if pct is None:
-                pct = det.get("perChange")
-            oi = det.get("opnInterest")
-            if oi is None:
-                oi = det.get("openInterest")
-            ltp = det.get("ltp")
-            if ltp is None:
-                ltp = det.get("lastTradedPrice")
+            pct = get_field(det, "percentChange", "perChange")
+            oi = get_field(det, "opnInterest", "openInterest")
+            ltp = get_field(det, "ltp", "lastTradedPrice")
             parts = []
             if ltp is not None:
                 parts.append(f"LTP={ltp}")
@@ -379,7 +374,7 @@ def enrich_flagged_with_candles(
         sym = item["symbol"]
         token = resolve_equity_token(smart_api, sym)
         if token:
-            time.sleep(1.5)
+            time.sleep(config.API_DELAY)
             candles = fetch_candles(smart_api, symbol=sym, token=token, days=7)
             if candles:
                 candle_data[sym] = candles
@@ -388,7 +383,7 @@ def enrich_flagged_with_candles(
                 print(f"    {sym}: no candle data")
         else:
             print(f"    {sym}: could not resolve token")
-        time.sleep(1.5)
+        time.sleep(config.API_DELAY)
 
     return candle_data
 
@@ -443,7 +438,7 @@ def run_watchdog(smart_api, detailed: bool = False) -> dict:
     client = config.get_anthropic_client()
     try:
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model=config.CLAUDE_MODEL,
             max_tokens=2048,
             system=WATCHDOG_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
@@ -686,7 +681,7 @@ def run_deep_dive(smart_api, symbol: str, token: str | None = None) -> dict:
         if not token:
             return {"error": f"Could not resolve token for {symbol}. Check the symbol name."}
         print(f"  Token: {token}")
-        time.sleep(1.5)
+        time.sleep(config.API_DELAY)
     else:
         print(f"\nStep 1: Using provided token {token} for {symbol}")
 
@@ -697,7 +692,7 @@ def run_deep_dive(smart_api, symbol: str, token: str | None = None) -> dict:
         print(f"  Got {len(candles)} candles")
     else:
         print(f"  No candle data returned")
-    time.sleep(1.5)
+    time.sleep(config.API_DELAY)
 
     # Step 3: Fetch option chain
     print(f"\nStep 3: Fetching option chain...")
@@ -706,7 +701,7 @@ def run_deep_dive(smart_api, symbol: str, token: str | None = None) -> dict:
         print(f"  Got {len(options_data)} strikes")
     else:
         print(f"  No option chain (stock may not have F&O contracts)")
-    time.sleep(1.5)
+    time.sleep(config.API_DELAY)
 
     # Step 4: Fetch F&O signals
     print(f"\nStep 4: Fetching F&O signals...")
@@ -724,7 +719,7 @@ def run_deep_dive(smart_api, symbol: str, token: str | None = None) -> dict:
         print(f"  PCR: {pcr_data.get('pcr', 'N/A')}")
     else:
         print(f"  No PCR data for {symbol}")
-    time.sleep(1.5)
+    time.sleep(config.API_DELAY)
 
     # Step 6: Claude analysis
     print(f"\nStep 6: Sending to Claude for analysis...")
@@ -736,7 +731,7 @@ def run_deep_dive(smart_api, symbol: str, token: str | None = None) -> dict:
     client = config.get_anthropic_client()
     try:
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model=config.CLAUDE_MODEL,
             max_tokens=2048,
             system=DEEPDIVE_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],

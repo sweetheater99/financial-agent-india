@@ -185,7 +185,7 @@ def analyze_with_options(candles: list, options_data: list | None, symbol: str) 
 
     try:
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model=config.CLAUDE_MODEL,
             max_tokens=1500,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_message}],

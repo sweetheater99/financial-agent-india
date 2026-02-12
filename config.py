@@ -22,6 +22,10 @@ ANGELONE_PASSWORD = os.getenv("ANGELONE_PASSWORD")
 ANGELONE_TOTP_SECRET = os.getenv("ANGELONE_TOTP_SECRET")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
+# Centralized defaults — change here to update all modules at once
+CLAUDE_MODEL = "claude-sonnet-4-20250514"
+API_DELAY = 1.5  # seconds between SmartAPI calls to avoid rate-limiting
+
 # Whether claude CLI is available (for Max subscription users)
 CLAUDE_CLI_AVAILABLE = shutil.which("claude") is not None
 
@@ -54,7 +58,7 @@ class ClaudeCLIClient:
         self.messages = self._Messages()
 
     class _Messages:
-        def create(self, *, model="claude-sonnet-4-20250514", max_tokens=1024,
+        def create(self, *, model=None, max_tokens=1024,
                    system=None, messages=None, **kwargs):
             # Build the user prompt from messages
             user_text = ""
@@ -64,14 +68,14 @@ class ClaudeCLIClient:
 
             cmd = ["claude", "-p", "--output-format", "json", "--no-session-persistence"]
 
-            if model:
-                # Map model names to claude CLI model aliases
-                model_map = {
-                    "claude-sonnet-4-20250514": "sonnet",
-                    "claude-opus-4-20250514": "opus",
-                    "claude-haiku-3-5-20241022": "haiku",
-                }
-                cmd.extend(["--model", model_map.get(model, model)])
+            # Map model names to claude CLI model aliases
+            model_name = model or CLAUDE_MODEL
+            model_map = {
+                "claude-sonnet-4-20250514": "sonnet",
+                "claude-opus-4-20250514": "opus",
+                "claude-haiku-3-5-20241022": "haiku",
+            }
+            cmd.extend(["--model", model_map.get(model_name, model_name)])
 
             if system:
                 cmd.extend(["--system-prompt", system])

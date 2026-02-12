@@ -339,7 +339,7 @@ def handle_search_stock(smart_api, params):
             return {"matches": matches, "count": len(matches)}
         return {"matches": [], "count": 0, "message": f"No results for '{query}' on {exchange}"}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": f"searchScrip({exchange}, {query}) failed: {e}"}
 
 
 def handle_get_quote(smart_api, params):
@@ -387,9 +387,9 @@ def handle_get_quote(smart_api, params):
                 "low": data.get("low"),
                 "close": data.get("close"),
             }
-        return {"error": "No quote data returned"}
+        return {"error": f"No quote data for {symbol} (token={token}) on {exchange}"}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": f"get_quote({symbol}, token={token}) failed: {e}"}
 
 
 def handle_get_historical_data(smart_api, params):
@@ -421,9 +421,9 @@ def handle_get_historical_data(smart_api, params):
                     "volume": c[5],
                 })
             return {"candles": formatted, "count": len(formatted), "interval": interval}
-        return {"candles": [], "count": 0, "message": "No data returned"}
+        return {"candles": [], "count": 0, "message": f"No candle data for token={token} ({interval}, {days}d)"}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": f"getCandleData(token={token}, {interval}, {days}d) failed: {e}"}
 
 
 def handle_get_option_chain(smart_api, params):
@@ -455,9 +455,9 @@ def handle_get_option_chain(smart_api, params):
                     "pe_ltp": pe.get("ltp", 0),
                 })
             return {"options": summary, "count": len(summary), "symbol": symbol}
-        return {"options": [], "count": 0, "message": "No option chain data returned"}
+        return {"options": [], "count": 0, "message": f"No option chain for {symbol} (expiry={expiry}). May be after-hours or non-F&O stock."}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": f"optionGreek({symbol}, expiry={expiry}) failed: {e}"}
 
 
 def handle_get_gainers_losers(smart_api, params):
@@ -479,9 +479,9 @@ def handle_get_gainers_losers(smart_api, params):
             })
         if response and response.get("data"):
             return {"data": response["data"][:10], "type": data_type}
-        return {"data": [], "message": "No data returned"}
+        return {"data": [], "message": f"No data for {data_type}"}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": f"gainersLosers({data_type}) failed: {e}"}
 
 
 def handle_get_pcr(smart_api, params):
@@ -496,9 +496,9 @@ def handle_get_pcr(smart_api, params):
             # Symbol not found — return all available
             return {"pcr_data": response["data"][:5], "symbol": symbol,
                     "message": f"'{symbol}' not found, showing top results"}
-        return {"pcr_data": None, "message": "No PCR data returned"}
+        return {"pcr_data": None, "message": "No PCR data returned from API"}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": f"putCallRatio() failed: {e}"}
 
 
 def handle_get_holdings(smart_api, _params):
@@ -520,7 +520,7 @@ def handle_get_holdings(smart_api, _params):
             return {"holdings": summary, "count": len(summary), "totals": total_value}
         return {"holdings": [], "count": 0, "message": "No holdings found"}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": f"allholding() failed: {e}"}
 
 
 def handle_get_positions(smart_api, _params):
@@ -530,7 +530,7 @@ def handle_get_positions(smart_api, _params):
             return {"positions": response["data"], "count": len(response["data"])}
         return {"positions": [], "count": 0, "message": "No open positions"}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": f"position() failed: {e}"}
 
 
 def handle_get_order_book(smart_api, _params):
@@ -551,7 +551,7 @@ def handle_get_order_book(smart_api, _params):
             return {"orders": orders, "count": len(orders)}
         return {"orders": [], "count": 0, "message": "No orders today"}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": f"orderBook() failed: {e}"}
 
 
 def handle_get_margin(smart_api, _params):
@@ -566,9 +566,9 @@ def handle_get_margin(smart_api, _params):
                 "used_margin": d.get("utiliseddebits"),
                 "net": d.get("net"),
             }
-        return {"error": "No margin data returned"}
+        return {"error": "No margin data returned from rmsLimit()"}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": f"rmsLimit() failed: {e}"}
 
 
 def handle_place_order(smart_api, params, dry_run=True):
@@ -580,6 +580,12 @@ def handle_place_order(smart_api, params, dry_run=True):
     price = params.get("price", 0)
     exchange = params.get("exchange", "NSE")
     product_type = params.get("product_type", "DELIVERY")
+
+    # Input validation
+    if not isinstance(qty, (int, float)) or qty <= 0:
+        return {"status": "REJECTED", "error": f"quantity must be > 0, got {qty}"}
+    if order_type == "LIMIT" and (not isinstance(price, (int, float)) or price <= 0):
+        return {"status": "REJECTED", "error": f"LIMIT price must be > 0, got {price}"}
 
     order_params = {
         "variety": "NORMAL",
@@ -613,7 +619,7 @@ def handle_place_order(smart_api, params, dry_run=True):
             "message": f"Order placed: {txn_type} {qty}x {symbol}",
         }
     except Exception as e:
-        return {"status": "FAILED", "error": str(e)}
+        return {"status": "FAILED", "error": f"placeOrder({txn_type} {qty}x {symbol}) failed: {e}"}
 
 
 def handle_search_news(_smart_api, params):
@@ -635,7 +641,7 @@ def handle_search_news(_smart_api, params):
     except ImportError:
         return {"error": "duckduckgo-search not installed. Run: pip install duckduckgo-search"}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": f"search_news({query}) failed: {e}"}
 
 
 def handle_run_screener(smart_api, params):
@@ -646,7 +652,7 @@ def handle_run_screener(smart_api, params):
         result = run_screener(smart_api, top_n=top_n, raw_only=raw_only)
         return result
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": f"run_screener(top_n={top_n}) failed: {e}"}
 
 
 def handle_portfolio_watchdog(smart_api, params):
@@ -656,7 +662,7 @@ def handle_portfolio_watchdog(smart_api, params):
         result = run_watchdog(smart_api, detailed=detailed)
         return result
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": f"portfolio_watchdog(detailed={detailed}) failed: {e}"}
 
 
 def handle_deep_dive_stock(smart_api, params):
@@ -667,7 +673,7 @@ def handle_deep_dive_stock(smart_api, params):
         result = run_deep_dive(smart_api, symbol, token=token)
         return result
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": f"deep_dive({symbol}) failed: {e}"}
 
 
 # ---------------------------------------------------------------------------

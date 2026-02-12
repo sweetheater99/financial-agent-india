@@ -84,7 +84,7 @@ def analyze_stock(candles: list, symbol: str) -> dict:
 
     try:
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model=config.CLAUDE_MODEL,
             max_tokens=1024,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_message}],
