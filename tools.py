@@ -455,7 +455,10 @@ def handle_get_option_chain(smart_api, params):
                     "pe_ltp": pe.get("ltp", 0),
                 })
             return {"options": summary, "count": len(summary), "symbol": symbol}
-        return {"options": [], "count": 0, "message": f"No option chain for {symbol} (expiry={expiry}). May be after-hours or non-F&O stock."}
+        from config import is_market_open
+        _open, _status = is_market_open()
+        hint = f" {_status}." if not _open else ""
+        return {"options": [], "count": 0, "message": f"No option chain for {symbol} (expiry={expiry}).{hint} May be after-hours or non-F&O stock."}
     except Exception as e:
         return {"error": f"optionGreek({symbol}, expiry={expiry}) failed: {e}"}
 

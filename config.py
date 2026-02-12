@@ -135,6 +135,33 @@ def validate() -> bool:
     return True
 
 
+def is_market_open(_now=None) -> tuple[bool, str]:
+    """Check if NSE market is currently open.
+
+    NSE trading hours: Mon-Fri 9:15 AM – 3:30 PM IST (UTC+5:30).
+    Returns (is_open, status_message).
+    """
+    from datetime import datetime, timezone, timedelta
+
+    ist = timezone(timedelta(hours=5, minutes=30))
+    now = _now if _now is not None else datetime.now(ist)
+
+    # Weekend check
+    if now.weekday() >= 5:  # 5=Saturday, 6=Sunday
+        day_name = "Saturday" if now.weekday() == 5 else "Sunday"
+        return (False, f"Market closed ({day_name})")
+
+    market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+
+    if now < market_open:
+        return (False, f"Market closed (opens at 9:15 AM IST, current time {now.strftime('%H:%M')} IST)")
+    if now >= market_close:
+        return (False, f"Market closed (after 3:30 PM IST, current time {now.strftime('%H:%M')} IST)")
+
+    return (True, "Market is open")
+
+
 if __name__ == "__main__":
     if validate():
         auth_method = "API key" if ANTHROPIC_API_KEY else "Claude Code CLI (Max subscription)"

@@ -77,6 +77,11 @@ def fetch_option_chain(smart_api, symbol: str, token: str, exchange: str = "NFO"
     Returns the raw option chain response, or None on failure.
     """
     print(f"Fetching option chain for {symbol}...")
+
+    is_open, market_status = config.is_market_open()
+    if not is_open:
+        print(f"  Warning: {market_status} — option chain data may be unavailable or stale.")
+
     expiry = get_nearest_expiry()
     print(f"Using expiry: {expiry}")
 

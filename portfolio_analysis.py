@@ -695,6 +695,9 @@ def run_deep_dive(smart_api, symbol: str, token: str | None = None) -> dict:
     time.sleep(config.API_DELAY)
 
     # Step 3: Fetch option chain
+    is_open, market_status = config.is_market_open()
+    if not is_open:
+        print(f"\n  Warning: {market_status} — option chain data may be unavailable or stale.")
     print(f"\nStep 3: Fetching option chain...")
     options_data = fetch_option_chain(smart_api, symbol, token)
     if options_data:
