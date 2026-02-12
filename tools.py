@@ -431,19 +431,13 @@ def handle_get_gainers_losers(smart_api, params):
     data_type = params["data_type"]
     exchange = params.get("exchange", "NSE")
 
-    # Buildup types use oIBuildup endpoint with space-separated names
-    OI_BUILDUP_MAP = {
-        "LongBuildUp": "Long Built Up",
-        "ShortBuildUp": "Short Built Up",
-        "LongUnwinding": "Long Unwinding",
-        "ShortCovering": "Short Covering",
-    }
+    from screener import BUILDUP_API_NAMES
 
     try:
-        if data_type in OI_BUILDUP_MAP:
+        if data_type in BUILDUP_API_NAMES:
             response = smart_api.oIBuildup({
                 "expirytype": "NEAR",
-                "datatype": OI_BUILDUP_MAP[data_type],
+                "datatype": BUILDUP_API_NAMES[data_type],
             })
         else:
             response = smart_api.gainersLosers({

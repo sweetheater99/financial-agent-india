@@ -136,8 +136,13 @@ have exactly these fields:
 
 
 def normalize_holding_symbol(trading_symbol: str) -> str:
-    """Normalize a holdings symbol: strip -EQ suffix."""
-    return trading_symbol.replace("-EQ", "").strip()
+    """Normalize a holdings symbol: strip exchange suffix (e.g. -EQ, -BE, -BL)."""
+    sym = trading_symbol.strip()
+    if "-" in sym:
+        base = sym.rsplit("-", 1)[0]
+        if base:
+            return base
+    return sym
 
 
 def fetch_portfolio(smart_api) -> tuple[list[dict], list[dict]]:

@@ -56,6 +56,10 @@ CANONICAL_NAMES = {
 
 ALL_SIGNAL_NAMES = list(CANONICAL_NAMES.values())
 
+# Reverse mapping: canonical name -> API name (for buildup types only)
+# Used by tools.py to route canonical names back to the oIBuildup endpoint
+BUILDUP_API_NAMES = {v: k for k, v in CANONICAL_NAMES.items() if k in OI_BUILDUP_TYPES}
+
 # Bullish signals: price up, OI up (longs building), shorts covering
 BULLISH_CATEGORIES = {"PercPriceGainers", "PercOIGainers", "LongBuildUp", "ShortCovering"}
 BEARISH_CATEGORIES = {"PercPriceLosers", "PercOILosers", "ShortBuildUp", "LongUnwinding"}
