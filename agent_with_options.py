@@ -50,6 +50,26 @@ the JSON. The JSON must have exactly these fields:
 }"""
 
 
+def get_nearest_expiry() -> str:
+    """Get the nearest monthly options expiry (last Thursday of the month) in dd-Mon-yyyy format."""
+    from datetime import date, timedelta
+    import calendar
+
+    today = date.today()
+    # Check current month and next month
+    for month_offset in range(3):
+        y = today.year + (today.month + month_offset - 1) // 12
+        m = (today.month + month_offset - 1) % 12 + 1
+        # Find last Thursday: start from last day, walk back
+        last_day = calendar.monthrange(y, m)[1]
+        d = date(y, m, last_day)
+        while d.weekday() != 3:  # Thursday
+            d -= timedelta(days=1)
+        if d >= today:
+            return d.strftime("%d%b%Y").upper()  # e.g. 27FEB2026
+    return ""
+
+
 def fetch_option_chain(smart_api, symbol: str, token: str, exchange: str = "NFO") -> dict | None:
     """
     Fetch option chain data for a stock from SmartAPI.
@@ -57,11 +77,13 @@ def fetch_option_chain(smart_api, symbol: str, token: str, exchange: str = "NFO"
     Returns the raw option chain response, or None on failure.
     """
     print(f"Fetching option chain for {symbol}...")
+    expiry = get_nearest_expiry()
+    print(f"Using expiry: {expiry}")
 
     try:
         response = smart_api.optionGreek({
             "name": symbol,
-            "expirydate": "",  # empty string gets the nearest expiry
+            "expirydate": expiry,
         })
     except Exception as e:
         print(f"Option chain API call failed: {e}")
