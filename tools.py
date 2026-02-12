@@ -246,6 +246,48 @@ TOOL_SCHEMAS = [
             },
         },
     },
+    {
+        "name": "portfolio_watchdog",
+        "description": (
+            "Analyze portfolio holdings against today's F&O signals. Cross-references "
+            "your holdings and positions with OI buildups, price/OI movers to flag stocks "
+            "that need action — EXIT/REDUCE, HOLD/ADD, or MONITOR with urgency levels. "
+            "Use when the user asks to check their portfolio, wants a risk check, or says "
+            "'check my holdings'."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "detailed": {
+                    "type": "boolean",
+                    "description": "Include candle enrichment for flagged stocks. Default false.",
+                },
+            },
+        },
+    },
+    {
+        "name": "deep_dive_stock",
+        "description": (
+            "Comprehensive single-stock analysis with trade plan. Combines 30-day candles, "
+            "option chain (IV, OI, Greeks), OI buildup signals, and PCR into an actionable "
+            "trade plan with entry, targets, stop-loss, and risk:reward. Use when the user "
+            "asks for a deep dive, detailed analysis, or trade plan for a specific stock."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "symbol": {
+                    "type": "string",
+                    "description": "Stock symbol (e.g. 'RELIANCE', 'BHARATFORG')",
+                },
+                "token": {
+                    "type": "string",
+                    "description": "SmartAPI token. If omitted, auto-resolved via search.",
+                },
+            },
+            "required": ["symbol"],
+        },
+    },
 ]
 
 
@@ -597,6 +639,27 @@ def handle_run_screener(smart_api, params):
         return {"error": str(e)}
 
 
+def handle_portfolio_watchdog(smart_api, params):
+    detailed = params.get("detailed", False)
+    try:
+        from portfolio_analysis import run_watchdog
+        result = run_watchdog(smart_api, detailed=detailed)
+        return result
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def handle_deep_dive_stock(smart_api, params):
+    symbol = params["symbol"]
+    token = params.get("token")
+    try:
+        from portfolio_analysis import run_deep_dive
+        result = run_deep_dive(smart_api, symbol, token=token)
+        return result
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
@@ -615,6 +678,8 @@ _HANDLERS = {
     "place_order": None,  # special-cased for dry_run
     "search_news": handle_search_news,
     "run_screener": handle_run_screener,
+    "portfolio_watchdog": handle_portfolio_watchdog,
+    "deep_dive_stock": handle_deep_dive_stock,
 }
 
 
