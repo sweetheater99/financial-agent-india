@@ -9,7 +9,40 @@ dispatch_tool() routes tool calls by name.
 """
 
 import json
+import os
 from datetime import datetime, timedelta
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Audit logging
+# ---------------------------------------------------------------------------
+
+_LOG_DIR = Path(__file__).parent / "logs"
+_LOG_FILE = _LOG_DIR / "tool_calls.jsonl"
+
+
+def _log_tool_call(name: str, tool_input: dict, result: dict, dry_run: bool) -> None:
+    """Append a tool call record to the audit log (JSON Lines format)."""
+    try:
+        _LOG_DIR.mkdir(exist_ok=True)
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "tool": name,
+            "input": tool_input,
+            "dry_run": dry_run,
+        }
+        # For place_order, log full result; for others, just status/error
+        if name == "place_order":
+            entry["result"] = result
+        else:
+            if "error" in result:
+                entry["error"] = result["error"]
+            else:
+                entry["status"] = "ok"
+        with open(_LOG_FILE, "a") as f:
+            f.write(json.dumps(entry, default=str) + "\n")
+    except Exception:
+        pass  # Never let logging break tool execution
 
 # ---------------------------------------------------------------------------
 # Tool schemas (Anthropic tool-use format)
@@ -663,6 +696,7 @@ _HANDLERS = {
 def dispatch_tool(name: str, tool_input: dict, smart_api, dry_run: bool = True) -> str:
     """
     Execute a tool by name and return the JSON result as a string.
+    All calls are logged to logs/tool_calls.jsonl for auditing.
     """
     if name == "place_order":
         result = handle_place_order(smart_api, tool_input, dry_run=dry_run)
@@ -672,4 +706,5 @@ def dispatch_tool(name: str, tool_input: dict, smart_api, dry_run: bool = True) 
     else:
         result = {"error": f"Unknown tool: {name}"}
 
+    _log_tool_call(name, tool_input, result, dry_run)
     return json.dumps(result, default=str)

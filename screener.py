@@ -131,7 +131,11 @@ and end with }. The JSON must have exactly these fields:
 # Phase 1: Data Collection
 # ---------------------------------------------------------------------------
 
-def fetch_all_signals(smart_api) -> dict[str, list]:
+_signal_cache: dict = {"data": None, "timestamp": None}
+SIGNAL_CACHE_TTL = 300  # 5 minutes
+
+
+def fetch_all_signals(smart_api, use_cache: bool = True) -> dict[str, list]:
     """
     Fetch all 8 signal types from SmartAPI using two endpoints:
     - gainersLosers for price/OI gainers and losers
@@ -139,7 +143,21 @@ def fetch_all_signals(smart_api) -> dict[str, list]:
 
     Returns a dict mapping canonical_name -> list of records.
     Skips types that fail and continues with available data.
+
+    Results are cached for 5 minutes to avoid redundant API calls
+    when watchdog and screener run close together.
     """
+    if (
+        use_cache
+        and _signal_cache["data"] is not None
+        and _signal_cache["timestamp"] is not None
+        and (datetime.now() - _signal_cache["timestamp"]).total_seconds() < SIGNAL_CACHE_TTL
+    ):
+        total = sum(len(v) for v in _signal_cache["data"].values())
+        print(f"  Using cached signals ({total} records, "
+              f"{int((datetime.now() - _signal_cache['timestamp']).total_seconds())}s old)")
+        return _signal_cache["data"]
+
     signals = {}
 
     # Fetch price/OI gainers and losers via gainersLosers endpoint
@@ -180,6 +198,8 @@ def fetch_all_signals(smart_api) -> dict[str, list]:
             signals[canonical] = []
         time.sleep(1.5)
 
+    _signal_cache["data"] = signals
+    _signal_cache["timestamp"] = datetime.now()
     return signals
 
 

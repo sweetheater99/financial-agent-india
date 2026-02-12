@@ -39,7 +39,7 @@ Guidelines:
 - Never fabricate data. If you don't have data, say so and offer to fetch it.
 - When analyzing trends, reference specific numbers from the data you fetched."""
 
-MAX_TOOL_ROUNDS = 15
+DEFAULT_MAX_TOOL_ROUNDS = 15
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +93,7 @@ TOOL_CALL_PATTERN = re.compile(r"<tool_calls>\s*(.*?)\s*</tool_calls>", re.DOTAL
 # SDK mode (native tool-use) — used when ANTHROPIC_API_KEY is available
 # ---------------------------------------------------------------------------
 
-def run_agent_loop_sdk(smart_api, client, dry_run: bool):
+def run_agent_loop_sdk(smart_api, client, dry_run: bool, max_rounds: int = DEFAULT_MAX_TOOL_ROUNDS):
     """REPL loop using the Anthropic SDK's native tool-use."""
     messages = []
     mode_label = "DRY-RUN" if dry_run else "LIVE"
@@ -112,7 +112,7 @@ def run_agent_loop_sdk(smart_api, client, dry_run: bool):
 
         messages.append({"role": "user", "content": user_input})
 
-        for _round in range(MAX_TOOL_ROUNDS):
+        for _round in range(max_rounds):
             try:
                 response = client.messages.create(
                     model="claude-sonnet-4-20250514",
@@ -162,7 +162,7 @@ def run_agent_loop_sdk(smart_api, client, dry_run: bool):
 # CLI mode (prompt-based tool calling) — used with Claude Max subscription
 # ---------------------------------------------------------------------------
 
-def run_agent_loop_cli(smart_api, client, dry_run: bool):
+def run_agent_loop_cli(smart_api, client, dry_run: bool, max_rounds: int = DEFAULT_MAX_TOOL_ROUNDS):
     """REPL loop using prompt-based tool calling via the claude CLI."""
     transcript = []  # list of text segments representing the conversation
     mode_label = "DRY-RUN" if dry_run else "LIVE"
@@ -181,7 +181,7 @@ def run_agent_loop_cli(smart_api, client, dry_run: bool):
 
         transcript.append(f"User: {user_input}")
 
-        for _round in range(MAX_TOOL_ROUNDS):
+        for _round in range(max_rounds):
             # Build full conversation as a single prompt
             prompt_text = "\n\n".join(transcript) + "\n\nAssistant:"
 
@@ -284,6 +284,8 @@ def main():
     parser = argparse.ArgumentParser(description="Interactive financial agent with tool use")
     parser.add_argument("--live", action="store_true",
                         help="Enable LIVE order placement (default is dry-run)")
+    parser.add_argument("--max-rounds", type=int, default=DEFAULT_MAX_TOOL_ROUNDS,
+                        help=f"Max tool-call rounds per query (default: {DEFAULT_MAX_TOOL_ROUNDS})")
     args = parser.parse_args()
 
     dry_run = not args.live
@@ -303,9 +305,9 @@ def main():
 
     # Start the right REPL
     if use_sdk:
-        run_agent_loop_sdk(smart_api, client, dry_run=dry_run)
+        run_agent_loop_sdk(smart_api, client, dry_run=dry_run, max_rounds=args.max_rounds)
     else:
-        run_agent_loop_cli(smart_api, client, dry_run=dry_run)
+        run_agent_loop_cli(smart_api, client, dry_run=dry_run, max_rounds=args.max_rounds)
 
 
 if __name__ == "__main__":
