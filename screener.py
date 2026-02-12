@@ -155,7 +155,7 @@ def fetch_all_signals(smart_api) -> dict[str, list]:
         except Exception as e:
             print(f"  {canonical}: FAILED ({e})")
             signals[canonical] = []
-        time.sleep(0.5)
+        time.sleep(1.5)
 
     # Fetch buildup/unwinding patterns via oIBuildup endpoint
     for dtype in OI_BUILDUP_TYPES:
@@ -174,7 +174,7 @@ def fetch_all_signals(smart_api) -> dict[str, list]:
         except Exception as e:
             print(f"  {canonical}: FAILED ({e})")
             signals[canonical] = []
-        time.sleep(1.0)
+        time.sleep(1.5)
 
     return signals
 
@@ -343,7 +343,7 @@ def enrich_candidates(smart_api, candidates: list[dict]) -> list[dict]:
             cand["candles"] = None
             print(f"  {symbol}: enrichment failed ({e})")
 
-        time.sleep(1.0)
+        time.sleep(1.5)
 
     return candidates
 
