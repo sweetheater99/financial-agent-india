@@ -21,6 +21,7 @@ from pathlib import Path
 
 import config
 from connect import get_session
+from indicators import compute_rsi, compute_volume_ratio
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -85,6 +86,28 @@ INDEX_SYMBOLS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"}
 # Regex to extract underlying stock symbol from F&O trading symbol
 # e.g. RELIANCE26FEB26FUT -> RELIANCE, M&M26FEB26FUT -> M&M
 SYMBOL_REGEX = re.compile(r"^([A-Z&]+)\d")
+
+# --- RSI Scoring Adjustments ---
+RSI_PERIOD = 14
+RSI_BULLISH_OVERBOUGHT = 70     # penalize bullish above this
+RSI_BEARISH_OVERSOLD = 30       # penalize bearish below this
+RSI_PENALTY = -1.0              # additive score penalty
+
+# --- Volume Scoring Adjustments ---
+VOLUME_LOOKBACK = 20
+VOLUME_STRONG_THRESHOLD = 1.5   # bonus if volume_ratio > 1.5
+VOLUME_WEAK_THRESHOLD = 0.8     # penalty if volume_ratio < 0.8
+VOLUME_STRONG_BONUS = 1.0       # additive
+VOLUME_WEAK_PENALTY = -0.5      # additive
+
+# --- Win Rate Lookup ---
+WIN_RATE_FILE = Path(__file__).parent / "data" / "backtest_results" / "win_rates.json"
+WIN_RATE_DEFAULT = 1.0
+
+# --- Signal Persistence (Multi-Day Confirmation) ---
+PERSISTENCE_LOOKBACK_DAYS = 3        # check up to 3 previous calendar days
+PERSISTENCE_2DAY_BONUS = 1.5         # appeared 2 consecutive days same direction
+PERSISTENCE_3DAY_BONUS = 3.0         # appeared 3+ consecutive days same direction
 
 
 # ---------------------------------------------------------------------------
@@ -366,20 +389,71 @@ def save_snapshot(candidates: list[dict], signals: dict[str, list]) -> Path:
     return path
 
 
+def load_previous_snapshots(lookback_days: int = PERSISTENCE_LOOKBACK_DAYS) -> list[dict]:
+    """Load up to `lookback_days` previous snapshot files (excluding today), newest first."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    files = sorted(SNAPSHOT_DIR.glob("*.json"), reverse=True)
+    snapshots = []
+    for f in files:
+        date_str = f.stem  # e.g. "2026-02-12"
+        if date_str == today:
+            continue
+        try:
+            snap = json.loads(f.read_text())
+            snapshots.append(snap)
+        except (json.JSONDecodeError, OSError):
+            continue
+        if len(snapshots) >= lookback_days:
+            break
+    return snapshots
+
+
+def compute_persistence(candidates: list[dict], prev_snapshots: list[dict]) -> list[dict]:
+    """Count consecutive previous days each candidate appeared with the same direction.
+
+    Sets `persistence_days` on each candidate (0 if not found in any previous snapshot).
+    Modifies candidates in-place.
+    """
+    # Build lookup: [{symbol: direction}, ...] ordered newest-first
+    snap_lookups = []
+    for snap in prev_snapshots:
+        lookup = {}
+        for c in snap.get("candidates", []):
+            lookup[c["symbol"]] = c["direction"]
+        snap_lookups.append(lookup)
+
+    for cand in candidates:
+        symbol = cand["symbol"]
+        direction = cand["direction"]
+        consecutive = 0
+        for snap_lookup in snap_lookups:  # newest first
+            if snap_lookup.get(symbol) == direction:
+                consecutive += 1
+            else:
+                break
+        cand["persistence_days"] = consecutive
+
+    return candidates
+
+
 # ---------------------------------------------------------------------------
 # Phase 3: Enrichment
 # ---------------------------------------------------------------------------
 
 def enrich_candidates(smart_api, candidates: list[dict]) -> list[dict]:
     """
-    For each candidate, fetch equity token via searchScrip and 5 days of
-    daily candles for short-term context. Modifies candidates in-place.
+    For each candidate, fetch equity token via searchScrip and ~25 trading days
+    of daily candles (40 calendar days) for RSI/volume/short-term context.
+    Computes RSI and volume_ratio and attaches them to the candidate dict.
+    Modifies candidates in-place.
     """
     for cand in candidates:
         symbol = cand["symbol"]
 
         if symbol in INDEX_SYMBOLS:
             cand["candles"] = None
+            cand["rsi"] = None
+            cand["volume_ratio"] = None
             continue
 
         # Resolve equity token
@@ -397,9 +471,9 @@ def enrich_candidates(smart_api, candidates: list[dict]) -> list[dict]:
 
                 if token:
                     cand["equity_token"] = token
-                    # Fetch 5 days of candles
+                    # Fetch ~25 trading days of candles (40 calendar days)
                     to_date = datetime.now()
-                    from_date = to_date - timedelta(days=7)  # 7 calendar days ~ 5 trading
+                    from_date = to_date - timedelta(days=40)
                     candle_resp = smart_api.getCandleData({
                         "exchange": "NSE",
                         "symboltoken": token,
@@ -408,22 +482,231 @@ def enrich_candidates(smart_api, candidates: list[dict]) -> list[dict]:
                         "todate": to_date.strftime("%Y-%m-%d 15:30"),
                     })
                     if candle_resp and candle_resp.get("data"):
-                        cand["candles"] = candle_resp["data"]
-                        print(f"  {symbol}: {len(candle_resp['data'])} candles")
+                        candles = candle_resp["data"]
+                        cand["candles"] = candles
+                        cand["rsi"] = compute_rsi(candles, RSI_PERIOD)
+                        cand["volume_ratio"] = compute_volume_ratio(candles, VOLUME_LOOKBACK)
+                        rsi_str = f"RSI={cand['rsi']:.1f}" if cand['rsi'] is not None else "RSI=N/A"
+                        vol_str = f"Vol={cand['volume_ratio']:.2f}x" if cand['volume_ratio'] is not None else "Vol=N/A"
+                        print(f"  {symbol}: {len(candles)} candles, {rsi_str}, {vol_str}")
                     else:
                         cand["candles"] = None
+                        cand["rsi"] = None
+                        cand["volume_ratio"] = None
                         print(f"  {symbol}: no candle data")
                 else:
                     cand["candles"] = None
+                    cand["rsi"] = None
+                    cand["volume_ratio"] = None
                     print(f"  {symbol}: token not found")
             else:
                 cand["candles"] = None
+                cand["rsi"] = None
+                cand["volume_ratio"] = None
                 print(f"  {symbol}: search returned nothing")
         except Exception as e:
             cand["candles"] = None
+            cand["rsi"] = None
+            cand["volume_ratio"] = None
             print(f"  {symbol}: enrichment failed ({e})")
 
         time.sleep(config.API_DELAY)
+
+    return candidates
+
+
+def _load_win_rates() -> dict:
+    """Load precomputed signal-combo win rates from backtest output. Returns {} if missing."""
+    if WIN_RATE_FILE.exists():
+        try:
+            return json.loads(WIN_RATE_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def _make_combo_key(categories: list, direction: str) -> str:
+    """Build canonical key for win rate lookup: 'LongBuildUp+PercOIGainers|bullish'."""
+    return "+".join(sorted(categories)) + "|" + direction
+
+
+def apply_indicator_adjustments(candidates: list[dict]) -> list[dict]:
+    """
+    Adjust candidate scores based on RSI, volume, and historical win rate.
+
+    RSI/volume adjustments are additive (matching existing scoring).
+    Win rate is a multiplicative scalar.
+    Stores score_raw and score_adjustments for transparency.
+    Re-sorts candidates by adjusted score.
+    Modifies candidates in-place.
+    """
+    win_rates = _load_win_rates()
+
+    for cand in candidates:
+        score_raw = cand["score"]
+        adjustments = {}
+
+        rsi = cand.get("rsi")
+        direction = cand["direction"]
+
+        # RSI adjustments
+        if rsi is not None:
+            if direction == "bullish" and rsi > RSI_BULLISH_OVERBOUGHT:
+                adjustments["rsi_overbought"] = RSI_PENALTY
+            elif direction == "bearish" and rsi < RSI_BEARISH_OVERSOLD:
+                adjustments["rsi_oversold"] = RSI_PENALTY
+
+        # Volume adjustments
+        vol_ratio = cand.get("volume_ratio")
+        if vol_ratio is not None:
+            if vol_ratio >= VOLUME_STRONG_THRESHOLD:
+                adjustments["volume_strong"] = VOLUME_STRONG_BONUS
+            elif vol_ratio < VOLUME_WEAK_THRESHOLD:
+                adjustments["volume_weak"] = VOLUME_WEAK_PENALTY
+
+        # Persistence adjustments
+        persistence = cand.get("persistence_days", 0)
+        if persistence >= 3:
+            adjustments["persistence_3d"] = PERSISTENCE_3DAY_BONUS
+        elif persistence >= 2:
+            adjustments["persistence_2d"] = PERSISTENCE_2DAY_BONUS
+
+        # Apply additive adjustments
+        additive = sum(adjustments.values())
+        adjusted = score_raw + additive
+
+        # Win rate multiplier
+        combo_key = _make_combo_key(cand.get("categories", []), direction)
+        win_rate = win_rates.get(combo_key, WIN_RATE_DEFAULT)
+        if win_rate != WIN_RATE_DEFAULT:
+            adjustments["win_rate"] = win_rate
+        adjusted = adjusted * win_rate
+
+        # Floor at 0
+        adjusted = max(adjusted, 0)
+
+        cand["score_raw"] = score_raw
+        cand["score_adjustments"] = adjustments
+        cand["score"] = round(adjusted, 2)
+
+    # Re-sort by adjusted score
+    candidates.sort(key=lambda c: (c["score"], len(c.get("categories", []))), reverse=True)
+    return candidates
+
+
+# ---------------------------------------------------------------------------
+# Phase 3.5: News & Earnings Sentiment
+# ---------------------------------------------------------------------------
+
+NEWS_MAX_ARTICLES = 5
+NEWS_DELAY = 1.5
+
+NEWS_CLASSIFY_SYSTEM = """You are a financial news classifier for Indian stock markets (NSE/BSE).
+
+Given news headlines and snippets for multiple stocks, classify each one.
+Respond ONLY with valid JSON — no markdown, no explanation.
+
+Output format:
+{
+  "SYMBOL": {
+    "sentiment": "positive" | "neutral" | "negative",
+    "has_earnings_soon": true/false,
+    "has_policy_impact": true/false
+  }
+}
+
+Rules:
+- "has_earnings_soon": true if quarterly results / earnings announcement within ~1 week
+- "has_policy_impact": true if government policy, regulatory action, or RBI decision directly affects the stock
+- "sentiment": overall tone of the news for that stock's near-term price direction
+- If no news found for a symbol, classify as neutral with false for both flags"""
+
+
+def fetch_news_sentiment(candidates: list[dict]) -> list[dict]:
+    """
+    Fetch news for each candidate via DuckDuckGo and classify sentiment via Claude.
+
+    Attaches 'news_sentiment' dict to each candidate:
+      {"sentiment": "positive"|"neutral"|"negative",
+       "has_earnings_soon": bool, "has_policy_impact": bool}
+
+    Modifies candidates in-place.
+    """
+    # Step 1: Fetch news headlines for each candidate
+    try:
+        from duckduckgo_search import DDGS
+    except ImportError:
+        print("  News: duckduckgo-search not installed, skipping")
+        for cand in candidates:
+            cand["news_sentiment"] = None
+        return candidates
+
+    symbol_headlines = {}
+    for cand in candidates:
+        symbol = cand["symbol"]
+        try:
+            with DDGS() as ddgs:
+                results = list(ddgs.news(f"{symbol} NSE stock news", max_results=NEWS_MAX_ARTICLES))
+            headlines = []
+            for r in results:
+                title = r.get("title", "")
+                body = r.get("body", "")[:150]
+                if title:
+                    headlines.append(f"- {title}: {body}" if body else f"- {title}")
+            symbol_headlines[symbol] = headlines
+            print(f"  {symbol}: {len(headlines)} news articles")
+        except Exception as e:
+            print(f"  {symbol}: news fetch failed ({e})")
+            symbol_headlines[symbol] = []
+        time.sleep(NEWS_DELAY)
+
+    # Step 2: Batched Claude classification
+    if not any(symbol_headlines.values()):
+        for cand in candidates:
+            cand["news_sentiment"] = None
+        return candidates
+
+    prompt_lines = ["Classify the following stock news:\n"]
+    for symbol, headlines in symbol_headlines.items():
+        prompt_lines.append(f"=== {symbol} ===")
+        if headlines:
+            prompt_lines.extend(headlines)
+        else:
+            prompt_lines.append("(no recent news found)")
+        prompt_lines.append("")
+
+    try:
+        client = config.get_anthropic_client()
+        response = client.messages.create(
+            model=config.CLAUDE_MODEL,
+            max_tokens=1024,
+            system=NEWS_CLASSIFY_SYSTEM,
+            messages=[{"role": "user", "content": "\n".join(prompt_lines)}],
+        )
+        raw_text = response.content[0].text.strip()
+
+        # Strip markdown fences if present
+        if raw_text.startswith("```"):
+            raw_text = raw_text.split("\n", 1)[1]
+            raw_text = raw_text.rsplit("```", 1)[0].strip()
+
+        news_data = json.loads(raw_text)
+    except Exception as e:
+        print(f"  News classification failed: {e}")
+        news_data = {}
+
+    # Step 3: Attach to candidates
+    for cand in candidates:
+        symbol = cand["symbol"]
+        sentiment = news_data.get(symbol)
+        if sentiment and isinstance(sentiment, dict):
+            cand["news_sentiment"] = {
+                "sentiment": sentiment.get("sentiment", "neutral"),
+                "has_earnings_soon": bool(sentiment.get("has_earnings_soon", False)),
+                "has_policy_impact": bool(sentiment.get("has_policy_impact", False)),
+            }
+        else:
+            cand["news_sentiment"] = None
 
     return candidates
 
@@ -471,6 +754,10 @@ def build_claude_prompt(candidates: list[dict], pcr_data: dict | None,
         lines.append(f"  Signals: {', '.join(cand['categories'])}")
         if cand["price_change_pct"] is not None:
             lines.append(f"  Price Change: {cand['price_change_pct']:+.2f}%")
+        if cand.get("rsi") is not None:
+            lines.append(f"  RSI(14): {cand['rsi']:.1f}")
+        if cand.get("volume_ratio") is not None:
+            lines.append(f"  Volume Ratio: {cand['volume_ratio']:.2f}x avg")
 
         # Include raw detail data for each signal
         for cat in cand["categories"]:
@@ -612,8 +899,21 @@ def print_raw_signals(signals: dict[str, list], candidates: list[dict]) -> None:
     for i, cand in enumerate(candidates[:20], 1):
         direction_tag = "BULL" if cand["direction"] == "bullish" else "BEAR"
         pct = f"{cand['price_change_pct']:+.2f}%" if cand["price_change_pct"] is not None else "N/A"
-        print(f"\n  {i:>2}. {cand['symbol']:<15} [{direction_tag}]  Score: {cand['score']:.1f}  Change: {pct}")
-        print(f"      Signals: {', '.join(cand['categories'])}")
+        score_str = f"Score: {cand['score']:.1f}"
+        if cand.get("score_raw") is not None and cand["score_raw"] != cand["score"]:
+            score_str += f" (raw {cand['score_raw']:.1f})"
+        print(f"\n  {i:>2}. {cand['symbol']:<15} [{direction_tag}]  {score_str}  Change: {pct}")
+        extras = []
+        if cand.get("persistence_days", 0) > 0:
+            extras.append(f"{cand['persistence_days']}d")
+        if cand.get("rsi") is not None:
+            extras.append(f"RSI={cand['rsi']:.0f}")
+        if cand.get("volume_ratio") is not None:
+            extras.append(f"Vol={cand['volume_ratio']:.1f}x")
+        signals_str = ', '.join(cand['categories'])
+        if extras:
+            signals_str += f"  ({', '.join(extras)})"
+        print(f"      Signals: {signals_str}")
 
     print(f"\n{border}\n")
 
@@ -700,7 +1000,8 @@ def print_briefing(analysis: dict) -> None:
 # Public API (for tools.py integration)
 # ---------------------------------------------------------------------------
 
-def run_screener(smart_api, top_n: int = 5, raw_only: bool = False) -> dict:
+def run_screener(smart_api, top_n: int = 5, raw_only: bool = False,
+                  skip_news: bool = False) -> dict:
     """
     Run the full morning screener pipeline.
 
@@ -708,6 +1009,7 @@ def run_screener(smart_api, top_n: int = 5, raw_only: bool = False) -> dict:
         smart_api: Authenticated SmartConnect session
         top_n: Number of top candidates to enrich and analyze
         raw_only: If True, skip Claude analysis and return raw signals
+        skip_news: If True, skip news sentiment analysis
 
     Returns:
         dict with either raw signals or Claude analysis results
@@ -747,6 +1049,22 @@ def run_screener(smart_api, top_n: int = 5, raw_only: bool = False) -> dict:
     print(f"\nPhase 3: Enriching top {len(top)} candidates...")
     enrich_candidates(smart_api, top)
 
+    # Signal persistence (multi-day confirmation)
+    prev_snapshots = load_previous_snapshots()
+    if prev_snapshots:
+        compute_persistence(top, prev_snapshots)
+        print(f"  Persistence: checked against {len(prev_snapshots)} previous snapshot(s)")
+
+    # Phase 3.5: Indicator-based score adjustments
+    print("\n  Applying indicator adjustments (RSI, volume, win rate)...")
+    apply_indicator_adjustments(top)
+
+    if not skip_news:
+        print("\n  Fetching news sentiment...")
+        fetch_news_sentiment(top)
+    else:
+        print("\n  News sentiment: skipped (--skip-news)")
+
     print("  Fetching NIFTY PCR...")
     pcr_data = fetch_index_pcr(smart_api)
 
@@ -773,12 +1091,14 @@ def main():
                         help="Raw signal data only, skip Claude analysis")
     parser.add_argument("--top", type=int, default=5,
                         help="Number of top candidates to analyze (default: 5)")
+    parser.add_argument("--skip-news", action="store_true",
+                        help="Skip news sentiment analysis (faster)")
     args = parser.parse_args()
 
     print("Connecting to AngelOne SmartAPI...")
     smart_api = get_session()
 
-    run_screener(smart_api, top_n=args.top, raw_only=args.raw)
+    run_screener(smart_api, top_n=args.top, raw_only=args.raw, skip_news=args.skip_news)
 
 
 if __name__ == "__main__":

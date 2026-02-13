@@ -6,6 +6,8 @@
 #   3:15+ PM IST      → Final monitor pass before close
 #   Every invocation   → Monitor exits on open positions
 
+export PATH="$HOME/.local/bin:$PATH"
+
 cd ~/financial-agent-india
 source venv/bin/activate
 
