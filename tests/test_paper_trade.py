@@ -7,12 +7,16 @@ P&L calculations, portfolio stats, and persistence.
 
 import json
 import math
+from datetime import datetime
 
 import pytest
 
 from paper_trade import (
     STOPLOSS_PCT,
     TARGET_PCT,
+    PUT_TARGET_PCT,
+    PUT_STOPLOSS_PCT,
+    MIN_DTE_TO_HOLD,
     TOTAL_CAPITAL,
     _add_trading_days,
     _empty_portfolio,
@@ -20,8 +24,10 @@ from paper_trade import (
     calc_pnl_pct,
     close_position,
     compute_allocations,
+    days_to_expiry,
     load_portfolio,
     save_portfolio,
+    select_put_strike,
     PORTFOLIO_FILE,
 )
 
@@ -454,3 +460,229 @@ class TestPersistence:
         assert loaded["stats"]["total_pnl"] == 50.0
         assert len(loaded["closed_trades"]) == 1
         assert loaded["closed_trades"][0]["pnl_pct"] == 5.0
+
+
+# ---------------------------------------------------------------------------
+# Put Option Logic
+# ---------------------------------------------------------------------------
+
+class TestPutOptionLogic:
+    """Tests for put option support in paper trading."""
+
+    # --- Strike Selection ---
+
+    def test_select_put_strike_atm(self):
+        """ATM strike (closest ≤ spot) is picked."""
+        chain = [
+            {"strikePrice": 5300, "PE": {"lastTradedPrice": 120, "delta": -0.35, "theta": -7, "impliedVolatility": 30, "openInterest": 5000, "gamma": 0.002, "vega": 10}},
+            {"strikePrice": 5400, "PE": {"lastTradedPrice": 75, "delta": -0.42, "theta": -8, "impliedVolatility": 28, "openInterest": 8000, "gamma": 0.003, "vega": 12}},
+            {"strikePrice": 5500, "PE": {"lastTradedPrice": 40, "delta": -0.25, "theta": -5, "impliedVolatility": 32, "openInterest": 3000, "gamma": 0.001, "vega": 8}},
+        ]
+        result = select_put_strike(chain, spot_price=5420)
+        assert result is not None
+        assert result["strike"] == 5400  # closest ≤ 5420
+
+    def test_select_put_strike_between_strikes(self):
+        """When spot is between strikes, picks the OTM one (below spot)."""
+        chain = [
+            {"strikePrice": 5300, "PE": {"lastTradedPrice": 120, "delta": -0.35, "theta": -7, "impliedVolatility": 30, "openInterest": 5000, "gamma": 0.002, "vega": 10}},
+            {"strikePrice": 5400, "PE": {"lastTradedPrice": 75, "delta": -0.42, "theta": -8, "impliedVolatility": 28, "openInterest": 8000, "gamma": 0.003, "vega": 12}},
+            {"strikePrice": 5500, "PE": {"lastTradedPrice": 40, "delta": -0.25, "theta": -5, "impliedVolatility": 32, "openInterest": 3000, "gamma": 0.001, "vega": 8}},
+        ]
+        result = select_put_strike(chain, spot_price=5450)
+        assert result is not None
+        assert result["strike"] == 5400  # closest ≤ 5450
+
+    def test_select_put_strike_exact_match(self):
+        """Spot price exactly at a strike."""
+        chain = [
+            {"strikePrice": 5400, "PE": {"lastTradedPrice": 75, "delta": -0.42, "theta": -8, "impliedVolatility": 28, "openInterest": 8000, "gamma": 0.003, "vega": 12}},
+        ]
+        result = select_put_strike(chain, spot_price=5400)
+        assert result is not None
+        assert result["strike"] == 5400
+
+    def test_select_put_strike_empty_chain(self):
+        """Empty option chain returns None."""
+        assert select_put_strike([], spot_price=5400) is None
+
+    def test_select_put_strike_zero_ltp_filtered(self):
+        """Strikes with zero PE LTP are filtered out."""
+        chain = [
+            {"strikePrice": 5400, "PE": {"lastTradedPrice": 0, "delta": -0.42, "theta": -8, "impliedVolatility": 28, "openInterest": 8000, "gamma": 0.003, "vega": 12}},
+            {"strikePrice": 5300, "PE": {"lastTradedPrice": 120, "delta": -0.35, "theta": -7, "impliedVolatility": 30, "openInterest": 5000, "gamma": 0.002, "vega": 10}},
+        ]
+        result = select_put_strike(chain, spot_price=5450)
+        assert result is not None
+        assert result["strike"] == 5300  # 5400 filtered out (zero LTP)
+
+    def test_select_put_strike_all_above_spot(self):
+        """All strikes above spot returns None (ITM puts excluded)."""
+        chain = [
+            {"strikePrice": 5500, "PE": {"lastTradedPrice": 40, "delta": -0.25, "theta": -5, "impliedVolatility": 32, "openInterest": 3000, "gamma": 0.001, "vega": 8}},
+            {"strikePrice": 5600, "PE": {"lastTradedPrice": 20, "delta": -0.15, "theta": -3, "impliedVolatility": 35, "openInterest": 1000, "gamma": 0.001, "vega": 5}},
+        ]
+        result = select_put_strike(chain, spot_price=5400)
+        assert result is None
+
+    # --- DTE Calculation ---
+
+    def test_days_to_expiry(self, monkeypatch):
+        """Known date pair gives expected DTE."""
+        from datetime import date
+        fake_today = date(2026, 2, 13)
+        monkeypatch.setattr("paper_trade.datetime", type("FakeDatetime", (), {
+            "now": staticmethod(lambda tz=None: type("D", (), {"date": lambda self: fake_today})()),
+            "strptime": datetime.strptime,
+        })())
+        # Actually, let's just monkeypatch more precisely
+        monkeypatch.undo()
+
+        import paper_trade
+        original_now = datetime.now
+
+        class FakeDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime(2026, 2, 13, tzinfo=tz)
+
+        monkeypatch.setattr(paper_trade, "datetime", FakeDatetime)
+        result = days_to_expiry("27FEB2026")
+        assert result == 14  # Feb 13 to Feb 27
+
+    # --- Option P&L ---
+
+    def test_put_pnl_premium_increase(self):
+        """Bought put at 75, premium rises to 112.5 → +50% (target)."""
+        pnl = calc_pnl_pct(75, 112.5, "bullish")
+        assert pnl == pytest.approx(50.0)
+
+    def test_put_pnl_premium_decrease(self):
+        """Bought put at 75, premium drops to 45 → -40% (stoploss)."""
+        pnl = calc_pnl_pct(75, 45, "bullish")
+        assert pnl == pytest.approx(-40.0)
+
+    def test_put_target_threshold(self):
+        """Premium increase just above target threshold."""
+        pnl = calc_pnl_pct(100, 151, "bullish")
+        assert pnl >= PUT_TARGET_PCT
+
+    def test_put_stoploss_threshold(self):
+        """Premium decrease just below stoploss threshold."""
+        pnl = calc_pnl_pct(100, 59, "bullish")
+        assert pnl <= PUT_STOPLOSS_PCT
+
+    # --- close_position for options ---
+
+    def _make_option_position(self, entry_premium=75.0, lot_size=500, num_lots=1):
+        qty = lot_size * num_lots
+        return {
+            "symbol": "PERSISTENT",
+            "token": "77777",
+            "direction": "bearish",
+            "instrument": "OPT",
+            "option_type": "PE",
+            "strike": 5400.0,
+            "expiry": "27FEB2026",
+            "contract_symbol": "PERSISTENT27FEB2026PE5400",
+            "lot_size": lot_size,
+            "num_lots": num_lots,
+            "entry_price": entry_premium,
+            "quantity": qty,
+            "allocated": entry_premium * qty,
+            "underlying_price_at_entry": 5452.0,
+            "greeks_at_entry": {"delta": -0.42, "theta": -8.5, "iv": 32.5, "gamma": 0.003, "vega": 12.1},
+            "score": 6.0,
+            "categories": ["ShortBuildUp"],
+            "entry_date": "2026-02-13",
+            "max_hold_date": "2026-02-20",
+            "status": "open",
+        }
+
+    def test_close_option_target(self):
+        """Option position closed at +50% premium gain."""
+        pos = self._make_option_position(75.0, 500, 1)
+        portfolio = _empty_portfolio()
+        portfolio["positions"].append(pos)
+        portfolio["available_capital"] = TOTAL_CAPITAL - pos["allocated"]
+
+        closed = close_position(portfolio, pos, 112.5, "target")
+
+        # P&L uses "bullish" direction: (112.5 - 75) * 500 = 18750
+        assert closed["pnl_pct"] == pytest.approx(50.0)
+        assert closed["pnl"] == pytest.approx(18750.0)
+        assert portfolio["stats"]["winning_trades"] == 1
+
+    def test_close_option_stoploss(self):
+        """Option position closed at -40% premium loss."""
+        pos = self._make_option_position(75.0, 500, 1)
+        portfolio = _empty_portfolio()
+        portfolio["positions"].append(pos)
+        portfolio["available_capital"] = TOTAL_CAPITAL - pos["allocated"]
+
+        closed = close_position(portfolio, pos, 45.0, "stoploss")
+
+        # P&L: (45 - 75) * 500 = -15000
+        assert closed["pnl_pct"] == pytest.approx(-40.0)
+        assert closed["pnl"] == pytest.approx(-15000.0)
+        assert portfolio["stats"]["losing_trades"] == 1
+
+    def test_close_option_capital_released(self):
+        """Allocated capital is freed when option position is closed."""
+        pos = self._make_option_position(75.0, 500, 1)
+        portfolio = _empty_portfolio()
+        portfolio["positions"].append(pos)
+        portfolio["available_capital"] = TOTAL_CAPITAL - pos["allocated"]
+        avail_before = portfolio["available_capital"]
+
+        close_position(portfolio, pos, 90.0, "target")
+        assert portfolio["available_capital"] == avail_before + pos["allocated"]
+
+    # --- Backward Compatibility ---
+
+    def test_legacy_position_no_instrument_field(self):
+        """Position without 'instrument' field defaults to equity behavior."""
+        pos = {
+            "symbol": "TEST",
+            "token": "99999",
+            "direction": "bearish",
+            "entry_price": 1000,
+            "quantity": -10,
+            "allocated": 10000,
+            "entry_date": "2026-02-10",
+            "status": "open",
+        }
+        portfolio = _empty_portfolio()
+        portfolio["positions"].append(pos)
+        portfolio["available_capital"] = TOTAL_CAPITAL - pos["allocated"]
+
+        # Legacy bearish: (entry - exit) / entry
+        closed = close_position(portfolio, pos, 950, "target")
+        assert closed["pnl_pct"] == pytest.approx(5.0)
+        assert closed["pnl"] == pytest.approx(500.0)
+
+    # --- Persistence with Option Positions ---
+
+    def test_save_load_option_position(self, tmp_path, monkeypatch):
+        """Option position round-trips through save/load."""
+        test_file = tmp_path / "portfolio.json"
+        monkeypatch.setattr("paper_trade.PORTFOLIO_FILE", test_file)
+        monkeypatch.setattr("paper_trade.PORTFOLIO_DIR", tmp_path)
+
+        portfolio = _empty_portfolio()
+        pos = self._make_option_position(75.0, 500, 1)
+        portfolio["positions"].append(pos)
+        portfolio["available_capital"] = TOTAL_CAPITAL - pos["allocated"]
+
+        save_portfolio(portfolio)
+        loaded = load_portfolio()
+
+        opt_pos = loaded["positions"][0]
+        assert opt_pos["instrument"] == "OPT"
+        assert opt_pos["option_type"] == "PE"
+        assert opt_pos["strike"] == 5400.0
+        assert opt_pos["expiry"] == "27FEB2026"
+        assert opt_pos["contract_symbol"] == "PERSISTENT27FEB2026PE5400"
+        assert opt_pos["lot_size"] == 500
+        assert opt_pos["num_lots"] == 1
+        assert opt_pos["greeks_at_entry"]["delta"] == -0.42

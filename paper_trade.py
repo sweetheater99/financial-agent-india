@@ -22,6 +22,7 @@ from pathlib import Path
 
 import config
 from connect import get_session
+from agent_with_options import fetch_option_chain, get_nearest_expiry
 from screener import run_screener, fetch_all_signals, score_signals
 
 # ---------------------------------------------------------------------------
@@ -37,6 +38,12 @@ STOPLOSS_PCT = -3.0    # -3% stop-loss
 MAX_HOLD_DAYS = 5      # force exit after 5 trading days
 TOP_N = 5              # top candidates to trade
 MIN_CAPITAL = 1_000    # minimum capital to open new positions
+
+# Put option thresholds (leveraged instrument → wider bands)
+PUT_TARGET_PCT = 50.0       # +50% premium gain
+PUT_STOPLOSS_PCT = -40.0    # -40% premium loss
+MIN_DTE_TO_OPEN = 3         # don't open puts with < 3 days to expiry
+MIN_DTE_TO_HOLD = 2         # force exit if < 2 days to expiry
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -136,6 +143,201 @@ def get_ltp(smart_api, symbol: str, token: str) -> float | None:
 
 
 # ---------------------------------------------------------------------------
+# Put Option Helpers
+# ---------------------------------------------------------------------------
+
+def get_ltp_nfo(smart_api, symbol: str, token: str) -> float | None:
+    """Fetch current last traded price for an NFO contract (options/futures)."""
+    try:
+        resp = smart_api.ltpData("NFO", symbol, token)
+        if resp and resp.get("data"):
+            ltp = resp["data"].get("ltp")
+            if ltp is not None:
+                return float(ltp)
+    except Exception:
+        pass
+
+    try:
+        resp = smart_api.getMarketData({
+            "mode": "LTP",
+            "exchangeTokens": {"NFO": [token]},
+        })
+        if resp and resp.get("data") and resp["data"].get("fetched"):
+            return float(resp["data"]["fetched"][0]["ltp"])
+    except Exception as e:
+        print(f"  WARNING: NFO LTP fetch failed for {symbol}: {e}")
+    return None
+
+
+def days_to_expiry(expiry_str: str) -> int:
+    """Calendar days from today to expiry. expiry_str in 'DDMONYYYY' format (e.g. '27FEB2026')."""
+    expiry_date = datetime.strptime(expiry_str, "%d%b%Y").date()
+    today = datetime.now(IST).date()
+    return (expiry_date - today).days
+
+
+def select_put_strike(option_chain: list, spot_price: float) -> dict | None:
+    """
+    Pick ATM or 1-strike-OTM put from the option chain.
+
+    Selects the strike ≤ spot_price closest to spot, filtering out zero-LTP strikes.
+    Returns dict with strike details or None.
+    """
+    candidates = []
+    for row in option_chain:
+        strike = row.get("strikePrice", 0)
+        pe = row.get("PE") or {}
+        pe_ltp = pe.get("lastTradedPrice", 0) or 0
+        if strike <= 0 or pe_ltp <= 0 or strike > spot_price:
+            continue
+        candidates.append({
+            "strike": strike,
+            "pe_ltp": float(pe_ltp),
+            "pe_delta": float(pe.get("delta", 0) or 0),
+            "pe_theta": float(pe.get("theta", 0) or 0),
+            "pe_iv": float(pe.get("impliedVolatility", 0) or 0),
+            "pe_oi": int(pe.get("openInterest", 0) or 0),
+            "pe_gamma": float(pe.get("gamma", 0) or 0),
+            "pe_vega": float(pe.get("vega", 0) or 0),
+        })
+
+    if not candidates:
+        return None
+
+    # Closest strike to spot (ATM or 1-strike OTM put)
+    candidates.sort(key=lambda c: spot_price - c["strike"])
+    return candidates[0]
+
+
+def resolve_option_contract(smart_api, symbol: str, strike: float, expiry: str) -> dict | None:
+    """
+    Resolve a PE option contract via searchScrip.
+
+    Returns {trading_symbol, token, lot_size} or None.
+    """
+    # Build query like "PERSISTENT 27FEB2026 PE 5400"
+    strike_str = str(int(strike)) if strike == int(strike) else str(strike)
+    query = f"{symbol}{expiry}P{strike_str}"
+
+    try:
+        resp = smart_api.searchScrip("NFO", query)
+        if resp and resp.get("data"):
+            for match in resp["data"]:
+                tsym = match.get("tradingsymbol", "")
+                if "PE" in tsym.upper() or tsym.upper().endswith(f"P{strike_str}"):
+                    return {
+                        "trading_symbol": tsym,
+                        "token": match["symboltoken"],
+                        "lot_size": int(match.get("lotsize", 1)),
+                    }
+            # Fallback: first result
+            first = resp["data"][0]
+            return {
+                "trading_symbol": first.get("tradingsymbol", query),
+                "token": first["symboltoken"],
+                "lot_size": int(first.get("lotsize", 1)),
+            }
+    except Exception as e:
+        print(f"  WARNING: searchScrip NFO failed for {query}: {e}")
+    return None
+
+
+def _open_put_position(smart_api, symbol: str, eq_token: str, spot_price: float,
+                       allocation: float, alloc: dict) -> dict | None:
+    """
+    Open a put option position for a bearish candidate.
+
+    Returns position dict or None if skipped.
+    """
+    expiry = get_nearest_expiry()
+    if not expiry:
+        print(f"  SKIP {symbol}: could not determine option expiry")
+        return None
+
+    dte = days_to_expiry(expiry)
+    if dte < MIN_DTE_TO_OPEN:
+        print(f"  SKIP {symbol}: expiry {expiry} only {dte}d away (min {MIN_DTE_TO_OPEN}d)")
+        return None
+
+    # Fetch option chain
+    option_chain = fetch_option_chain(smart_api, symbol, eq_token)
+    time.sleep(config.API_DELAY)
+    if not option_chain:
+        print(f"  SKIP {symbol}: option chain fetch failed")
+        return None
+
+    # Select strike
+    strike_info = select_put_strike(option_chain, spot_price)
+    if not strike_info:
+        print(f"  SKIP {symbol}: no suitable put strike found")
+        return None
+
+    strike = strike_info["strike"]
+    premium = strike_info["pe_ltp"]
+
+    # Resolve NFO contract for token + lot size
+    contract = resolve_option_contract(smart_api, symbol, strike, expiry)
+    time.sleep(config.API_DELAY)
+    if not contract:
+        print(f"  SKIP {symbol}: could not resolve PE contract")
+        return None
+
+    lot_size = contract["lot_size"]
+    # Size: how many lots can we afford?
+    cost_per_lot = premium * lot_size
+    if cost_per_lot <= 0:
+        print(f"  SKIP {symbol}: zero premium cost")
+        return None
+
+    num_lots = max(1, math.floor(allocation / cost_per_lot))
+    actual_allocated = round(num_lots * cost_per_lot, 2)
+
+    # Verify live premium from NFO
+    live_premium = get_ltp_nfo(smart_api, contract["trading_symbol"], contract["token"])
+    time.sleep(config.API_DELAY)
+    if live_premium and live_premium > 0:
+        premium = live_premium
+        actual_allocated = round(num_lots * premium * lot_size, 2)
+
+    today = _today_ist()
+    max_hold_date = _add_trading_days(today, MAX_HOLD_DAYS)
+
+    position = {
+        "symbol": symbol,
+        "token": contract["token"],
+        "direction": "bearish",
+        "instrument": "OPT",
+        "option_type": "PE",
+        "strike": strike,
+        "expiry": expiry,
+        "contract_symbol": contract["trading_symbol"],
+        "lot_size": lot_size,
+        "num_lots": num_lots,
+        "entry_price": premium,
+        "quantity": num_lots * lot_size,
+        "allocated": actual_allocated,
+        "underlying_price_at_entry": spot_price,
+        "greeks_at_entry": {
+            "delta": strike_info["pe_delta"],
+            "theta": strike_info["pe_theta"],
+            "iv": strike_info["pe_iv"],
+            "gamma": strike_info["pe_gamma"],
+            "vega": strike_info["pe_vega"],
+        },
+        "score": alloc["score"],
+        "categories": alloc.get("categories", []),
+        "entry_date": today,
+        "max_hold_date": max_hold_date,
+        "status": "open",
+    }
+
+    print(f"  OPENED {symbol} PE{int(strike)} x{num_lots}lot ({num_lots * lot_size}qty) "
+          f"@ ₹{premium:,.2f} (₹{actual_allocated:,.0f}, score={alloc['score']:.1f}, DTE:{dte})")
+
+    return position
+
+
+# ---------------------------------------------------------------------------
 # Trading Day Helpers
 # ---------------------------------------------------------------------------
 
@@ -225,8 +427,9 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict]) -> int:
 
     for alloc in allocations:
         symbol = alloc["symbol"]
+        direction = alloc["direction"]
 
-        # Resolve token
+        # Resolve equity token + LTP (needed for both paths)
         resolved = resolve_token(smart_api, symbol)
         if not resolved:
             print(f"  SKIP {symbol}: token resolution failed")
@@ -234,7 +437,6 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict]) -> int:
         trading_symbol, token = resolved
         time.sleep(config.API_DELAY)
 
-        # Get entry price
         ltp = get_ltp(smart_api, trading_symbol, token)
         if ltp is None or ltp <= 0:
             print(f"  SKIP {symbol}: could not get LTP")
@@ -242,51 +444,48 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict]) -> int:
         time.sleep(config.API_DELAY)
 
         allocation = alloc["allocation"]
-        direction = alloc["direction"]
-        quantity = math.floor(allocation / ltp)
-        if quantity < 1:
-            print(f"  SKIP {symbol}: allocation ₹{allocation:,.0f} < 1 share at ₹{ltp:,.2f}")
-            continue
 
-        actual_allocated = round(quantity * ltp, 2)
-
-        # Bearish = negative quantity (simulated short)
         if direction == "bearish":
-            quantity = -quantity
+            # --- Put option path ---
+            position = _open_put_position(smart_api, symbol, token, ltp, allocation, alloc)
+            if position is None:
+                continue
+        else:
+            # --- Equity buy path ---
+            quantity = math.floor(allocation / ltp)
+            if quantity < 1:
+                print(f"  SKIP {symbol}: allocation ₹{allocation:,.0f} < 1 share at ₹{ltp:,.2f}")
+                continue
 
-        # Compute target and stoploss
-        target_price = round(ltp * (1 + TARGET_PCT / 100), 2)
-        stoploss_price = round(ltp * (1 + STOPLOSS_PCT / 100), 2)
-        if direction == "bearish":
-            # For shorts: target is below entry, SL is above
-            target_price = round(ltp * (1 - TARGET_PCT / 100), 2)
-            stoploss_price = round(ltp * (1 - STOPLOSS_PCT / 100), 2)
+            actual_allocated = round(quantity * ltp, 2)
+            target_price = round(ltp * (1 + TARGET_PCT / 100), 2)
+            stoploss_price = round(ltp * (1 + STOPLOSS_PCT / 100), 2)
+            max_hold_date = _add_trading_days(today, MAX_HOLD_DAYS)
 
-        max_hold_date = _add_trading_days(today, MAX_HOLD_DAYS)
+            position = {
+                "symbol": symbol,
+                "token": token,
+                "direction": direction,
+                "instrument": "EQ",
+                "entry_price": ltp,
+                "quantity": quantity,
+                "allocated": actual_allocated,
+                "score": alloc["score"],
+                "categories": alloc.get("categories", []),
+                "entry_date": today,
+                "target_price": target_price,
+                "stoploss_price": stoploss_price,
+                "max_hold_date": max_hold_date,
+                "status": "open",
+            }
 
-        position = {
-            "symbol": symbol,
-            "token": token,
-            "direction": direction,
-            "entry_price": ltp,
-            "quantity": quantity,
-            "allocated": actual_allocated,
-            "score": alloc["score"],
-            "categories": alloc.get("categories", []),
-            "entry_date": today,
-            "target_price": target_price,
-            "stoploss_price": stoploss_price,
-            "max_hold_date": max_hold_date,
-            "status": "open",
-        }
+            print(f"  OPENED {symbol} BUY x{quantity} @ ₹{ltp:,.2f} "
+                  f"(₹{actual_allocated:,.0f}, score={alloc['score']:.1f})")
 
         portfolio["positions"].append(position)
-        portfolio["available_capital"] = round(portfolio["available_capital"] - actual_allocated, 2)
+        portfolio["available_capital"] = round(
+            portfolio["available_capital"] - position["allocated"], 2)
         opened += 1
-
-        dir_tag = "BUY" if direction == "bullish" else "SHORT"
-        print(f"  OPENED {symbol} {dir_tag} x{abs(quantity)} @ ₹{ltp:,.2f} "
-              f"(₹{actual_allocated:,.0f}, score={alloc['score']:.1f})")
 
     return opened
 
@@ -313,8 +512,12 @@ def close_position(portfolio: dict, pos: dict, exit_price: float, reason: str) -
     quantity = pos["quantity"]
     abs_qty = abs(quantity)
 
-    pnl_pct = calc_pnl_pct(entry_price, exit_price, direction)
-    if direction == "bullish":
+    # Option positions: we bought the put, so P&L = premium change (bullish calc)
+    is_option = pos.get("instrument") == "OPT"
+    pnl_direction = "bullish" if is_option else direction
+
+    pnl_pct = calc_pnl_pct(entry_price, exit_price, pnl_direction)
+    if pnl_direction == "bullish":
         pnl = round((exit_price - entry_price) * abs_qty, 2)
     else:
         pnl = round((entry_price - exit_price) * abs_qty, 2)
@@ -380,38 +583,69 @@ def monitor_positions(smart_api, portfolio: dict) -> int:
 
     for pos in open_positions:
         symbol = pos["symbol"]
+        is_option = pos.get("instrument") == "OPT"
 
         # Check max hold expiry first (doesn't need LTP)
         expired = today > pos["max_hold_date"]
 
-        # Fetch current LTP
-        ltp = get_ltp(smart_api, symbol, pos["token"])
-        if ltp is None:
-            # Try with -EQ suffix
-            ltp = get_ltp(smart_api, f"{symbol}-EQ", pos["token"])
+        # Check DTE-based forced exit for options
+        dte_expired = False
+        dte = None
+        if is_option:
+            dte = days_to_expiry(pos["expiry"])
+            if dte < MIN_DTE_TO_HOLD:
+                dte_expired = True
+
+        # Fetch current LTP (NFO for options, NSE for equity)
+        if is_option:
+            ltp = get_ltp_nfo(smart_api, pos.get("contract_symbol", symbol), pos["token"])
+        else:
+            ltp = get_ltp(smart_api, symbol, pos["token"])
+            if ltp is None:
+                ltp = get_ltp(smart_api, f"{symbol}-EQ", pos["token"])
         time.sleep(config.API_DELAY)
 
         if ltp is None:
             print(f"  {symbol}: could not fetch LTP, skipping")
             continue
 
-        pnl_pct = calc_pnl_pct(pos["entry_price"], ltp, pos["direction"])
+        # P&L: options use "bullish" direction (bought the put)
+        pnl_direction = "bullish" if is_option else pos["direction"]
+        pnl_pct = calc_pnl_pct(pos["entry_price"], ltp, pnl_direction)
 
-        if pnl_pct >= TARGET_PCT:
+        # Thresholds depend on instrument
+        target_pct = PUT_TARGET_PCT if is_option else TARGET_PCT
+        stoploss_pct = PUT_STOPLOSS_PCT if is_option else STOPLOSS_PCT
+
+        if pnl_pct >= target_pct:
             reason = "target"
-        elif pnl_pct <= STOPLOSS_PCT:
+        elif pnl_pct <= stoploss_pct:
             reason = "stoploss"
+        elif dte_expired:
+            reason = "expiry"
         elif expired:
             reason = "expiry"
         else:
             day_num = _trading_days_between(pos["entry_date"], today)
             max_days = _trading_days_between(pos["entry_date"], pos["max_hold_date"])
-            print(f"  {symbol}: LTP ₹{ltp:,.2f}  P&L: {pnl_pct:+.1f}%  Day {day_num}/{max_days}  [HOLD]")
+            if is_option:
+                label = (f"  {symbol} PE{int(pos['strike'])}: "
+                         f"Prem ₹{ltp:,.2f}  P&L: {pnl_pct:+.1f}%  "
+                         f"DTE:{dte}  Day {day_num}/{max_days}  [HOLD]")
+            else:
+                label = (f"  {symbol}: LTP ₹{ltp:,.2f}  P&L: {pnl_pct:+.1f}%  "
+                         f"Day {day_num}/{max_days}  [HOLD]")
+            print(label)
             continue
 
         closed = close_position(portfolio, pos, ltp, reason)
         tag = "TARGET" if reason == "target" else "STOPLOSS" if reason == "stoploss" else "EXPIRY"
-        print(f"  {symbol}: EXIT ({tag}) @ ₹{ltp:,.2f}  P&L: {closed['pnl_pct']:+.1f}% (₹{closed['pnl']:+,.0f})")
+        if is_option:
+            print(f"  {symbol} PE{int(pos['strike'])}: EXIT ({tag}) @ ₹{ltp:,.2f}  "
+                  f"P&L: {closed['pnl_pct']:+.1f}% (₹{closed['pnl']:+,.0f})")
+        else:
+            print(f"  {symbol}: EXIT ({tag}) @ ₹{ltp:,.2f}  "
+                  f"P&L: {closed['pnl_pct']:+.1f}% (₹{closed['pnl']:+,.0f})")
         exits += 1
 
     # Clean up closed positions from the open list
@@ -429,9 +663,13 @@ def close_all_positions(smart_api, portfolio: dict) -> int:
 
     exits = 0
     for pos in open_pos:
-        ltp = get_ltp(smart_api, pos["symbol"], pos["token"])
-        if ltp is None:
-            ltp = get_ltp(smart_api, f"{pos['symbol']}-EQ", pos["token"])
+        is_option = pos.get("instrument") == "OPT"
+        if is_option:
+            ltp = get_ltp_nfo(smart_api, pos.get("contract_symbol", pos["symbol"]), pos["token"])
+        else:
+            ltp = get_ltp(smart_api, pos["symbol"], pos["token"])
+            if ltp is None:
+                ltp = get_ltp(smart_api, f"{pos['symbol']}-EQ", pos["token"])
         time.sleep(config.API_DELAY)
 
         if ltp is None:
@@ -475,30 +713,48 @@ def print_portfolio_status(portfolio: dict, smart_api=None) -> None:
 
     if open_pos:
         for pos in open_pos:
-            dir_tag = "BULL" if pos["direction"] == "bullish" else "BEAR"
+            is_option = pos.get("instrument") == "OPT"
             day_num = _trading_days_between(pos["entry_date"], today)
             max_days = _trading_days_between(pos["entry_date"], pos["max_hold_date"])
 
             # Try to get live LTP if smart_api is available
             ltp = None
             if smart_api:
-                ltp = get_ltp(smart_api, pos["symbol"], pos["token"])
-                if ltp is None:
-                    ltp = get_ltp(smart_api, f"{pos['symbol']}-EQ", pos["token"])
+                if is_option:
+                    ltp = get_ltp_nfo(smart_api, pos.get("contract_symbol", pos["symbol"]), pos["token"])
+                else:
+                    ltp = get_ltp(smart_api, pos["symbol"], pos["token"])
+                    if ltp is None:
+                        ltp = get_ltp(smart_api, f"{pos['symbol']}-EQ", pos["token"])
                 time.sleep(config.API_DELAY)
 
-            if ltp:
-                pnl_pct = calc_pnl_pct(pos["entry_price"], ltp, pos["direction"])
-                print(f"  {pos['symbol']:<13}{dir_tag}  "
-                      f"Entry: ₹{pos['entry_price']:,.2f}  "
-                      f"LTP: ₹{ltp:,.2f}  "
-                      f"P&L: {pnl_pct:+.1f}%  "
-                      f"Day {day_num}/{max_days}")
+            if is_option:
+                dte = days_to_expiry(pos["expiry"])
+                tag = f"PE{int(pos['strike'])}"
+                if ltp:
+                    pnl_pct = calc_pnl_pct(pos["entry_price"], ltp, "bullish")
+                    print(f"  {pos['symbol']:<13}{tag}  "
+                          f"Prem: ₹{pos['entry_price']:,.2f} → ₹{ltp:,.2f}  "
+                          f"P&L: {pnl_pct:+.1f}%  "
+                          f"DTE:{dte}  Day {day_num}/{max_days}")
+                else:
+                    print(f"  {pos['symbol']:<13}{tag}  "
+                          f"Prem: ₹{pos['entry_price']:,.2f} → ---  "
+                          f"DTE:{dte}  Day {day_num}/{max_days}")
             else:
-                print(f"  {pos['symbol']:<13}{dir_tag}  "
-                      f"Entry: ₹{pos['entry_price']:,.2f}  "
-                      f"LTP: ---  "
-                      f"Day {day_num}/{max_days}")
+                dir_tag = "BULL" if pos["direction"] == "bullish" else "BEAR"
+                if ltp:
+                    pnl_pct = calc_pnl_pct(pos["entry_price"], ltp, pos["direction"])
+                    print(f"  {pos['symbol']:<13}{dir_tag}  "
+                          f"Entry: ₹{pos['entry_price']:,.2f}  "
+                          f"LTP: ₹{ltp:,.2f}  "
+                          f"P&L: {pnl_pct:+.1f}%  "
+                          f"Day {day_num}/{max_days}")
+                else:
+                    print(f"  {pos['symbol']:<13}{dir_tag}  "
+                          f"Entry: ₹{pos['entry_price']:,.2f}  "
+                          f"LTP: ---  "
+                          f"Day {day_num}/{max_days}")
     else:
         print("  (none)")
 
