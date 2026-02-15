@@ -1,0 +1,94 @@
+# Subreddit Monitoring Configuration
+
+subreddits:
+  # Example: Python help subreddit
+  - name: "learnpython"
+    enabled: true
+
+    # What to monitor
+    monitor:
+      new_posts: true
+      hot_posts: false
+      rising_posts: false
+
+    # Auto-reply settings
+    auto_reply:
+      enabled: true
+      keywords:
+        - "help"
+        - "question"
+        - "how to"
+        - "how do I"
+        - "beginner"
+
+      # Guidelines for AI to follow when replying
+      guidelines: |
+        - Be helpful and encouraging to beginners
+        - Provide clear code examples
+        - Explain concepts simply
+        - Ask clarifying questions if the problem is unclear
+        - Suggest relevant documentation
+        - Be friendly and supportive
+
+      # Additional filters
+      filters:
+        min_upvotes: 0
+        max_upvotes: null  # null means no limit
+        require_question_mark: false
+        avoid_keywords: ["solved", "thanks", "resolved"]
+
+    # Reply probability for this subreddit
+    reply_probability: 0.6
+
+  # Example: Another subreddit
+  - name: "AskReddit"
+    enabled: false  # Disabled by default
+
+    monitor:
+      new_posts: true
+      hot_posts: true
+
+    auto_reply:
+      enabled: true
+      keywords:
+        - "what's your"
+        - "what is your"
+        - "share your"
+
+      guidelines: |
+        - Share personal experiences authentically
+        - Be conversational and natural
+        - Keep responses concise
+        - Add humor when appropriate
+        - Stay on topic
+
+      filters:
+        min_upvotes: 10  # Only reply to posts with some traction
+
+    reply_probability: 0.3  # Reply less frequently
+
+  # Example: Tech support subreddit
+  - name: "techsupport"
+    enabled: false
+
+    monitor:
+      new_posts: true
+
+    auto_reply:
+      enabled: true
+      keywords:
+        - "help"
+        - "issue"
+        - "problem"
+        - "not working"
+
+      guidelines: |
+        - Ask diagnostic questions
+        - Provide step-by-step troubleshooting
+        - Be patient and understanding
+        - Avoid assuming user's technical knowledge
+        - Suggest safe solutions first
+
+    reply_probability: 0.5
+
+# Add more subreddits as needed

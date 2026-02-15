@@ -1,0 +1,48 @@
+# User Tracking Configuration
+
+tracked_users:
+  # Example user tracking
+  - username: "example_user"
+    enabled: false
+
+    # What to track
+    track:
+      posts: true
+      comments: true
+      hidden_posts: true  # Check user profile even if posts are hidden
+
+    # Check frequency (in seconds)
+    check_interval: 60  # Check every minute
+
+    # Notifications
+    notify:
+      new_post: true
+      new_comment: true
+      post_in_specific_subreddit: null  # null = all subreddits
+      comment_in_specific_subreddit: null
+
+    # Custom notification message
+    notification_template: |
+      🔔 User Activity Alert
+      User: u/{username}
+      Action: {action_type}
+      Subreddit: r/{subreddit}
+      Title: {title}
+      URL: {url}
+
+  # Add more users to track
+  - username: "another_user"
+    enabled: false
+    track:
+      posts: true
+      comments: false
+      hidden_posts: false
+    check_interval: 300  # Check every 5 minutes
+    notify:
+      new_post: true
+      new_comment: false
+
+# Notes:
+# - Set enabled: true to activate tracking for a user
+# - check_interval can be adjusted per user (in seconds)
+# - hidden_posts: true will check the user's profile page directly

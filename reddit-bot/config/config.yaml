@@ -1,0 +1,90 @@
+# Reddit Bot Configuration
+
+# AI Settings
+ai:
+  provider: "claude"  # Options: claude, openai, local
+  model: "claude-sonnet-4.5"  # or "gpt-4", "gpt-4-turbo"
+
+  # Response style settings
+  style:
+    learn_from_history: true
+    comment_samples: 50  # Analyze your last N comments to learn style
+    match_formality: true
+    match_length: true
+    add_personality: true
+
+  # Quality control
+  approval_mode: "manual"  # Options: manual, auto, threshold
+  confidence_threshold: 0.8  # For threshold mode
+  max_response_length: 500  # Max characters in response
+
+# Monitoring Settings
+monitoring:
+  check_interval: 300  # Check every 5 minutes (in seconds)
+  max_posts_per_check: 50  # Max posts to process per check
+
+# Reply Settings
+reply:
+  enabled: true
+
+  # Timing to appear natural
+  timing:
+    min_delay_seconds: 120  # Wait at least 2 minutes before replying
+    max_delay_seconds: 1800  # Reply within 30 minutes
+    randomize: true
+
+  # Rate limiting
+  rate_limit:
+    max_replies_per_hour: 5
+    max_replies_per_day: 30
+    cooldown_between_replies: 300  # 5 minutes
+
+  # Avoid detection
+  anti_detection:
+    reply_probability: 0.7  # Don't reply to everything (70% chance)
+    skip_if_too_many_replies: 10  # Skip if post already has this many replies
+    skip_if_post_age_hours: 24  # Don't reply to posts older than 24 hours
+    skip_if_already_replied: true  # Never reply twice to same post
+
+# User Tracking
+user_tracking:
+  enabled: true
+  check_interval: 60  # Check every minute
+  users: []  # List of usernames to track (configure in users.yaml)
+
+  notify_on:
+    new_post: true
+    new_comment: true
+    hidden_posts: true  # Track even hidden posts via user profile
+
+# Subreddit Monitoring
+subreddit_monitoring:
+  enabled: true
+  subreddits: []  # List of subreddits (configure in subreddits.yaml)
+
+# Notifications
+notifications:
+  enabled: true
+
+  channels:
+    console: true  # Print to console
+    email: false
+    telegram: false
+    discord: false
+
+  notify_on:
+    tracked_user_activity: true
+    new_subreddit_posts: true
+    auto_reply_posted: true
+    errors: true
+
+# Database
+database:
+  path: "data/bot.db"
+
+# Logging
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  file: "logs/bot.log"
+  max_size_mb: 10
+  backup_count: 5
