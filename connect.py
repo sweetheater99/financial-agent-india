@@ -10,10 +10,30 @@ Usage:
     python connect.py
 """
 
+import logging
 import sys
 import pyotp
 from SmartApi import SmartConnect
 import config
+
+logger = logging.getLogger("paper_trade")
+
+
+def refresh_session(smart_api: SmartConnect) -> None:
+    """Re-authenticate an existing SmartConnect session in-place using fresh TOTP."""
+    totp = pyotp.TOTP(config.ANGELONE_TOTP_SECRET)
+    totp_code = totp.now()
+
+    session = smart_api.generateSession(
+        clientCode=config.ANGELONE_CLIENT_ID,
+        password=config.ANGELONE_PASSWORD,
+        totp=totp_code,
+    )
+
+    if session.get("status") is False:
+        raise RuntimeError(f"Session refresh failed: {session.get('message')}")
+
+    logger.info("Session refreshed for %s", config.ANGELONE_CLIENT_ID)
 
 
 def get_session() -> SmartConnect:

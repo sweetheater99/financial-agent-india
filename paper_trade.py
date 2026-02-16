@@ -22,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import config
-from connect import get_session
+from connect import get_session, refresh_session
 from agent_with_options import fetch_option_chain, get_nearest_expiry
 from indicators import compute_atr
 from screener import (
@@ -195,6 +195,26 @@ logger = _setup_logger()
 
 
 # ---------------------------------------------------------------------------
+# Session Error Detection
+# ---------------------------------------------------------------------------
+
+class SessionExpiredError(Exception):
+    """Raised when an API call fails due to expired/invalid session."""
+    pass
+
+
+def _is_session_error(resp) -> bool:
+    """Check if an API response indicates session expiry."""
+    if not isinstance(resp, dict):
+        return False
+    code = resp.get("errorcode", "")
+    if code == "AB1010":
+        return True
+    msg = resp.get("message", "")
+    return "Invalid Session" in msg or "Session is Expired" in msg
+
+
+# ---------------------------------------------------------------------------
 # macOS Notifications
 # ---------------------------------------------------------------------------
 
@@ -331,24 +351,32 @@ def resolve_token(smart_api, symbol: str) -> tuple[str, str] | None:
 
 
 def get_ltp(smart_api, symbol: str, token: str) -> float | None:
-    """Fetch current last traded price for a stock."""
+    """Fetch current last traded price for a stock.
+
+    Raises SessionExpiredError if the API session has expired.
+    """
     try:
         resp = smart_api.ltpData("NSE", symbol, token)
+        if _is_session_error(resp):
+            raise SessionExpiredError(symbol)
         if resp and resp.get("data"):
             ltp = resp["data"].get("ltp")
             if ltp is not None:
                 return float(ltp)
+    except SessionExpiredError:
+        raise
     except Exception:
         pass
 
     # Fallback: getMarketData
     try:
-        resp = smart_api.getMarketData({
-            "mode": "LTP",
-            "exchangeTokens": {"NSE": [token]},
-        })
+        resp = smart_api.getMarketData(mode="LTP", exchangeTokens={"NSE": [token]})
+        if _is_session_error(resp):
+            raise SessionExpiredError(symbol)
         if resp and resp.get("data") and resp["data"].get("fetched"):
             return float(resp["data"]["fetched"][0]["ltp"])
+    except SessionExpiredError:
+        raise
     except Exception as e:
         logger.warning("LTP fetch failed for %s: %s", symbol, e)
     return None
@@ -359,23 +387,31 @@ def get_ltp(smart_api, symbol: str, token: str) -> float | None:
 # ---------------------------------------------------------------------------
 
 def get_ltp_nfo(smart_api, symbol: str, token: str) -> float | None:
-    """Fetch current last traded price for an NFO contract (options/futures)."""
+    """Fetch current last traded price for an NFO contract (options/futures).
+
+    Raises SessionExpiredError if the API session has expired.
+    """
     try:
         resp = smart_api.ltpData("NFO", symbol, token)
+        if _is_session_error(resp):
+            raise SessionExpiredError(symbol)
         if resp and resp.get("data"):
             ltp = resp["data"].get("ltp")
             if ltp is not None:
                 return float(ltp)
+    except SessionExpiredError:
+        raise
     except Exception:
         pass
 
     try:
-        resp = smart_api.getMarketData({
-            "mode": "LTP",
-            "exchangeTokens": {"NFO": [token]},
-        })
+        resp = smart_api.getMarketData(mode="LTP", exchangeTokens={"NFO": [token]})
+        if _is_session_error(resp):
+            raise SessionExpiredError(symbol)
         if resp and resp.get("data") and resp["data"].get("fetched"):
             return float(resp["data"]["fetched"][0]["ltp"])
+    except SessionExpiredError:
+        raise
     except Exception as e:
         logger.warning("NFO LTP fetch failed for %s: %s", symbol, e)
     return None
@@ -1200,6 +1236,7 @@ def monitor_positions(smart_api, portfolio: dict) -> int:
 
     today = _today_ist()
     exits = 0
+    session_refreshed = False
 
     for pos in open_pos:
         symbol = pos["symbol"]
@@ -1216,13 +1253,30 @@ def monitor_positions(smart_api, portfolio: dict) -> int:
             if dte < MIN_DTE_TO_HOLD:
                 dte_expired = True
 
-        # Fetch current LTP (NFO for options, NSE for equity)
-        if is_option:
-            ltp = get_ltp_nfo(smart_api, pos.get("contract_symbol", symbol), pos["token"])
-        else:
-            ltp = get_ltp(smart_api, symbol, pos["token"])
-            if ltp is None:
-                ltp = get_ltp(smart_api, f"{symbol}-EQ", pos["token"])
+        # Fetch current LTP with session-refresh retry
+        ltp = None
+        for _attempt in range(2):
+            try:
+                if is_option:
+                    ltp = get_ltp_nfo(smart_api, pos.get("contract_symbol", symbol), pos["token"])
+                else:
+                    ltp = get_ltp(smart_api, symbol, pos["token"])
+                    if ltp is None:
+                        ltp = get_ltp(smart_api, f"{symbol}-EQ", pos["token"])
+                break  # no session error, proceed
+            except SessionExpiredError:
+                if _attempt == 0 and not session_refreshed:
+                    logger.info("Session expired, re-authenticating...")
+                    try:
+                        refresh_session(smart_api)
+                        session_refreshed = True
+                        time.sleep(config.API_DELAY)
+                        continue  # retry LTP fetch
+                    except Exception as e:
+                        logger.warning("Session refresh failed: %s", e)
+                        break
+                else:
+                    break  # already refreshed once, give up
         time.sleep(config.API_DELAY)
 
         if ltp is None:
@@ -1380,14 +1434,32 @@ def close_all_positions(smart_api, portfolio: dict) -> int:
         return 0
 
     exits = 0
+    session_refreshed = False
     for pos in open_pos:
         is_option = pos.get("instrument") == "OPT"
-        if is_option:
-            ltp = get_ltp_nfo(smart_api, pos.get("contract_symbol", pos["symbol"]), pos["token"])
-        else:
-            ltp = get_ltp(smart_api, pos["symbol"], pos["token"])
-            if ltp is None:
-                ltp = get_ltp(smart_api, f"{pos['symbol']}-EQ", pos["token"])
+        ltp = None
+        for _attempt in range(2):
+            try:
+                if is_option:
+                    ltp = get_ltp_nfo(smart_api, pos.get("contract_symbol", pos["symbol"]), pos["token"])
+                else:
+                    ltp = get_ltp(smart_api, pos["symbol"], pos["token"])
+                    if ltp is None:
+                        ltp = get_ltp(smart_api, f"{pos['symbol']}-EQ", pos["token"])
+                break
+            except SessionExpiredError:
+                if _attempt == 0 and not session_refreshed:
+                    logger.info("Session expired, re-authenticating...")
+                    try:
+                        refresh_session(smart_api)
+                        session_refreshed = True
+                        time.sleep(config.API_DELAY)
+                        continue
+                    except Exception as e:
+                        logger.warning("Session refresh failed: %s", e)
+                        break
+                else:
+                    break
         time.sleep(config.API_DELAY)
 
         if ltp is None:
@@ -1441,12 +1513,15 @@ def print_portfolio_status(portfolio: dict, smart_api=None) -> None:
             # Try to get live LTP if smart_api is available
             ltp = None
             if smart_api:
-                if is_option:
-                    ltp = get_ltp_nfo(smart_api, pos.get("contract_symbol", pos["symbol"]), pos["token"])
-                else:
-                    ltp = get_ltp(smart_api, pos["symbol"], pos["token"])
-                    if ltp is None:
-                        ltp = get_ltp(smart_api, f"{pos['symbol']}-EQ", pos["token"])
+                try:
+                    if is_option:
+                        ltp = get_ltp_nfo(smart_api, pos.get("contract_symbol", pos["symbol"]), pos["token"])
+                    else:
+                        ltp = get_ltp(smart_api, pos["symbol"], pos["token"])
+                        if ltp is None:
+                            ltp = get_ltp(smart_api, f"{pos['symbol']}-EQ", pos["token"])
+                except SessionExpiredError:
+                    pass  # dashboard is display-only, skip on session error
                 time.sleep(config.API_DELAY)
 
             if is_option:
