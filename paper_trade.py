@@ -1225,7 +1225,7 @@ def close_position(portfolio: dict, pos: dict, exit_price: float, reason: str,
     return closed
 
 
-def monitor_positions(smart_api, portfolio: dict) -> int:
+def monitor_positions(smart_api, portfolio: dict) -> tuple:
     """
     Check each open position for exit conditions. Returns number of exits.
     """
@@ -1236,6 +1236,7 @@ def monitor_positions(smart_api, portfolio: dict) -> int:
 
     today = _today_ist()
     exits = 0
+    unrealized_pnl = 0.0
     session_refreshed = False
 
     for pos in open_pos:
@@ -1384,15 +1385,22 @@ def monitor_positions(smart_api, portfolio: dict) -> int:
                 reason = "expiry"
 
         if reason is None:
-            # HOLD
+            # HOLD — calculate unrealized rupee P&L
+            qty = abs(pos["quantity"])
+            if is_option:
+                pos_pnl = (ltp - pos["entry_price"]) * qty  # bought put, long position
+            elif pos["direction"] == "bullish":
+                pos_pnl = (ltp - pos["entry_price"]) * qty
+            else:
+                pos_pnl = (pos["entry_price"] - ltp) * qty
+            unrealized_pnl += pos_pnl
+
             day_num = _trading_days_between(pos["entry_date"], today)
             max_days = _trading_days_between(pos["entry_date"], pos["max_hold_date"])
             if is_option:
-                logger.info("%s PE%d: Prem ₹%.2f  P&L: %+.1f%%  DTE:%s  Day %d/%d  [HOLD]",
-                            symbol, int(pos['strike']), ltp, pnl_pct, dte, day_num, max_days)
+                logger.info(f"{symbol} PE{int(pos['strike'])}: Prem ₹{ltp:.2f}  P&L: {pnl_pct:+.1f}% (₹{pos_pnl:+,.0f})  DTE:{dte}  Day {day_num}/{max_days}  [HOLD]")
             else:
-                logger.info("%s: LTP ₹%.2f  P&L: %+.1f%%  Day %d/%d  [HOLD]",
-                            symbol, ltp, pnl_pct, day_num, max_days)
+                logger.info(f"{symbol}: LTP ₹{ltp:.2f}  P&L: {pnl_pct:+.1f}% (₹{pos_pnl:+,.0f})  Day {day_num}/{max_days}  [HOLD]")
             continue
 
         # --- Partial exit for equity target ---
@@ -1423,7 +1431,7 @@ def monitor_positions(smart_api, portfolio: dict) -> int:
     # Clean up closed positions from the open list
     portfolio["positions"] = [p for p in portfolio["positions"] if p["status"] == "open"]
 
-    return exits
+    return exits, unrealized_pnl
 
 
 def close_all_positions(smart_api, portfolio: dict) -> int:
@@ -1706,14 +1714,15 @@ def run_paper_trade(smart_api, mode: str) -> None:
     elif mode == "monitor":
         logger.info("\n=== PAPER TRADE: Monitoring positions ===\n")
 
-        exits = monitor_positions(smart_api, portfolio)
+        exits, unrealized_pnl = monitor_positions(smart_api, portfolio)
         if exits:
             logger.info("\n  %d position(s) closed.", exits)
         save_portfolio(portfolio)
 
         # Print brief status
         open_count = len([p for p in portfolio["positions"] if p["status"] == "open"])
-        logger.info("Open: %d  |  Total P&L: ₹%+.0f", open_count, portfolio['stats']['total_pnl'])
+        realized_pnl = portfolio['stats']['total_pnl']
+        logger.info(f"Open: {open_count}  |  Unrealized: ₹{unrealized_pnl:+,.0f}  |  Realized: ₹{realized_pnl:+,.0f}  |  Total: ₹{unrealized_pnl + realized_pnl:+,.0f}")
 
     elif mode == "status":
         print_portfolio_status(portfolio, smart_api)
