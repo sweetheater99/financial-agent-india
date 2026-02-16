@@ -2,7 +2,7 @@
 Paper Trading Engine — tracks simulated positions based on F&O screener signals.
 
 Runs the screener, opens score-weighted paper positions on top candidates,
-monitors for +5% target / -3% stop-loss / 5-day expiry, and tracks cumulative P&L.
+monitors for ATR-based target / stop-loss / 7-day expiry, and tracks cumulative P&L.
 
 Usage:
     python paper_trade.py open        # run screener + open new positions
@@ -41,7 +41,7 @@ PORTFOLIO_FILE = PORTFOLIO_DIR / "portfolio.json"
 TOTAL_CAPITAL = 100_000
 TARGET_PCT = 5.0       # +5% profit target
 STOPLOSS_PCT = -3.0    # -3% stop-loss
-MAX_HOLD_DAYS = 5      # force exit after 5 trading days
+MAX_HOLD_DAYS = 7      # force exit after 7 trading days
 TOP_N = 5              # top candidates to trade
 MIN_CAPITAL = 1_000    # minimum capital to open new positions
 
@@ -126,12 +126,13 @@ SYMBOL_SECTOR = {
 }
 
 # --- Trailing Stop-Loss ---
-TRAILING_STOP_PCT = 2.0         # -2% from peak for equity
-OPT_TRAILING_STOP_PCT = 25.0    # -25% from peak premium for options
+ATR_TRAILING_MULTIPLIER = 1.0       # trailing SL = peak ± 1.0*ATR (equity)
+LEGACY_TRAILING_STOP_PCT = 2.0      # fallback for positions without ATR
+OPT_TRAILING_STOP_PCT = 25.0        # -25% from peak premium for options
 
 # --- ATR-Based Exits (equity only) ---
 ATR_PERIOD = 14
-ATR_TARGET_MULTIPLIER = 2.0     # target = entry + 2*ATR
+ATR_TARGET_MULTIPLIER = 2.5     # target = entry + 2.5*ATR
 ATR_STOPLOSS_MULTIPLIER = 1.5   # SL = entry - 1.5*ATR
 
 # --- Option Theta Awareness ---
@@ -1336,13 +1337,12 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
             atr_at_entry = pos.get("atr_at_entry")
 
             if atr_at_entry is not None:
-                # ATR-based: price thresholds
+                # ATR-based: price thresholds + ATR-based trailing stop
                 if pos["direction"] == "bullish":
                     if ltp >= pos["target_price"]:
                         reason = "target"
                     else:
-                        # Trailing stop
-                        trailing_sl = peak * (1 - TRAILING_STOP_PCT / 100)
+                        trailing_sl = peak - ATR_TRAILING_MULTIPLIER * atr_at_entry
                         fixed_sl = pos["stoploss_price"]
                         effective_sl = max(trailing_sl, fixed_sl)
                         if ltp <= effective_sl:
@@ -1351,19 +1351,18 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
                     if ltp <= pos["target_price"]:
                         reason = "target"
                     else:
-                        trailing_sl = peak * (1 + TRAILING_STOP_PCT / 100)
+                        trailing_sl = peak + ATR_TRAILING_MULTIPLIER * atr_at_entry
                         fixed_sl = pos["stoploss_price"]
                         effective_sl = min(trailing_sl, fixed_sl)
                         if ltp >= effective_sl:
                             reason = "trailing_stop" if trailing_sl < fixed_sl else "stoploss"
             else:
-                # Legacy percentage-based
+                # Legacy percentage-based (no ATR data)
                 target_pct = TARGET_PCT
                 stoploss_pct = STOPLOSS_PCT
 
                 if pos["direction"] == "bullish":
-                    # Trailing stop for bullish equity
-                    trailing_sl = peak * (1 - TRAILING_STOP_PCT / 100)
+                    trailing_sl = peak * (1 - LEGACY_TRAILING_STOP_PCT / 100)
                     fixed_sl = pos.get("stoploss_price", pos["entry_price"] * (1 + stoploss_pct / 100))
                     effective_sl = max(trailing_sl, fixed_sl)
 
@@ -1372,7 +1371,7 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
                     elif ltp <= effective_sl:
                         reason = "trailing_stop" if trailing_sl > fixed_sl else "stoploss"
                 else:
-                    trailing_sl = peak * (1 + TRAILING_STOP_PCT / 100)
+                    trailing_sl = peak * (1 + LEGACY_TRAILING_STOP_PCT / 100)
                     fixed_sl = pos.get("stoploss_price", pos["entry_price"] * (1 - stoploss_pct / 100))
                     effective_sl = min(trailing_sl, fixed_sl)
 
@@ -1400,7 +1399,21 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
             if is_option:
                 logger.info(f"{symbol} PE{int(pos['strike'])}: Prem ₹{ltp:.2f}  P&L: {pnl_pct:+.1f}% (₹{pos_pnl:+,.0f})  DTE:{dte}  Day {day_num}/{max_days}  [HOLD]")
             else:
-                logger.info(f"{symbol}: LTP ₹{ltp:.2f}  P&L: {pnl_pct:+.1f}% (₹{pos_pnl:+,.0f})  Day {day_num}/{max_days}  [HOLD]")
+                # Compute effective trailing SL for display
+                atr_hold = pos.get("atr_at_entry")
+                if atr_hold is not None:
+                    if pos["direction"] == "bullish":
+                        trail_display = max(peak - ATR_TRAILING_MULTIPLIER * atr_hold, pos["stoploss_price"])
+                    else:
+                        trail_display = min(peak + ATR_TRAILING_MULTIPLIER * atr_hold, pos["stoploss_price"])
+                else:
+                    if pos["direction"] == "bullish":
+                        trail_display = max(peak * (1 - LEGACY_TRAILING_STOP_PCT / 100),
+                                            pos.get("stoploss_price", pos["entry_price"] * (1 + STOPLOSS_PCT / 100)))
+                    else:
+                        trail_display = min(peak * (1 + LEGACY_TRAILING_STOP_PCT / 100),
+                                            pos.get("stoploss_price", pos["entry_price"] * (1 - STOPLOSS_PCT / 100)))
+                logger.info(f"{symbol}: LTP ₹{ltp:.2f}  P&L: {pnl_pct:+.1f}% (₹{pos_pnl:+,.0f})  Trail: ₹{trail_display:.2f}  Day {day_num}/{max_days}  [HOLD]")
             continue
 
         # --- Partial exit for equity target ---

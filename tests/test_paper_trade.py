@@ -20,7 +20,8 @@ from paper_trade import (
     TOTAL_CAPITAL,
     COOLDOWN_DAYS,
     MAX_POSITIONS_PER_SECTOR,
-    TRAILING_STOP_PCT,
+    ATR_TRAILING_MULTIPLIER,
+    LEGACY_TRAILING_STOP_PCT,
     OPT_TRAILING_STOP_PCT,
     ATR_PERIOD,
     ATR_TARGET_MULTIPLIER,
@@ -1032,7 +1033,7 @@ class TestTrailingStop:
     def test_trailing_stop_triggers(self):
         """Trailing stop fires when LTP drops below peak * (1 - pct)."""
         pos = self._make_equity_position(1000, 1100)
-        trailing_sl = pos["peak_price"] * (1 - TRAILING_STOP_PCT / 100)
+        trailing_sl = pos["peak_price"] * (1 - LEGACY_TRAILING_STOP_PCT / 100)
         # 1100 * 0.98 = 1078
         ltp = 1075
         assert ltp <= trailing_sl
@@ -1040,14 +1041,14 @@ class TestTrailingStop:
     def test_trailing_tighter_than_fixed(self):
         """When peak is high enough, trailing SL is tighter than fixed."""
         pos = self._make_equity_position(1000, 1100)
-        trailing_sl = pos["peak_price"] * (1 - TRAILING_STOP_PCT / 100)
+        trailing_sl = pos["peak_price"] * (1 - LEGACY_TRAILING_STOP_PCT / 100)
         fixed_sl = pos["stoploss_price"]  # 970
         assert trailing_sl > fixed_sl
 
     def test_trailing_weaker_than_fixed(self):
         """When peak hasn't risen much, fixed SL is tighter."""
         pos = self._make_equity_position(1000, 1005)
-        trailing_sl = pos["peak_price"] * (1 - TRAILING_STOP_PCT / 100)
+        trailing_sl = pos["peak_price"] * (1 - LEGACY_TRAILING_STOP_PCT / 100)
         # 1005 * 0.98 = 984.9
         fixed_sl = pos["stoploss_price"]  # 970
         assert trailing_sl > fixed_sl  # trailing is still higher in this range
@@ -1100,9 +1101,9 @@ class TestATR:
         """ATR-based target and SL are computed correctly."""
         entry = 1000.0
         atr = 50.0
-        target = entry + ATR_TARGET_MULTIPLIER * atr  # 1000 + 100 = 1100
+        target = entry + ATR_TARGET_MULTIPLIER * atr  # 1000 + 2.5*50 = 1125
         sl = entry - ATR_STOPLOSS_MULTIPLIER * atr     # 1000 - 75 = 925
-        assert target == pytest.approx(1100.0)
+        assert target == pytest.approx(1125.0)
         assert sl == pytest.approx(925.0)
 
     def test_atr_known_values(self):
