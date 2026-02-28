@@ -819,7 +819,7 @@ def analyze_with_claude(candidates: list[dict], pcr_data: dict | None,
         )
     except Exception as e:
         print(f"Claude API call failed: {e}")
-        sys.exit(1)
+        return {"error": str(e), "market_mood": "unknown", "watchlist": [], "sector_patterns": [], "risk_flags": []}
 
     raw_text = response.content[0].text.strip()
 
@@ -845,7 +845,7 @@ def analyze_with_claude(candidates: list[dict], pcr_data: dict | None,
 
     print("Claude returned invalid JSON:")
     print(raw_text[:500])
-    sys.exit(1)
+    return {"error": "invalid_json", "market_mood": "unknown", "watchlist": [], "sector_patterns": [], "risk_flags": []}
 
 
 # ---------------------------------------------------------------------------
