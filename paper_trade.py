@@ -231,6 +231,99 @@ def _notify(title: str, message: str) -> None:
         pass
 
 
+def _telegram_send(text: str) -> None:
+    """Send a message via Telegram bot. Fails silently."""
+    import os
+    import urllib.request
+    import urllib.parse
+    token = os.environ.get("DEAL_BOT_TOKEN", "")
+    forum_chat_id = os.environ.get("TELEGRAM_FORUM_CHAT_ID", "")
+    topic_id = os.environ.get("TELEGRAM_TOPIC_STOCKS", "")
+    chat_id = os.environ.get("DEAL_BOT_CHAT_ID", "")
+    if not token or not (forum_chat_id or chat_id):
+        return
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {
+            "chat_id": forum_chat_id or chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+        }
+        if forum_chat_id and topic_id:
+            payload["message_thread_id"] = topic_id
+        data = urllib.parse.urlencode(payload).encode()
+        req = urllib.request.Request(url, data=data)
+        urllib.request.urlopen(req, timeout=10)
+    except Exception:
+        pass
+
+
+def _telegram_notify_entry(positions_opened: list[dict]) -> None:
+    """Send Telegram alert for new position entries."""
+    if not positions_opened:
+        return
+    lines = ["<b>📈 Paper Trade: New Positions</b>\n"]
+    for p in positions_opened:
+        direction = "🟢 BULL" if p["direction"] == "bullish" else "🔴 BEAR"
+        lines.append(
+            f"<b>{p['symbol']}</b> {direction}\n"
+            f"  Entry: ₹{p['entry_price']:,.2f}  |  Qty: {p['quantity']}\n"
+            f"  Target: ₹{p['target_price']:,.2f} ({TARGET_PCT:+.0f}%)\n"
+            f"  SL: ₹{p['stoploss_price']:,.2f} ({STOPLOSS_PCT:.0f}%)\n"
+            f"  Allocated: ₹{p['allocated']:,.0f}"
+        )
+    _telegram_send("\n".join(lines))
+
+
+def _telegram_notify_exit(pos: dict, reason: str, pnl: float, pnl_pct: float) -> None:
+    """Send Telegram alert for position exits."""
+    emoji = "✅" if pnl >= 0 else "❌"
+    reason_label = {
+        "target": "Target hit", "stoploss": "Stop-loss hit",
+        "trailing_stop": "Trailing stop hit", "theta_decay": "Theta decay",
+        "partial_target": "Partial target", "expiry": "Max hold expired",
+        "manual": "Manual close",
+    }.get(reason, reason)
+    text = (
+        f"{emoji} <b>Paper Trade Exit: {pos['symbol']}</b>\n"
+        f"  Reason: {reason_label}\n"
+        f"  P&amp;L: {pnl_pct:+.1f}% (₹{pnl:+,.0f})\n"
+        f"  Entry: ₹{pos['entry_price']:,.2f} → Exit: ₹{pos.get('exit_price', 0):,.2f}"
+    )
+    _telegram_send(text)
+
+
+def _telegram_daily_summary(portfolio: dict) -> None:
+    """Send daily portfolio summary via Telegram."""
+    open_pos = [p for p in portfolio["positions"] if p["status"] == "open"]
+    stats = portfolio["stats"]
+    realized = stats["total_pnl"]
+
+    lines = ["<b>📊 Paper Trade Daily Summary</b>\n"]
+    lines.append(f"Capital: ₹{portfolio['capital']:,.0f}  |  Available: ₹{portfolio['available_capital']:,.0f}")
+    lines.append(f"Trades: {stats['total_trades']}  |  Win: {stats['winning_trades']}  |  Loss: {stats['losing_trades']}")
+
+    if stats["total_trades"] > 0:
+        wr = stats["winning_trades"] / stats["total_trades"] * 100
+        lines.append(f"Win Rate: {wr:.0f}%  |  Realized P&amp;L: ₹{realized:+,.0f}")
+
+    if open_pos:
+        lines.append(f"\n<b>Open Positions ({len(open_pos)}):</b>")
+        for p in open_pos:
+            ltp = p.get("ltp_at_entry", p["entry_price"])
+            entry_val = p["entry_price"] * abs(p["quantity"])
+            lines.append(f"  <b>{p['symbol']}</b> — Entry: ₹{p['entry_price']:,.2f}  Qty: {p['quantity']}")
+    else:
+        lines.append("\nNo open positions.")
+
+    if stats.get("best_trade"):
+        lines.append(f"\nBest: {stats['best_trade']['symbol']} ({stats['best_trade']['pnl_pct']:+.1f}%)")
+    if stats.get("worst_trade"):
+        lines.append(f"Worst: {stats['worst_trade']['symbol']} ({stats['worst_trade']['pnl_pct']:+.1f}%)")
+
+    _telegram_send("\n".join(lines))
+
+
 # ---------------------------------------------------------------------------
 # Slippage Modeling
 # ---------------------------------------------------------------------------
@@ -1190,6 +1283,7 @@ def close_position(portfolio: dict, pos: dict, exit_price: float, reason: str,
                     "manual": "Manual close"}.get(reason, reason)
     _notify("Paper Trade Exit",
             f"{pos['symbol']} {reason_label}: {pnl_pct:+.1f}% (₹{emoji}{pnl:,.0f})")
+    _telegram_notify_exit(pos, reason, pnl, pnl_pct)
 
     if close_qty is not None:
         # Partial close: reduce position, free proportional capital
@@ -1718,11 +1812,21 @@ def run_paper_trade(smart_api, mode: str) -> None:
             logger.info("  %d. %-15s [%s]  Score: %.1f%s", i, c['symbol'], dir_tag, c['score'], extra_str)
 
         logger.info("\nOpening positions (available capital: ₹%.0f)...", portfolio['available_capital'])
+        positions_before = {p["symbol"] for p in portfolio["positions"] if p["status"] == "open"}
         opened = open_positions(smart_api, portfolio, top_buffer)
         logger.info("\n  Opened %d position(s).", opened)
 
+        # Telegram alert for new entries
+        if opened > 0:
+            new_positions = [p for p in portfolio["positions"]
+                            if p["status"] == "open" and p["symbol"] not in positions_before]
+            _telegram_notify_entry(new_positions)
+
         save_portfolio(portfolio)
         print_portfolio_status(portfolio)
+
+        # Daily summary after opening
+        _telegram_daily_summary(portfolio)
 
     elif mode == "monitor":
         logger.info("\n=== PAPER TRADE: Monitoring positions ===\n")
