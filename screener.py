@@ -678,7 +678,7 @@ def fetch_news_sentiment(candidates: list[dict]) -> list[dict]:
     try:
         client = config.get_anthropic_client()
         response = client.messages.create(
-            model=config.CLAUDE_MODEL,
+            model=config.CLAUDE_MODEL_LIGHT,
             max_tokens=1024,
             system=NEWS_CLASSIFY_SYSTEM,
             messages=[{"role": "user", "content": "\n".join(prompt_lines)}],
@@ -812,7 +812,7 @@ def analyze_with_claude(candidates: list[dict], pcr_data: dict | None,
 
     try:
         response = client.messages.create(
-            model=config.CLAUDE_MODEL,
+            model=config.CLAUDE_MODEL_LIGHT,
             max_tokens=2048,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_message}],

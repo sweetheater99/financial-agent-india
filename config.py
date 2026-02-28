@@ -24,6 +24,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 # Centralized defaults — change here to update all modules at once
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
+CLAUDE_MODEL_LIGHT = "claude-haiku-4-5-20251001"  # cheap model for classification/formatting
 API_DELAY = 1.5  # seconds between SmartAPI calls to avoid rate-limiting
 
 # Whether claude CLI is available (for Max subscription users)
@@ -74,6 +75,7 @@ class ClaudeCLIClient:
                 "claude-sonnet-4-20250514": "sonnet",
                 "claude-opus-4-20250514": "opus",
                 "claude-haiku-3-5-20241022": "haiku",
+                "claude-haiku-4-5-20251001": "haiku",
             }
             cmd.extend(["--model", model_map.get(model_name, model_name)])
 
