@@ -18,6 +18,7 @@ import anthropic
 
 import config
 from connect import get_session
+from utils import parse_claude_json
 from fetch_data import fetch_candles
 
 # --- Claude setup ---
@@ -99,23 +100,11 @@ def analyze_stock(candles: list, symbol: str) -> dict:
         print(f"Claude API call failed: {e}")
         sys.exit(1)
 
-    # Parse the JSON response
-    raw_text = response.content[0].text.strip()
-
-    # Handle cases where Claude wraps JSON in code fences despite instructions
-    if raw_text.startswith("```"):
-        raw_text = raw_text.split("\n", 1)[1]  # remove first line
-        raw_text = raw_text.rsplit("```", 1)[0]  # remove last fence
-        raw_text = raw_text.strip()
-
     try:
-        analysis = json.loads(raw_text)
-    except json.JSONDecodeError:
-        print("Claude returned something that isn't valid JSON:")
-        print(raw_text[:500])
+        return parse_claude_json(response.content[0].text)
+    except ValueError as e:
+        print(f"Claude returned invalid JSON: {e}")
         sys.exit(1)
-
-    return analysis
 
 
 def print_report(analysis: dict, symbol: str) -> None:

@@ -47,46 +47,7 @@ from agent_with_options import (
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-def parse_claude_json(raw_text: str) -> dict:
-    """Parse JSON from Claude's response, stripping markdown fences if present."""
-    text = raw_text.strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1]
-        text = text.rsplit("```", 1)[0].strip()
-
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-
-    # Fallback: extract JSON object from mixed text
-    match = re.search(r"\{[\s\S]*\}", text)
-    if match:
-        try:
-            return json.loads(match.group())
-        except json.JSONDecodeError:
-            pass
-
-    raise ValueError(f"Could not parse JSON from Claude response: {text[:300]}")
-
-
-def resolve_equity_token(smart_api, symbol: str) -> str | None:
-    """Resolve a stock symbol to its NSE equity token via searchScrip."""
-    try:
-        resp = smart_api.searchScrip("NSE", symbol)
-        if resp and resp.get("data"):
-            # Prefer -EQ suffix (equity segment), fall back to first result
-            token = None
-            for match in resp["data"]:
-                if match.get("tradingsymbol", "").endswith("-EQ"):
-                    token = match.get("symboltoken")
-                    break
-            if not token:
-                token = resp["data"][0].get("symboltoken")
-            return token
-    except Exception as e:
-        print(f"  searchScrip failed for {symbol}: {e}")
-    return None
+from utils import parse_claude_json, resolve_equity_token  # noqa: F401 (re-exported)
 
 
 # ---------------------------------------------------------------------------

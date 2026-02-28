@@ -22,6 +22,7 @@ from pathlib import Path
 import config
 from connect import get_session
 from indicators import compute_rsi, compute_volume_ratio
+from utils import parse_claude_json, resolve_equity_token
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -456,54 +457,38 @@ def enrich_candidates(smart_api, candidates: list[dict]) -> list[dict]:
             cand["volume_ratio"] = None
             continue
 
-        # Resolve equity token
         try:
-            search_resp = smart_api.searchScrip("NSE", symbol)
-            if search_resp and search_resp.get("data"):
-                # Prefer -EQ suffix (equity segment), fall back to first result
-                token = None
-                for match in search_resp["data"]:
-                    if match.get("tradingsymbol", "").endswith("-EQ"):
-                        token = match.get("symboltoken")
-                        break
-                if not token:
-                    token = search_resp["data"][0].get("symboltoken")
-
-                if token:
-                    cand["equity_token"] = token
-                    # Fetch ~25 trading days of candles (40 calendar days)
-                    to_date = datetime.now()
-                    from_date = to_date - timedelta(days=40)
-                    candle_resp = smart_api.getCandleData({
-                        "exchange": "NSE",
-                        "symboltoken": token,
-                        "interval": "ONE_DAY",
-                        "fromdate": from_date.strftime("%Y-%m-%d 09:15"),
-                        "todate": to_date.strftime("%Y-%m-%d 15:30"),
-                    })
-                    if candle_resp and candle_resp.get("data"):
-                        candles = candle_resp["data"]
-                        cand["candles"] = candles
-                        cand["rsi"] = compute_rsi(candles, RSI_PERIOD)
-                        cand["volume_ratio"] = compute_volume_ratio(candles, VOLUME_LOOKBACK)
-                        rsi_str = f"RSI={cand['rsi']:.1f}" if cand['rsi'] is not None else "RSI=N/A"
-                        vol_str = f"Vol={cand['volume_ratio']:.2f}x" if cand['volume_ratio'] is not None else "Vol=N/A"
-                        print(f"  {symbol}: {len(candles)} candles, {rsi_str}, {vol_str}")
-                    else:
-                        cand["candles"] = None
-                        cand["rsi"] = None
-                        cand["volume_ratio"] = None
-                        print(f"  {symbol}: no candle data")
+            token = resolve_equity_token(smart_api, symbol)
+            if token:
+                cand["equity_token"] = token
+                # Fetch ~25 trading days of candles (40 calendar days)
+                to_date = datetime.now()
+                from_date = to_date - timedelta(days=40)
+                candle_resp = smart_api.getCandleData({
+                    "exchange": "NSE",
+                    "symboltoken": token,
+                    "interval": "ONE_DAY",
+                    "fromdate": from_date.strftime("%Y-%m-%d 09:15"),
+                    "todate": to_date.strftime("%Y-%m-%d 15:30"),
+                })
+                if candle_resp and candle_resp.get("data"):
+                    candles = candle_resp["data"]
+                    cand["candles"] = candles
+                    cand["rsi"] = compute_rsi(candles, RSI_PERIOD)
+                    cand["volume_ratio"] = compute_volume_ratio(candles, VOLUME_LOOKBACK)
+                    rsi_str = f"RSI={cand['rsi']:.1f}" if cand['rsi'] is not None else "RSI=N/A"
+                    vol_str = f"Vol={cand['volume_ratio']:.2f}x" if cand['volume_ratio'] is not None else "Vol=N/A"
+                    print(f"  {symbol}: {len(candles)} candles, {rsi_str}, {vol_str}")
                 else:
                     cand["candles"] = None
                     cand["rsi"] = None
                     cand["volume_ratio"] = None
-                    print(f"  {symbol}: token not found")
+                    print(f"  {symbol}: no candle data")
             else:
                 cand["candles"] = None
                 cand["rsi"] = None
                 cand["volume_ratio"] = None
-                print(f"  {symbol}: search returned nothing")
+                print(f"  {symbol}: token not found")
         except Exception as e:
             cand["candles"] = None
             cand["rsi"] = None
@@ -683,14 +668,7 @@ def fetch_news_sentiment(candidates: list[dict]) -> list[dict]:
             system=NEWS_CLASSIFY_SYSTEM,
             messages=[{"role": "user", "content": "\n".join(prompt_lines)}],
         )
-        raw_text = response.content[0].text.strip()
-
-        # Strip markdown fences if present
-        if raw_text.startswith("```"):
-            raw_text = raw_text.split("\n", 1)[1]
-            raw_text = raw_text.rsplit("```", 1)[0].strip()
-
-        news_data = json.loads(raw_text)
+        news_data = parse_claude_json(response.content[0].text)
     except Exception as e:
         print(f"  News classification failed: {e}")
         news_data = {}
@@ -821,31 +799,12 @@ def analyze_with_claude(candidates: list[dict], pcr_data: dict | None,
         print(f"Claude API call failed: {e}")
         return {"error": str(e), "market_mood": "unknown", "watchlist": [], "sector_patterns": [], "risk_flags": []}
 
-    raw_text = response.content[0].text.strip()
-
-    # Strip markdown code fences if present
-    if raw_text.startswith("```"):
-        raw_text = raw_text.split("\n", 1)[1]
-        raw_text = raw_text.rsplit("```", 1)[0]
-        raw_text = raw_text.strip()
-
-    # Try direct parse first
     try:
-        return json.loads(raw_text)
-    except json.JSONDecodeError:
-        pass
-
-    # Fallback: extract JSON object from mixed text (Claude sometimes reasons first)
-    json_match = re.search(r"\{[\s\S]*\}", raw_text)
-    if json_match:
-        try:
-            return json.loads(json_match.group())
-        except json.JSONDecodeError:
-            pass
-
-    print("Claude returned invalid JSON:")
-    print(raw_text[:500])
-    return {"error": "invalid_json", "market_mood": "unknown", "watchlist": [], "sector_patterns": [], "risk_flags": []}
+        return parse_claude_json(response.content[0].text)
+    except ValueError:
+        print("Claude returned invalid JSON:")
+        print(response.content[0].text[:500])
+        return {"error": "invalid_json", "market_mood": "unknown", "watchlist": [], "sector_patterns": [], "risk_flags": []}
 
 
 # ---------------------------------------------------------------------------

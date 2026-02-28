@@ -18,6 +18,7 @@ import anthropic
 
 import config
 from connect import get_session
+from utils import parse_claude_json
 from fetch_data import fetch_candles
 
 SYSTEM_PROMPT = """You are a financial analyst specializing in Indian equities and derivatives (NSE F&O).
@@ -205,21 +206,11 @@ def analyze_with_options(candles: list, options_data: list | None, symbol: str) 
         print(f"Claude API call failed: {e}")
         sys.exit(1)
 
-    raw_text = response.content[0].text.strip()
-
-    if raw_text.startswith("```"):
-        raw_text = raw_text.split("\n", 1)[1]
-        raw_text = raw_text.rsplit("```", 1)[0]
-        raw_text = raw_text.strip()
-
     try:
-        analysis = json.loads(raw_text)
-    except json.JSONDecodeError:
-        print("Claude returned invalid JSON:")
-        print(raw_text[:500])
+        return parse_claude_json(response.content[0].text)
+    except ValueError as e:
+        print(f"Claude returned invalid JSON: {e}")
         sys.exit(1)
-
-    return analysis
 
 
 def print_report(analysis: dict, symbol: str) -> None:
