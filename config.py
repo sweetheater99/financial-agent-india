@@ -333,6 +333,78 @@ PAPER_TRADE_SLIPPAGE_PCT = 0.005  # 0.5%
 # Risk-free rate for Black-Scholes
 RISK_FREE_RATE = 0.065
 
+# ── V3 Global Macro Intelligence ────────────────────────────────────────────
+
+# US Market hard gates
+US_CRASH_BLOCK_PCT = 2.0
+US_SEVERE_CRASH_PCT = 3.0
+US_MILD_RED_PCT = 1.0
+NASDAQ_IT_CRASH_PCT = 3.0
+
+# GIFT Nifty hard gates
+GIFT_GAP_REDUCE_PCT = 1.5
+GIFT_GAP_BLOCK_PCT = 2.5
+
+# FII/DII hard gates (values in crores)
+FII_HEAVY_SELL_CRORES = 5000
+FII_EXTREME_SELL_CRORES = 10000
+DII_SUPPORT_MODERATE_PCT = 0.25
+
+# PCR gates
+PCR_EUPHORIA = 0.5
+PCR_EXTREME_CALL = 0.7
+PCR_EXTREME_PUT = 1.3
+
+# Supertrend
+SUPERTREND_PERIOD = 10
+SUPERTREND_MULTIPLIER = 3.0
+SUPERTREND_DISAGREE_REDUCTION = 0.25
+
+# CPR thresholds
+CPR_NARROW_PCT = 0.3
+CPR_WIDE_PCT = 0.8
+
+# Trailing SL enhancement
+TRAILING_SL_ACTIVATION_PCT = 2.0
+TRAILING_SL_ATR_MULT = 1.5
+
+# Weekly theta strategy
+WEEKLY_THETA_MIN_VIX = 14.0
+WEEKLY_THETA_TARGET_PCT = 0.50
+WEEKLY_THETA_SL_MULTIPLIER = 2.0
+WEEKLY_THETA_MAX_RISK_PCT = 0.02
+WEEKLY_THETA_OTM_POINTS_NIFTY = 250
+WEEKLY_THETA_OTM_POINTS_BANKNIFTY = 600
+
+# BankNifty
+BANKNIFTY_TOKEN = "99926009"
+BANKNIFTY_LOT_SIZE = 30
+BANKNIFTY_VIX_MULTIPLIER = 1.3
+
+# Updated allocations (V3)
+ALLOC_EQUITY_MAX_V3 = 0.35
+ALLOC_SPREADS_MAX_V3 = 0.25
+ALLOC_IRON_CONDOR_MAX_V3 = 0.15
+ALLOC_MOMENTUM_MAX_V3 = 0.10
+ALLOC_WEEKLY_THETA_MAX = 0.10
+ALLOC_CASH_MIN_V3 = 0.05
+
+# X/Twitter intel
+X_SEARCH_QUERIES = [
+    "Nifty today",
+    "GIFT Nifty",
+    "India VIX",
+    "FII selling OR FII buying",
+    "RBI rate",
+    "war India OR sanctions India",
+]
+X_CACHE_HOURS = 1
+X_MIN_LIKES = 50
+
+# Global intel caching
+GLOBAL_INTEL_CACHE_HOURS = 6
+FII_DII_CACHE_HOURS = 12
+
 # YouTube intel config
 YT_CHANNEL_ALLOWLIST = [
     "PR Sundar", "CA Rachana Ranade", "Power of Stocks",

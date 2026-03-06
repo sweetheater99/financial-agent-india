@@ -180,3 +180,32 @@ def test_is_market_open_holiday():
     is_open, msg = is_market_open(_now=_ist(year=2026, month=1, day=26, hour=10))
     assert is_open is False
     assert "holiday" in msg.lower() or "closed" in msg.lower()
+
+
+def test_v3_us_market_constants():
+    from config import US_CRASH_BLOCK_PCT, US_SEVERE_CRASH_PCT, US_MILD_RED_PCT
+    assert US_CRASH_BLOCK_PCT == 2.0
+    assert US_SEVERE_CRASH_PCT == 3.0
+    assert 0 < US_MILD_RED_PCT < US_CRASH_BLOCK_PCT
+
+def test_v3_gift_nifty_constants():
+    from config import GIFT_GAP_REDUCE_PCT, GIFT_GAP_BLOCK_PCT
+    assert GIFT_GAP_REDUCE_PCT < GIFT_GAP_BLOCK_PCT
+
+def test_v3_fii_constants():
+    from config import FII_HEAVY_SELL_CRORES, FII_EXTREME_SELL_CRORES
+    assert FII_HEAVY_SELL_CRORES < FII_EXTREME_SELL_CRORES
+
+def test_v3_allocations_sum():
+    from config import (ALLOC_EQUITY_MAX_V3, ALLOC_SPREADS_MAX_V3,
+                        ALLOC_IRON_CONDOR_MAX_V3, ALLOC_MOMENTUM_MAX_V3,
+                        ALLOC_WEEKLY_THETA_MAX, ALLOC_CASH_MIN_V3)
+    total = (ALLOC_EQUITY_MAX_V3 + ALLOC_SPREADS_MAX_V3 +
+             ALLOC_IRON_CONDOR_MAX_V3 + ALLOC_MOMENTUM_MAX_V3 +
+             ALLOC_WEEKLY_THETA_MAX + ALLOC_CASH_MIN_V3)
+    assert total == 1.0
+
+def test_v3_banknifty_config():
+    from config import BANKNIFTY_TOKEN, BANKNIFTY_LOT_SIZE
+    assert BANKNIFTY_TOKEN == "99926009"
+    assert BANKNIFTY_LOT_SIZE == 30
