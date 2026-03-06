@@ -336,7 +336,7 @@ def _telegram_notify_exit(pos: dict, reason: str, pnl: float, pnl_pct: float,
 
 
 def _telegram_daily_summary(portfolio: dict) -> None:
-    """Send daily portfolio summary via Telegram."""
+    """Send daily portfolio summary via Telegram, including V3 global macro context."""
     open_pos = [p for p in portfolio["positions"] if p["status"] == "open"]
     stats = portfolio["stats"]
     realized = stats["total_pnl"]
@@ -348,6 +348,37 @@ def _telegram_daily_summary(portfolio: dict) -> None:
     if stats["total_trades"] > 0:
         wr = stats["winning_trades"] / stats["total_trades"] * 100
         lines.append(f"Win Rate: {wr:.0f}%  |  Realized P&amp;L: ₹{realized:+,.0f}")
+
+    # V3: Global macro context
+    try:
+        from global_intel import fetch_macro_context
+        macro = fetch_macro_context(prev_nifty_close=0, pcr=1.0)
+        if macro:
+            lines.append(f"\n<b>Global Cues:</b>")
+            lines.append(f"S&amp;P {macro.get('sp500_pct_change', 0):+.1f}% | "
+                         f"Nasdaq {macro.get('nasdaq_pct_change', 0):+.1f}% | "
+                         f"GIFT gap {macro.get('gift_nifty_gap_pct', 0):+.1f}% | "
+                         f"FII {macro.get('fii_net_crores', 0):+.0f}cr")
+            if macro.get("hard_gate") != "NONE":
+                lines.append(f"⚠️ Gate: {macro['hard_gate']} — {macro['hard_gate_reason']}")
+    except Exception:
+        pass
+
+    try:
+        from oi_analysis import compute_pcr
+        from indicators_v3 import compute_supertrend
+        # PCR and Supertrend already cached from open_positions, just log what we have
+    except Exception:
+        pass
+
+    try:
+        from x_intel import fetch_x_sentiment
+        x_sentiment = fetch_x_sentiment()
+        if x_sentiment:
+            themes = ", ".join(x_sentiment.get("key_themes", [])[:3])
+            lines.append(f"X: {x_sentiment.get('sentiment', '?')} ({themes})")
+    except Exception:
+        pass
 
     if open_pos:
         lines.append(f"\n<b>Open Positions ({len(open_pos)}):</b>")
