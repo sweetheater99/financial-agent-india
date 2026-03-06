@@ -154,6 +154,11 @@ def is_market_open(_now=None) -> tuple[bool, str]:
         day_name = "Saturday" if now.weekday() == 5 else "Sunday"
         return (False, f"Market closed ({day_name})")
 
+    # Holiday check
+    today = now.date() if hasattr(now, 'date') and callable(now.date) else now
+    if today in NSE_HOLIDAYS_2026:
+        return (False, "Market closed (NSE holiday)")
+
     market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
     market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
 
@@ -194,6 +199,43 @@ def is_trading_day(d: date) -> bool:
     if d in NSE_HOLIDAYS_2026:
         return False
     return True
+
+
+def trading_days_between(start: date, end: date) -> int:
+    """Count trading days between two dates (exclusive of start, inclusive of end)."""
+    from datetime import timedelta
+    if start >= end:
+        return 0
+    count = 0
+    current = start + timedelta(days=1)
+    while current <= end:
+        if is_trading_day(current):
+            count += 1
+        current += timedelta(days=1)
+    return count
+
+
+def add_trading_days(d: date, n: int) -> date:
+    """Add n trading days to date d. If n is negative, subtract."""
+    from datetime import timedelta
+    step = 1 if n > 0 else -1
+    remaining = abs(n)
+    current = d
+    while remaining > 0:
+        current += timedelta(days=step)
+        if is_trading_day(current):
+            remaining -= 1
+    return current
+
+
+def next_trading_day(d: date) -> date:
+    """Return the next trading day after d."""
+    return add_trading_days(d, 1)
+
+
+def prev_trading_day(d: date) -> date:
+    """Return the previous trading day before d."""
+    return add_trading_days(d, -1)
 
 
 VIX_TIERS = {

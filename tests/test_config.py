@@ -107,3 +107,76 @@ def test_capital_allocation_sums_to_100():
                         ALLOC_IRON_CONDOR_MAX, ALLOC_MOMENTUM_MAX, ALLOC_CASH_MIN)
     total = ALLOC_EQUITY_MAX + ALLOC_SPREADS_MAX + ALLOC_IRON_CONDOR_MAX + ALLOC_MOMENTUM_MAX + ALLOC_CASH_MIN
     assert total == 1.0
+
+
+# --- Trading day helper tests ---
+
+def test_trading_days_between_normal_week():
+    from config import trading_days_between
+    # Mon Mar 9 to Fri Mar 13 = 3 trading days (Tue 10 is Holi, so Wed, Thu, Fri)
+    assert trading_days_between(date(2026, 3, 9), date(2026, 3, 13)) == 3
+
+
+def test_trading_days_between_over_weekend():
+    from config import trading_days_between
+    # Fri Mar 6 to Mon Mar 9 = 1 trading day (Mon)
+    assert trading_days_between(date(2026, 3, 6), date(2026, 3, 9)) == 1
+
+
+def test_trading_days_between_over_holiday():
+    from config import trading_days_between
+    # Day before Republic Day (Jan 23 Fri) to Jan 27 (Tue)
+    # Jan 24 Sat, Jan 25 Sun, Jan 26 Holiday, Jan 27 Tue = 1 trading day
+    assert trading_days_between(date(2026, 1, 23), date(2026, 1, 27)) == 1
+
+
+def test_trading_days_between_same_day():
+    from config import trading_days_between
+    assert trading_days_between(date(2026, 3, 9), date(2026, 3, 9)) == 0
+
+
+def test_add_trading_days_simple():
+    from config import add_trading_days
+    # Mon + 3 trading days = Fri (Tue 10 is Holi, so Wed=1, Thu=2, Fri=3)
+    assert add_trading_days(date(2026, 3, 9), 3) == date(2026, 3, 13)
+
+
+def test_add_trading_days_over_weekend():
+    from config import add_trading_days
+    # Thu + 2 trading days = Mon (skips Sat, Sun)
+    assert add_trading_days(date(2026, 3, 12), 2) == date(2026, 3, 16)
+
+
+def test_add_trading_days_over_holiday():
+    from config import add_trading_days
+    # Fri Jan 23 + 1 = Tue Jan 27 (skips Sat, Sun, Republic Day Mon)
+    assert add_trading_days(date(2026, 1, 23), 1) == date(2026, 1, 27)
+
+
+def test_add_trading_days_negative():
+    from config import add_trading_days
+    # Wed Mar 11 - 2 trading days: Tue 10 is Holi (skip), Mon=1, Fri=2
+    assert add_trading_days(date(2026, 3, 11), -2) == date(2026, 3, 6)
+
+
+def test_next_trading_day_from_friday():
+    from config import next_trading_day
+    assert next_trading_day(date(2026, 3, 6)) == date(2026, 3, 9)  # Skip weekend
+
+
+def test_next_trading_day_from_holiday():
+    from config import next_trading_day
+    # Jan 26 (Mon holiday) -> Jan 27 (Tue)
+    assert next_trading_day(date(2026, 1, 26)) == date(2026, 1, 27)
+
+
+def test_prev_trading_day_from_monday():
+    from config import prev_trading_day
+    assert prev_trading_day(date(2026, 3, 9)) == date(2026, 3, 6)  # Previous Friday
+
+
+def test_is_market_open_holiday():
+    # Republic Day (Monday) at 10:00 AM should be closed
+    is_open, msg = is_market_open(_now=_ist(year=2026, month=1, day=26, hour=10))
+    assert is_open is False
+    assert "holiday" in msg.lower() or "closed" in msg.lower()
