@@ -21,10 +21,14 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pandas as pd
+
 import config
 from connect import get_session, refresh_session
 from agent_with_options import fetch_option_chain, get_nearest_expiry
 from indicators import compute_atr
+from regime import classify_regime as classify_regime_v2, vix_to_iv_percentile
+from risk_manager import RiskManager
 from screener import (
     run_screener, fetch_all_signals, score_signals,
     enrich_candidates, apply_indicator_adjustments,
@@ -1257,7 +1261,8 @@ def calc_performance_analytics(closed_trades: list, capital: float) -> dict | No
 # Open Positions
 # ---------------------------------------------------------------------------
 
-def open_positions(smart_api, portfolio: dict, candidates: list[dict]) -> int:
+def open_positions(smart_api, portfolio: dict, candidates: list[dict],
+                   yt_market: dict | None = None) -> int:
     """
     Open paper positions for top candidates. Returns number of positions opened.
 
@@ -1268,14 +1273,58 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict]) -> int:
                     portfolio['available_capital'], MIN_CAPITAL)
         return 0
 
-    # --- Market Regime Filter ---
-    regime_info = fetch_market_regime(smart_api)
-    regime = regime_info["regime"]
+    # --- Risk Manager: circuit breakers ---
+    rm = RiskManager(initial_capital=TOTAL_CAPITAL)
+    total_pnl = portfolio.get("stats", {}).get("total_pnl", 0)
+    rm._total_pnl = total_pnl
+    rm.current_capital = TOTAL_CAPITAL + total_pnl
+
+    if rm.check_total_stop():
+        logger.warning("FULL STOP: Total drawdown exceeds %.0f%%. No new positions.",
+                        config.DRAWDOWN_TOTAL_STOP * 100)
+        return 0
+
+    size_mult = rm.get_size_multiplier()
+    risk_state = rm.get_risk_state()
+
+    # --- V2 Market Regime Detection ---
+    nifty_candles = fetch_daily_candles(smart_api, NIFTY_TOKEN, days=50)
+    vix_ltp = get_ltp(smart_api, "India VIX", VIX_TOKEN)
+    time.sleep(config.API_DELAY)
+
+    regime_result = None
+    iv_percentile = 50  # default
+
+    if nifty_candles and vix_ltp:
+        nifty_df = pd.DataFrame(nifty_candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        regime_result = classify_regime_v2(nifty_df, vix_ltp, risk_state=risk_state)
+        iv_percentile = regime_result.get("iv_percentile", 50)
+        logger.info("Regime: %s (confidence=%.2f) — %s",
+                    regime_result["regime"], regime_result["confidence"], regime_result["reason"])
+    else:
+        regime_result = {"regime": "UNCERTAIN", "confidence": 0.3, "reason": "data unavailable", "iv_percentile": 50}
+        logger.info("Regime: UNCERTAIN (data unavailable)")
+
+    regime = regime_result["regime"]
+
+    # CASH regime → skip all new positions
+    if regime == "CASH":
+        logger.warning("CASH regime active — skipping all new positions. Reason: %s",
+                        regime_result["reason"])
+        return 0
 
     available_capital = portfolio["available_capital"]
-    if regime == "caution":
+
+    # Apply size multiplier from risk manager (weekly drawdown)
+    if size_mult < 1.0:
+        available_capital = round(available_capital * size_mult, 2)
+        logger.info("Risk manager: weekly drawdown → reducing capital to ₹%.0f (%.0f%%)",
+                    available_capital, size_mult * 100)
+
+    # VOLATILE regime → reduce capital by 50%
+    if regime == "VOLATILE":
         available_capital = round(available_capital * REGIME_SIZE_REDUCTION, 2)
-        logger.info("Market regime: CAUTION — reducing available capital to ₹%.0f", available_capital)
+        logger.info("VOLATILE regime — reducing available capital to ₹%.0f", available_capital)
 
     # Filter out stocks already held
     open_symbols = {p["symbol"] for p in portfolio["positions"] if p["status"] == "open"}
@@ -1307,9 +1356,20 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict]) -> int:
         symbol = c["symbol"]
         direction = c["direction"]
 
-        # Regime filter: skip bullish entries in bearish regime, but allow bearish
-        if regime == "skip" and direction == "bullish":
-            logger.info("SKIP %s: bullish entry blocked in bearish regime", symbol)
+        # V2 regime filter
+        if regime == "TRENDING_DOWN" and direction == "bullish":
+            logger.info("SKIP %s: bullish entry blocked in TRENDING_DOWN regime", symbol)
+            continue
+        if regime == "TRENDING_UP" and direction == "bearish":
+            logger.info("SKIP %s: bearish entry blocked in TRENDING_UP regime", symbol)
+            continue
+        if regime == "SIDEWAYS" and c.get("instrument_hint") != "SPREAD":
+            # In SIDEWAYS, allow spreads but skip directional equity
+            logger.info("SKIP %s: directional equity blocked in SIDEWAYS regime (spreads only)", symbol)
+            continue
+        if regime == "UNCERTAIN" and direction == "bearish":
+            # UNCERTAIN → conservative, equity only (bullish)
+            logger.info("SKIP %s: bearish entry blocked in UNCERTAIN regime (conservative)", symbol)
             continue
         rsi = c.get("rsi")
         vol_ratio = c.get("volume_ratio")
@@ -1346,6 +1406,22 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict]) -> int:
                     logger.info("SKIP %s: bearish signal contradicts positive news", symbol)
                     continue
 
+        # YouTube stock intel gate (Mode B) — only as contradiction filter
+        try:
+            from youtube_intel import fetch_stock_intel
+            yt_stock = fetch_stock_intel(symbol)
+            if yt_stock and yt_stock.get("sentiment"):
+                if (direction == "bullish" and yt_stock["sentiment"] == "bearish" and
+                    yt_stock.get("confidence") == "high"):
+                    logger.info("SKIP %s: YouTube strongly bearish (contradicts bullish signal)", symbol)
+                    continue
+                if (direction == "bearish" and yt_stock["sentiment"] == "bullish" and
+                    yt_stock.get("confidence") == "high"):
+                    logger.info("SKIP %s: YouTube strongly bullish (contradicts bearish signal)", symbol)
+                    continue
+        except Exception:
+            pass  # YouTube intel is optional
+
         quality_filtered.append(c)
 
     if not quality_filtered:
@@ -1359,6 +1435,19 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict]) -> int:
     for alloc in allocations:
         symbol = alloc["symbol"]
         direction = alloc["direction"]
+
+        # Risk manager: check position limits before opening
+        sector = SYMBOL_SECTOR.get(symbol, "Other")
+        allocation = alloc["allocation"]
+        open_pos_for_rm = [
+            {"strategy": p.get("instrument", "EQ"), "sector": SYMBOL_SECTOR.get(p["symbol"], "Other"),
+             "max_loss": p.get("allocated", 0)}
+            for p in portfolio["positions"] if p["status"] == "open"
+        ]
+        allowed, rm_reason = rm.can_open_position(open_pos_for_rm, new_sector=sector, new_max_loss=allocation)
+        if not allowed:
+            logger.info("SKIP %s: %s", symbol, rm_reason)
+            continue
 
         # Resolve equity token + LTP (needed for both paths)
         resolved = resolve_token(smart_api, symbol)
@@ -1374,8 +1463,6 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict]) -> int:
             continue
         time.sleep(config.API_DELAY)
 
-        allocation = alloc["allocation"]
-
         # Intraday momentum confirmation
         if INTRADAY_CONFIRM_ENABLED:
             is_open, _ = config.is_market_open()
@@ -1389,11 +1476,30 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict]) -> int:
                 logger.info("  %s: intraday momentum %s", symbol, momentum_detail)
 
         if direction == "bearish":
-            # --- Put option path ---
-            position = _open_put_position(smart_api, symbol, token, ltp, allocation, alloc)
-            if position is None:
-                continue
+            # --- Bearish path: spread if low IV, else put ---
+            if iv_percentile < 70:
+                # Try spread first (cheaper in low IV)
+                try:
+                    spread_pos = _open_spread_position(
+                        portfolio, symbol, direction, None, allocation,
+                        regime, iv_percentile, ""
+                    )
+                except Exception:
+                    spread_pos = None
+
+                if spread_pos is not None:
+                    position = spread_pos
+                else:
+                    # Fallback to put option
+                    position = _open_put_position(smart_api, symbol, token, ltp, allocation, alloc)
+                    if position is None:
+                        continue
+            else:
+                position = _open_put_position(smart_api, symbol, token, ltp, allocation, alloc)
+                if position is None:
+                    continue
             position["market_regime"] = regime
+            position["iv_percentile"] = iv_percentile
         else:
             # --- Equity buy path ---
             entry_price = apply_slippage(ltp, "EQ", "buy")
@@ -1438,6 +1544,7 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict]) -> int:
                 "atr_at_entry": atr_at_entry,
                 "peak_price": ltp,
                 "market_regime": regime,
+                "iv_percentile": iv_percentile,
                 "max_hold_date": max_hold_date,
                 "status": "open",
             }
@@ -1635,6 +1742,48 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
     for pos in open_pos:
         symbol = pos["symbol"]
         is_option = pos.get("instrument") == "OPT"
+        is_spread = pos.get("instrument") == "SPREAD"
+
+        if is_spread:
+            # --- Spread position monitoring ---
+            underlying_token = pos.get("token", "")
+            underlying_ltp = get_ltp(smart_api, symbol, underlying_token) if underlying_token else None
+            time.sleep(config.API_DELAY)
+
+            if underlying_ltp is None:
+                logger.warning("%s spread: could not fetch underlying LTP, skipping", symbol)
+                continue
+
+            long_premium = estimate_premium_from_underlying(pos, "long", underlying_ltp, today)
+            short_premium = estimate_premium_from_underlying(pos, "short", underlying_ltp, today)
+
+            exit_reason = check_spread_exit(pos, underlying_ltp=underlying_ltp, today=today,
+                                            long_premium=long_premium, short_premium=short_premium)
+
+            if exit_reason:
+                spread_pnl = calc_spread_pnl(
+                    pos["long_leg"]["entry_premium"], long_premium,
+                    pos["short_leg"]["entry_premium"], short_premium,
+                    pos["quantity"],
+                )
+                exit_price = underlying_ltp  # track underlying for reference
+                pnl_pct = (spread_pnl / pos["allocated"]) * 100 if pos["allocated"] > 0 else 0
+                logger.info("EXIT %s spread (%s): P&L ₹%.0f (%.1f%%), reason=%s",
+                            symbol, pos.get("strategy", ""), spread_pnl, pnl_pct, exit_reason)
+                close_position(portfolio, pos, exit_price, exit_reason)
+                exits += 1
+            else:
+                # HOLD — log spread status
+                spread_pnl = calc_spread_pnl(
+                    pos["long_leg"]["entry_premium"], long_premium,
+                    pos["short_leg"]["entry_premium"], short_premium,
+                    pos["quantity"],
+                )
+                pnl_pct = (spread_pnl / pos["allocated"]) * 100 if pos["allocated"] > 0 else 0
+                unrealized_pnl += spread_pnl
+                logger.info("%s spread: underlying ₹%.2f  P&L: ₹%.0f (%.1f%%)  [HOLD]",
+                            symbol, underlying_ltp, spread_pnl, pnl_pct)
+            continue  # skip the EQ/OPT logic below
 
         # Check max hold expiry first (doesn't need LTP)
         expired = today > pos["max_hold_date"]
@@ -2109,9 +2258,21 @@ def run_paper_trade(smart_api, mode: str) -> None:
             extra_str = f"  ({', '.join(extras)})" if extras else ""
             logger.info("  %d. %-15s [%s]  Score: %.1f%s", i, c['symbol'], dir_tag, c['score'], extra_str)
 
+        # YouTube market intel (Mode A)
+        yt_market = None
+        try:
+            from youtube_intel import fetch_market_intel
+            yt_market = fetch_market_intel()
+            if yt_market:
+                logger.info("YouTube intel: bias=%s, confidence=%s",
+                            yt_market.get("market_bias", "unknown"),
+                            yt_market.get("confidence", "unknown"))
+        except Exception as e:
+            logger.debug("YouTube intel unavailable: %s", e)
+
         logger.info("\nOpening positions (available capital: ₹%.0f)...", portfolio['available_capital'])
         positions_before = {p["symbol"] for p in portfolio["positions"] if p["status"] == "open"}
-        opened = open_positions(smart_api, portfolio, top_buffer)
+        opened = open_positions(smart_api, portfolio, top_buffer, yt_market=yt_market)
         logger.info("\n  Opened %d position(s).", opened)
 
         # Telegram alert for new entries
