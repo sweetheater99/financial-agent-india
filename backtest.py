@@ -1,576 +1,500 @@
-"""
-Backtest engine for the F&O screener.
+"""Backtesting engine for equity strategy.
 
-Validates screener predictions against forward price data by:
-1. Loading daily snapshots saved by screener.py
-2. Resolving equity tokens and fetching forward candles via SmartAPI
-3. Calculating forward returns at configurable horizons (1d, 3d, Nd)
-4. Determining hit/miss (bullish+positive=hit, bearish+negative=hit)
-5. Aggregating stats by direction, score tier, and signal type
+Replays historical daily OHLCV data from yfinance and simulates
+the equity long strategy with ATR-based exits, trailing stops,
+and transaction costs.
 
 Usage:
-    python backtest.py                        # all snapshots
-    python backtest.py --date 2026-02-12      # specific date
-    python backtest.py --days 5               # forward horizon (default 5)
-    python backtest.py --top 10               # top N per snapshot
-    python backtest.py --no-cache             # re-fetch everything
+    python backtest.py --symbols RELIANCE,TCS,HDFCBANK --period 1y
+    python backtest.py --nifty50 --period 2y --atr-target 3.0 --atr-sl 2.0
+    python backtest.py --symbols RELIANCE --period 6mo --output results.json
 """
 
 import argparse
 import json
+import math
 import sys
-import time
-from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import config
-from connect import get_session
-from screener import SNAPSHOT_DIR, BULLISH_CATEGORIES, BEARISH_CATEGORIES, INDEX_SYMBOLS
+import pandas as pd
 
-CANDLE_DIR = Path(__file__).parent / "data" / "candles"
-RESULTS_DIR = Path(__file__).parent / "data" / "backtest_results"
+# Transaction cost rates (same as paper_trade.py)
+BROKERAGE_FLAT = 20.0
+EQ_STT_PCT = 0.001
+EQ_EXCHANGE_PCT = 0.0000345
+EQ_STAMP_DUTY_PCT = 0.00015
+EQ_SEBI_PCT = 0.000001
+GST_PCT = 0.18
+EQ_SLIPPAGE_PCT = 0.001
+
+# Default strategy params
+DEFAULT_PARAMS = {
+    "atr_period": 14,
+    "atr_target_mult": 2.5,
+    "atr_sl_mult": 1.5,
+    "trailing_mult": 1.0,
+    "trailing_activation_pct": 2.0,
+    "trailing_tight_mult": 1.5,
+    "max_hold_days": 7,
+    "capital_per_trade": 10000,
+    "time_sl_enabled": True,
+    "time_sl_half_mult": 0.75,
+    "time_sl_three_quarter_mult": 0.5,
+}
+
+# Nifty 50 symbols for --nifty50 mode
+NIFTY50_SYMBOLS = [
+    "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "HINDUNILVR",
+    "ITC", "SBIN", "BHARTIARTL", "KOTAKBANK", "LT", "AXISBANK",
+    "WIPRO", "HCLTECH", "ASIANPAINT", "MARUTI", "SUNPHARMA", "TATAMOTORS",
+    "NTPC", "ULTRACEMCO", "POWERGRID", "TITAN", "BAJFINANCE", "NESTLEIND",
+    "TECHM", "TATASTEEL", "INDUSINDBK", "BAJAJFINSV", "ONGC", "JSWSTEEL",
+    "COALINDIA", "ADANIENT", "M&M", "ADANIPORTS", "GRASIM", "CIPLA",
+    "BPCL", "DRREDDY", "TATACONSUM", "APOLLOHOSP", "EICHERMOT", "DIVISLAB",
+    "BRITANNIA", "HINDALCO", "HEROMOTOCO", "BAJAJ-AUTO", "SBILIFE",
+    "HDFCLIFE", "SHRIRAMFIN", "TRENT",
+]
 
 
-# ---------------------------------------------------------------------------
-# Snapshot I/O
-# ---------------------------------------------------------------------------
-
-def list_snapshots() -> list[str]:
-    """List all available snapshot dates (sorted ascending)."""
-    if not SNAPSHOT_DIR.exists():
-        return []
-    dates = []
-    for f in SNAPSHOT_DIR.glob("*.json"):
-        dates.append(f.stem)  # YYYY-MM-DD
-    return sorted(dates)
+def calc_eq_costs(price: float, quantity: int, side: str) -> float:
+    """Calculate equity transaction costs for one leg."""
+    turnover = price * quantity
+    brokerage = min(BROKERAGE_FLAT, turnover * 0.0003)
+    stt = turnover * EQ_STT_PCT
+    exchange = turnover * EQ_EXCHANGE_PCT
+    stamp = turnover * EQ_STAMP_DUTY_PCT if side == "buy" else 0
+    sebi = turnover * EQ_SEBI_PCT
+    gst = (brokerage + exchange) * GST_PCT
+    return brokerage + stt + exchange + stamp + sebi + gst
 
 
-def load_snapshot(date_str: str) -> dict | None:
-    """Load a snapshot by date string (YYYY-MM-DD)."""
-    path = SNAPSHOT_DIR / f"{date_str}.json"
-    if not path.exists():
-        return None
-    return json.loads(path.read_text())
+def calc_round_trip_costs(entry_price, exit_price, quantity):
+    """Total round-trip costs."""
+    return calc_eq_costs(entry_price, quantity, "buy") + calc_eq_costs(exit_price, quantity, "sell")
 
 
-# ---------------------------------------------------------------------------
-# Token Resolution
-# ---------------------------------------------------------------------------
+def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Compute ATR from OHLCV DataFrame."""
+    high = df["High"]
+    low = df["Low"]
+    close = df["Close"]
 
-def resolve_and_cache_token(smart_api, snapshot: dict, symbol: str) -> str | None:
-    """Resolve equity token via searchScrip and cache it in the snapshot.
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
-    Writes the resolved token back into the snapshot JSON so subsequent
-    runs skip the API call.
+    return tr.rolling(window=period, min_periods=period).mean()
+
+
+def fetch_data(symbols: list[str], period: str = "1y") -> dict[str, pd.DataFrame]:
+    """Fetch historical daily OHLCV from yfinance.
+
+    Returns {symbol: DataFrame} with columns: Open, High, Low, Close, Volume
     """
-    # Check if already cached in snapshot
-    for cand in snapshot["candidates"]:
-        if cand["symbol"] == symbol and cand.get("equity_token"):
-            return cand["equity_token"]
+    import yfinance as yf
 
-    # Resolve via API
-    try:
-        search_resp = smart_api.searchScrip("NSE", symbol)
-        if not search_resp or not search_resp.get("data"):
-            return None
+    result = {}
+    tickers = [f"{s}.NS" for s in symbols]
 
-        token = None
-        for match in search_resp["data"]:
-            if match.get("tradingsymbol", "").endswith("-EQ"):
-                token = match.get("symboltoken")
-                break
-        if not token:
-            token = search_resp["data"][0].get("symboltoken")
+    data = yf.download(tickers, period=period, interval="1d", progress=False, threads=True)
 
-        if token:
-            # Cache back into snapshot
-            for cand in snapshot["candidates"]:
-                if cand["symbol"] == symbol:
-                    cand["equity_token"] = token
+    if data.empty:
+        return {}
+
+    # Handle single vs multi-ticker download format
+    if len(tickers) == 1:
+        sym = symbols[0]
+        df = data[["Open", "High", "Low", "Close", "Volume"]].dropna()
+        if len(df) >= 20:
+            result[sym] = df
+    else:
+        for sym, ticker in zip(symbols, tickers):
+            try:
+                df = pd.DataFrame({
+                    "Open": data[("Open", ticker)],
+                    "High": data[("High", ticker)],
+                    "Low": data[("Low", ticker)],
+                    "Close": data[("Close", ticker)],
+                    "Volume": data[("Volume", ticker)],
+                }).dropna()
+                if len(df) >= 20:
+                    result[sym] = df
+            except (KeyError, TypeError):
+                continue
+
+    return result
+
+
+class BacktestEngine:
+    """Simulates equity long strategy on historical data."""
+
+    def __init__(self, params: dict = None):
+        self.params = {**DEFAULT_PARAMS, **(params or {})}
+        self.trades = []
+        self.equity_curve = []
+
+    def run(self, symbol: str, df: pd.DataFrame) -> list[dict]:
+        """Run backtest on a single symbol.
+
+        Strategy: Buy at each bar's close, manage with ATR-based exits.
+        This simulates "what if we entered this stock on day X".
+
+        Returns list of trade dicts.
+        """
+        p = self.params
+        atr_series = compute_atr(df, p["atr_period"])
+
+        trades = []
+
+        # Slide through the data, entering a trade every max_hold_days bars
+        # (simulate non-overlapping trades)
+        i = p["atr_period"]  # start after ATR is available
+
+        while i < len(df) - 1:
+            entry_idx = i
+            entry_row = df.iloc[entry_idx]
+            entry_price = float(entry_row["Close"]) * (1 + EQ_SLIPPAGE_PCT)  # buy slippage
+            atr = float(atr_series.iloc[entry_idx])
+
+            if atr <= 0 or entry_price <= 0:
+                i += 1
+                continue
+
+            target = entry_price + p["atr_target_mult"] * atr
+            stoploss = entry_price - p["atr_sl_mult"] * atr
+            quantity = max(1, int(p["capital_per_trade"] / entry_price))
+
+            peak = entry_price
+            exit_price = None
+            exit_reason = None
+            exit_idx = None
+
+            for j in range(1, p["max_hold_days"] + 2):
+                day_idx = entry_idx + j
+                if day_idx >= len(df):
+                    # Force exit at last available bar
+                    exit_price = float(df.iloc[-1]["Close"]) * (1 - EQ_SLIPPAGE_PCT)
+                    exit_reason = "data_end"
+                    exit_idx = len(df) - 1
                     break
-            # Persist to disk
-            path = SNAPSHOT_DIR / f"{snapshot['date']}.json"
-            path.write_text(json.dumps(snapshot, indent=2, default=str))
 
-        return token
-    except Exception as e:
-        print(f"    Token resolution failed for {symbol}: {e}")
-        return None
+                day = df.iloc[day_idx]
+                high = float(day["High"])
+                low = float(day["Low"])
+                close = float(day["Close"])
 
+                # Update peak
+                if high > peak:
+                    peak = high
 
-# ---------------------------------------------------------------------------
-# Candle Fetching & Caching
-# ---------------------------------------------------------------------------
+                # Check target (intraday)
+                if high >= target:
+                    exit_price = target * (1 - EQ_SLIPPAGE_PCT)
+                    exit_reason = "target"
+                    exit_idx = day_idx
+                    break
 
-def fetch_forward_candles(smart_api, symbol: str, token: str,
-                          from_date: str, trading_days: int) -> list | None:
-    """Fetch daily candles from from_date forward for enough trading days.
+                # Check stoploss (intraday)
+                if low <= stoploss:
+                    exit_price = stoploss * (1 - EQ_SLIPPAGE_PCT)
+                    exit_reason = "stoploss"
+                    exit_idx = day_idx
+                    break
 
-    Requests extra calendar days (2x + 2) to cover weekends and holidays.
-    Returns raw candle list [[timestamp, O, H, L, C, V], ...] or None.
-    """
-    calendar_days = trading_days * 2 + 2
-    start = datetime.strptime(from_date, "%Y-%m-%d")
-    end = start + timedelta(days=calendar_days)
+                # Trailing stop
+                progress = j / p["max_hold_days"]
+                unrealized_pct = (close - entry_price) / entry_price * 100
 
-    try:
-        resp = smart_api.getCandleData({
-            "exchange": "NSE",
-            "symboltoken": token,
-            "interval": "ONE_DAY",
-            "fromdate": start.strftime("%Y-%m-%d 09:15"),
-            "todate": end.strftime("%Y-%m-%d 15:30"),
-        })
-        if resp and resp.get("data"):
-            return resp["data"]
-    except Exception as e:
-        print(f"    Candle fetch failed for {symbol}: {e}")
-    return None
+                if unrealized_pct >= p["trailing_activation_pct"]:
+                    trail_sl = peak - p["trailing_tight_mult"] * atr
+                    trail_sl = max(trail_sl, entry_price)  # floor at entry
+                else:
+                    trail_sl = peak - p["trailing_mult"] * atr
 
+                effective_sl = max(trail_sl, stoploss)
 
-def load_or_fetch_candles(smart_api, symbol: str, token: str,
-                          from_date: str, trading_days: int,
-                          no_cache: bool = False) -> list | None:
-    """Cache layer around candle fetching.
+                # Time-based SL tightening
+                if p["time_sl_enabled"]:
+                    if progress >= 0.75:
+                        time_sl = max(entry_price, peak - p["time_sl_three_quarter_mult"] * atr)
+                        effective_sl = max(effective_sl, time_sl)
+                    elif progress >= 0.5:
+                        time_sl = peak - p["time_sl_half_mult"] * atr
+                        effective_sl = max(effective_sl, time_sl)
 
-    Caches to data/candles/{SYMBOL}_{DATE}.json. Returns candle list or None.
-    """
-    CANDLE_DIR.mkdir(parents=True, exist_ok=True)
-    cache_file = CANDLE_DIR / f"{symbol}_{from_date}.json"
+                if low <= effective_sl:
+                    exit_price = effective_sl * (1 - EQ_SLIPPAGE_PCT)
+                    exit_reason = "trailing_stop" if trail_sl > stoploss else "stoploss"
+                    exit_idx = day_idx
+                    break
 
-    if not no_cache and cache_file.exists():
-        cached = json.loads(cache_file.read_text())
-        # Check if cached data has enough trading days
-        if len(cached) >= trading_days:
-            return cached
+                # Max hold expiry
+                if j >= p["max_hold_days"]:
+                    exit_price = close * (1 - EQ_SLIPPAGE_PCT)
+                    exit_reason = "expiry"
+                    exit_idx = day_idx
+                    break
 
-    candles = fetch_forward_candles(smart_api, symbol, token, from_date, trading_days)
-    if candles:
-        cache_file.write_text(json.dumps(candles, default=str))
-    return candles
+            if exit_price is None:
+                i += 1
+                continue
 
+            # Calculate P&L
+            pnl_gross = (exit_price - entry_price) * quantity
+            costs = calc_round_trip_costs(entry_price, exit_price, quantity)
+            pnl_net = pnl_gross - costs
+            pnl_pct = (pnl_net / (entry_price * quantity)) * 100
 
-# ---------------------------------------------------------------------------
-# Return Calculation
-# ---------------------------------------------------------------------------
+            trade = {
+                "symbol": symbol,
+                "entry_date": str(df.index[entry_idx].date()),
+                "exit_date": str(df.index[exit_idx].date()),
+                "entry_price": round(entry_price, 2),
+                "exit_price": round(exit_price, 2),
+                "quantity": quantity,
+                "atr": round(atr, 2),
+                "target": round(target, 2),
+                "stoploss": round(stoploss, 2),
+                "pnl_gross": round(pnl_gross, 2),
+                "costs": round(costs, 2),
+                "pnl_net": round(pnl_net, 2),
+                "pnl_pct": round(pnl_pct, 2),
+                "exit_reason": exit_reason,
+                "holding_days": exit_idx - entry_idx,
+            }
+            trades.append(trade)
 
-def calculate_forward_returns(candles: list, trading_days: int) -> dict | None:
-    """Calculate forward returns from candle data.
+            # Skip to after this trade exits
+            i = exit_idx + 1
 
-    Uses the first candle's open as entry price. Returns dict with
-    entry_price and return percentages at 1d, 3d, and Nd horizons.
-    Returns None if insufficient data.
-    """
-    if not candles or len(candles) < 2:
-        return None
+        return trades
 
-    entry_price = candles[0][1]  # Open of signal day
-    if not entry_price or entry_price <= 0:
-        return None
+    def run_multi(self, data: dict[str, pd.DataFrame]) -> list[dict]:
+        """Run backtest across multiple symbols."""
+        all_trades = []
+        for symbol, df in data.items():
+            trades = self.run(symbol, df)
+            all_trades.extend(trades)
 
-    result = {"entry_price": entry_price, "returns": {}}
+        # Sort by entry date
+        all_trades.sort(key=lambda t: t["entry_date"])
+        self.trades = all_trades
+        return all_trades
 
-    for horizon in [1, 3, trading_days]:
-        if horizon > len(candles) - 1:
-            continue
-        # Use close of the horizon-th candle
-        exit_price = candles[horizon][4]  # Close
-        if exit_price and exit_price > 0:
-            ret_pct = ((exit_price - entry_price) / entry_price) * 100
-            result["returns"][f"{horizon}d"] = round(ret_pct, 2)
+    def compute_stats(self) -> dict:
+        """Compute performance statistics from completed trades."""
+        trades = self.trades
+        if not trades:
+            return {"total_trades": 0}
 
-    # Deduplicate: if trading_days is 1 or 3, it's already covered
-    return result if result["returns"] else None
+        pnls = [t["pnl_net"] for t in trades]
+        pnl_pcts = [t["pnl_pct"] for t in trades]
+        wins = [t for t in trades if t["pnl_net"] >= 0]
+        losses = [t for t in trades if t["pnl_net"] < 0]
 
+        total_pnl = sum(pnls)
+        total_costs = sum(t["costs"] for t in trades)
+        win_rate = len(wins) / len(trades) * 100
 
-def is_hit(direction: str, return_pct: float) -> bool:
-    """Determine if a prediction was correct.
+        # Averages
+        avg_win_pct = sum(t["pnl_pct"] for t in wins) / len(wins) if wins else 0
+        avg_loss_pct = sum(t["pnl_pct"] for t in losses) / len(losses) if losses else 0
+        avg_hold = sum(t["holding_days"] for t in trades) / len(trades)
 
-    Bullish + positive return = hit.
-    Bearish + negative return = hit.
-    Zero return = miss.
-    """
-    if direction == "bullish":
-        return return_pct > 0
-    elif direction == "bearish":
-        return return_pct < 0
-    return False
+        # Sharpe
+        mean_ret = sum(pnl_pcts) / len(pnl_pcts)
+        var = sum((r - mean_ret) ** 2 for r in pnl_pcts) / len(pnl_pcts)
+        std = math.sqrt(var) if var > 0 else 0
+        sharpe = round((mean_ret / std) * math.sqrt(252), 2) if std > 0 else 0
 
+        # Max drawdown
+        cumulative = 0
+        peak_cum = 0
+        max_dd = 0
+        for p in pnls:
+            cumulative += p
+            if cumulative > peak_cum:
+                peak_cum = cumulative
+            dd = peak_cum - cumulative
+            if dd > max_dd:
+                max_dd = dd
 
-# ---------------------------------------------------------------------------
-# Per-Snapshot Backtest
-# ---------------------------------------------------------------------------
+        # Profit factor
+        win_sum = sum(t["pnl_net"] for t in wins)
+        loss_sum = abs(sum(t["pnl_net"] for t in losses))
+        pf = round(win_sum / loss_sum, 2) if loss_sum > 0 else float("inf")
 
-def backtest_snapshot(smart_api, snapshot: dict, trading_days: int = 5,
-                      top_n: int | None = None,
-                      no_cache: bool = False) -> list[dict]:
-    """Orchestrate backtest for a single snapshot.
+        # Expectancy
+        expectancy = mean_ret * (len(wins) / len(trades)) * avg_win_pct - (len(losses) / len(trades)) * abs(avg_loss_pct) if trades else 0
 
-    For each candidate: resolve token -> fetch forward candles ->
-    calculate returns -> determine hit/miss.
+        # Exit reason breakdown
+        reasons = {}
+        for t in trades:
+            r = t["exit_reason"]
+            reasons[r] = reasons.get(r, 0) + 1
 
-    Returns list of result dicts with symbol, direction, score,
-    categories, returns, and hit/miss at each horizon.
-    """
-    candidates = snapshot["candidates"]
-    if top_n:
-        candidates = candidates[:top_n]
+        # Per-symbol breakdown
+        symbols = {}
+        for t in trades:
+            s = t["symbol"]
+            if s not in symbols:
+                symbols[s] = {"trades": 0, "wins": 0, "pnl": 0}
+            symbols[s]["trades"] += 1
+            symbols[s]["pnl"] += t["pnl_net"]
+            if t["pnl_net"] >= 0:
+                symbols[s]["wins"] += 1
 
-    results = []
-    total = len(candidates)
+        # Tax estimates (Indian)
+        stcg_equity = round(max(0, total_pnl) * 0.15, 2)  # 15% STCG on equity
 
-    for i, cand in enumerate(candidates):
-        symbol = cand["symbol"]
-
-        # Skip indices
-        if symbol in INDEX_SYMBOLS:
-            continue
-
-        print(f"  [{i+1}/{total}] {symbol}...", end=" ", flush=True)
-
-        # Resolve token
-        token = resolve_and_cache_token(smart_api, snapshot, symbol)
-        if not token:
-            print("skip (no token)")
-            time.sleep(config.API_DELAY)
-            continue
-
-        time.sleep(config.API_DELAY)
-
-        # Fetch forward candles (from the day AFTER the snapshot)
-        snapshot_date = snapshot["date"]
-        next_day = (datetime.strptime(snapshot_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
-        candles = load_or_fetch_candles(
-            smart_api, symbol, token, next_day, trading_days, no_cache=no_cache
-        )
-
-        if not candles:
-            print("skip (no candles)")
-            time.sleep(config.API_DELAY)
-            continue
-
-        time.sleep(config.API_DELAY)
-
-        # Calculate returns
-        fwd = calculate_forward_returns(candles, trading_days)
-        if not fwd:
-            print("skip (insufficient data)")
-            continue
-
-        # Determine hit/miss at each horizon
-        direction = cand["direction"]
-        hits = {}
-        for horizon_key, ret_pct in fwd["returns"].items():
-            hits[horizon_key] = is_hit(direction, ret_pct)
-
-        result = {
-            "symbol": symbol,
-            "direction": direction,
-            "score": cand["score"],
-            "categories": cand["categories"],
-            "price_change_pct": cand.get("price_change_pct"),
-            "snapshot_date": snapshot["date"],
-            "entry_price": fwd["entry_price"],
-            "returns": fwd["returns"],
-            "hits": hits,
-        }
-        results.append(result)
-
-        ret_str = " | ".join(f"{k}: {v:+.1f}%" for k, v in fwd["returns"].items())
-        print(f"{ret_str}")
-
-    return results
-
-
-# ---------------------------------------------------------------------------
-# Aggregation
-# ---------------------------------------------------------------------------
-
-def aggregate_stats(all_results: list[dict], trading_days: int) -> dict:
-    """Aggregate backtest results across snapshots.
-
-    Returns stats dict with hit rates by direction, score tier,
-    signal type, and top/worst performers at each horizon.
-    """
-    if not all_results:
-        return {"total": 0}
-
-    # Collect all unique horizons present
-    horizons = set()
-    for r in all_results:
-        horizons.update(r["returns"].keys())
-    horizons = sorted(horizons, key=lambda h: int(h.replace("d", "")))
-
-    stats = {"total": len(all_results), "horizons": {}}
-
-    for horizon in horizons:
-        h_results = [r for r in all_results if horizon in r.get("hits", {})]
-        if not h_results:
-            continue
-
-        total = len(h_results)
-        hit_count = sum(1 for r in h_results if r["hits"][horizon])
-
-        # By direction
-        dir_stats = {}
-        for direction in ["bullish", "bearish"]:
-            dir_r = [r for r in h_results if r["direction"] == direction]
-            if dir_r:
-                dir_hits = sum(1 for r in dir_r if r["hits"][horizon])
-                dir_stats[direction] = {
-                    "total": len(dir_r),
-                    "hits": dir_hits,
-                    "rate": round(dir_hits / len(dir_r) * 100, 1),
-                }
-
-        # By score tier
-        tier_stats = {}
-        tiers = [(5, ">=5"), (3, ">=3"), (2, ">=2"), (0, "<2")]
-        for threshold, label in tiers:
-            if label.startswith(">="):
-                tier_r = [r for r in h_results if r["score"] >= threshold]
-            else:
-                tier_r = [r for r in h_results if r["score"] < 2]
-            if tier_r:
-                tier_hits = sum(1 for r in tier_r if r["hits"][horizon])
-                tier_stats[label] = {
-                    "total": len(tier_r),
-                    "hits": tier_hits,
-                    "rate": round(tier_hits / len(tier_r) * 100, 1),
-                }
-
-        # By signal type
-        signal_stats = {}
-        for r in h_results:
-            for cat in r["categories"]:
-                if cat not in signal_stats:
-                    signal_stats[cat] = {"total": 0, "hits": 0}
-                signal_stats[cat]["total"] += 1
-                if r["hits"][horizon]:
-                    signal_stats[cat]["hits"] += 1
-        for cat in signal_stats:
-            s = signal_stats[cat]
-            s["rate"] = round(s["hits"] / s["total"] * 100, 1) if s["total"] > 0 else 0
-
-        # Top/worst performers
-        sorted_by_return = sorted(
-            h_results,
-            key=lambda r: r["returns"].get(horizon, 0),
-            reverse=True,
-        )
-        top_3 = sorted_by_return[:3]
-        worst_3 = sorted_by_return[-3:]
-
-        stats["horizons"][horizon] = {
-            "total": total,
-            "hits": hit_count,
-            "rate": round(hit_count / total * 100, 1),
-            "by_direction": dir_stats,
-            "by_score_tier": tier_stats,
-            "by_signal": signal_stats,
-            "top_performers": [
-                {"symbol": r["symbol"], "return": r["returns"][horizon],
-                 "direction": r["direction"], "score": r["score"]}
-                for r in top_3
-            ],
-            "worst_performers": [
-                {"symbol": r["symbol"], "return": r["returns"][horizon],
-                 "direction": r["direction"], "score": r["score"]}
-                for r in worst_3
-            ],
+        return {
+            "total_trades": len(trades),
+            "winning_trades": len(wins),
+            "losing_trades": len(losses),
+            "win_rate": round(win_rate, 1),
+            "total_pnl": round(total_pnl, 2),
+            "total_costs": round(total_costs, 2),
+            "avg_win_pct": round(avg_win_pct, 2),
+            "avg_loss_pct": round(avg_loss_pct, 2),
+            "avg_holding_days": round(avg_hold, 1),
+            "sharpe_ratio": sharpe,
+            "max_drawdown": round(max_dd, 2),
+            "profit_factor": pf,
+            "best_trade": max(trades, key=lambda t: t["pnl_pct"]),
+            "worst_trade": min(trades, key=lambda t: t["pnl_pct"]),
+            "exit_reasons": reasons,
+            "per_symbol": symbols,
+            "estimated_stcg_tax": stcg_equity,
         }
 
-    return stats
+    def print_report(self, stats: dict = None):
+        """Print formatted backtest report to terminal."""
+        if stats is None:
+            stats = self.compute_stats()
 
+        if stats["total_trades"] == 0:
+            print("No trades generated.")
+            return
 
-# ---------------------------------------------------------------------------
-# Report Output
-# ---------------------------------------------------------------------------
+        border = "=" * 60
+        sep = "-" * 58
 
-def print_backtest_report(stats: dict, all_results: list[dict]) -> None:
-    """Print formatted backtest report to terminal."""
-    border = "=" * 60
-    sep = "-" * 60
+        print(f"\n{border}")
+        print("  BACKTEST RESULTS")
+        print(f"  Params: ATR target={self.params['atr_target_mult']}x, "
+              f"SL={self.params['atr_sl_mult']}x, "
+              f"hold={self.params['max_hold_days']}d, "
+              f"capital/trade=\u20b9{self.params['capital_per_trade']:,}")
+        print(border)
 
-    print(f"\n{border}")
-    print(f"  SCREENER BACKTEST REPORT")
-    print(f"  {datetime.now().strftime('%d %b %Y, %H:%M')}")
-    print(f"  {stats['total']} candidates evaluated")
-    print(border)
+        print(f"\n  Total Trades: {stats['total_trades']}  |  "
+              f"Win Rate: {stats['win_rate']:.1f}%  "
+              f"({stats['winning_trades']}W / {stats['losing_trades']}L)")
+        print(f"  Total P&L: \u20b9{stats['total_pnl']:+,.0f}  |  "
+              f"Costs: \u20b9{stats['total_costs']:,.0f}")
+        print(f"  Avg Win: {stats['avg_win_pct']:+.2f}%  |  "
+              f"Avg Loss: {stats['avg_loss_pct']:+.2f}%")
+        print(f"  Avg Holding: {stats['avg_holding_days']:.1f} days")
 
-    if stats["total"] == 0:
-        print("\n  No results to report. Candidates may lack forward data")
-        print("  (same-day backtest or market holidays).\n")
-        return
+        print(f"\n  {sep}")
+        print(f"  RISK METRICS")
+        print(f"  {sep}")
+        pf = f"{stats['profit_factor']:.2f}" if stats['profit_factor'] != float('inf') else "\u221e"
+        print(f"  Sharpe Ratio: {stats['sharpe_ratio']:.2f}  |  "
+              f"Profit Factor: {pf}")
+        print(f"  Max Drawdown: \u20b9{stats['max_drawdown']:,.0f}")
 
-    # Snapshot dates covered
-    dates = sorted(set(r["snapshot_date"] for r in all_results))
-    print(f"\n  Snapshots: {', '.join(dates)}")
+        print(f"\n  Best:  {stats['best_trade']['symbol']} "
+              f"({stats['best_trade']['pnl_pct']:+.1f}%, "
+              f"\u20b9{stats['best_trade']['pnl_net']:+,.0f})")
+        print(f"  Worst: {stats['worst_trade']['symbol']} "
+              f"({stats['worst_trade']['pnl_pct']:+.1f}%, "
+              f"\u20b9{stats['worst_trade']['pnl_net']:+,.0f})")
 
-    for horizon, h_stats in stats.get("horizons", {}).items():
-        print(f"\n{sep}")
-        print(f"  {horizon.upper()} FORWARD RETURNS")
-        print(sep)
+        print(f"\n  {sep}")
+        print(f"  EXIT REASONS")
+        print(f"  {sep}")
+        for reason, count in sorted(stats["exit_reasons"].items(), key=lambda x: -x[1]):
+            pct = count / stats["total_trades"] * 100
+            print(f"  {reason:20s} {count:4d}  ({pct:.0f}%)")
 
-        print(f"\n  Overall Hit Rate: {h_stats['rate']}%  ({h_stats['hits']}/{h_stats['total']})")
+        print(f"\n  {sep}")
+        print(f"  TAX ESTIMATE")
+        print(f"  {sep}")
+        print(f"  STCG (15% on equity gains): \u20b9{stats['estimated_stcg_tax']:,.0f}")
+        print(f"  Net after tax: \u20b9{stats['total_pnl'] - stats['estimated_stcg_tax']:+,.0f}")
 
-        # By direction
-        dir_parts = []
-        for direction, ds in h_stats.get("by_direction", {}).items():
-            dir_parts.append(f"{direction.upper()} {ds['rate']}% ({ds['hits']}/{ds['total']})")
-        if dir_parts:
-            print(f"  By Direction:  {' | '.join(dir_parts)}")
+        # Top 5 symbols
+        if stats["per_symbol"]:
+            sorted_syms = sorted(stats["per_symbol"].items(), key=lambda x: -x[1]["pnl"])
+            print(f"\n  {sep}")
+            print(f"  TOP SYMBOLS")
+            print(f"  {sep}")
+            for sym, data in sorted_syms[:5]:
+                wr = data["wins"] / data["trades"] * 100 if data["trades"] > 0 else 0
+                print(f"  {sym:15s} {data['trades']:3d} trades  "
+                      f"{wr:.0f}% WR  \u20b9{data['pnl']:+,.0f}")
+            if len(sorted_syms) > 5:
+                print(f"\n  WORST SYMBOLS")
+                for sym, data in sorted_syms[-3:]:
+                    wr = data["wins"] / data["trades"] * 100 if data["trades"] > 0 else 0
+                    print(f"  {sym:15s} {data['trades']:3d} trades  "
+                          f"{wr:.0f}% WR  \u20b9{data['pnl']:+,.0f}")
 
-        # By score tier
-        tier_parts = []
-        for tier, ts in h_stats.get("by_score_tier", {}).items():
-            tier_parts.append(f"{tier}: {ts['rate']}%")
-        if tier_parts:
-            print(f"  By Score Tier: {' | '.join(tier_parts)}")
+        print(f"\n{border}\n")
 
-        # By signal type
-        sig_parts = []
-        for sig, ss in sorted(h_stats.get("by_signal", {}).items(),
-                               key=lambda x: x[1]["rate"], reverse=True):
-            sig_parts.append(f"{sig} {ss['rate']}% ({ss['hits']}/{ss['total']})")
-        if sig_parts:
-            print(f"  By Signal:")
-            for part in sig_parts:
-                print(f"    {part}")
-
-        # Top performers
-        top = h_stats.get("top_performers", [])
-        if top:
-            print(f"\n  Top Performers:")
-            for p in top:
-                print(f"    {p['symbol']:<15} {p['return']:+.1f}%  [{p['direction']}] score={p['score']}")
-
-        # Worst performers
-        worst = h_stats.get("worst_performers", [])
-        if worst:
-            print(f"  Worst Performers:")
-            for p in worst:
-                print(f"    {p['symbol']:<15} {p['return']:+.1f}%  [{p['direction']}] score={p['score']}")
-
-    print(f"\n{border}\n")
-
-
-def save_backtest_results(stats: dict, all_results: list[dict]) -> Path:
-    """Save backtest results to data/backtest_results/backtest_YYYYMMDD_HHMMSS.json."""
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = RESULTS_DIR / f"backtest_{timestamp}.json"
-
-    output = {
-        "timestamp": datetime.now().isoformat(),
-        "stats": stats,
-        "results": all_results,
-    }
-    path.write_text(json.dumps(output, indent=2, default=str))
-    print(f"Results saved: {path}")
-    return path
-
-
-# ---------------------------------------------------------------------------
-# Signal Win Rates
-# ---------------------------------------------------------------------------
-
-WIN_RATE_FILE = RESULTS_DIR / "win_rates.json"
-MIN_SAMPLES_FOR_WIN_RATE = 3
-
-
-def compute_signal_win_rates(all_results: list[dict], horizon: str = "5d") -> dict:
-    """
-    Group backtest results by (sorted categories + direction) and compute win rates.
-
-    Only includes combos with at least MIN_SAMPLES_FOR_WIN_RATE samples.
-    Returns {combo_key: win_rate} where combo_key = "LongBuildUp+PercOIGainers|bullish".
-    """
-    combos = defaultdict(lambda: {"hits": 0, "total": 0})
-
-    for r in all_results:
-        if horizon not in r.get("hits", {}):
-            continue
-
-        key = "+".join(sorted(r["categories"])) + "|" + r["direction"]
-        combos[key]["total"] += 1
-        if r["hits"][horizon]:
-            combos[key]["hits"] += 1
-
-    win_rates = {}
-    for key, counts in combos.items():
-        if counts["total"] >= MIN_SAMPLES_FOR_WIN_RATE:
-            win_rates[key] = round(counts["hits"] / counts["total"], 3)
-
-    return win_rates
-
-
-def save_win_rates(win_rates: dict) -> Path:
-    """Write win rates to data/backtest_results/win_rates.json."""
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    WIN_RATE_FILE.write_text(json.dumps(win_rates, indent=2, sort_keys=True))
-    print(f"Win rates saved: {WIN_RATE_FILE} ({len(win_rates)} combos)")
-    return WIN_RATE_FILE
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Backtest screener predictions against forward price data")
-    parser.add_argument("--date", type=str, help="Specific snapshot date (YYYY-MM-DD)")
-    parser.add_argument("--days", type=int, default=5, help="Forward horizon in trading days (default: 5)")
-    parser.add_argument("--top", type=int, default=None, help="Top N candidates per snapshot (default: all)")
-    parser.add_argument("--no-cache", action="store_true", help="Re-fetch all candle data")
+    parser = argparse.ArgumentParser(description="Backtest equity strategy on historical data")
+    parser.add_argument("--symbols", type=str, help="Comma-separated symbols (e.g. RELIANCE,TCS)")
+    parser.add_argument("--nifty50", action="store_true", help="Run on all Nifty 50 stocks")
+    parser.add_argument("--period", type=str, default="1y", help="yfinance period (1mo, 3mo, 6mo, 1y, 2y)")
+    parser.add_argument("--atr-target", type=float, default=2.5, help="ATR target multiplier")
+    parser.add_argument("--atr-sl", type=float, default=1.5, help="ATR stoploss multiplier")
+    parser.add_argument("--max-hold", type=int, default=7, help="Max holding days")
+    parser.add_argument("--capital", type=float, default=10000, help="Capital per trade")
+    parser.add_argument("--output", type=str, help="Save results to JSON file")
+    parser.add_argument("--no-time-sl", action="store_true", help="Disable time-based SL tightening")
     args = parser.parse_args()
 
-    # Determine which snapshots to process
-    if args.date:
-        dates = [args.date]
-    else:
-        dates = list_snapshots()
-
-    if not dates:
-        print("No snapshots found. Run the screener first: python screener.py --raw")
+    if not args.symbols and not args.nifty50:
+        print("Error: specify --symbols or --nifty50")
         sys.exit(1)
 
-    print(f"Backtesting {len(dates)} snapshot(s) with {args.days}-day forward horizon...")
-    print(f"Connecting to AngelOne SmartAPI...")
-    smart_api = get_session()
+    symbols = NIFTY50_SYMBOLS if args.nifty50 else [s.strip() for s in args.symbols.split(",")]
 
-    all_results = []
-    for date_str in dates:
-        snapshot = load_snapshot(date_str)
-        if not snapshot:
-            print(f"\nSnapshot {date_str}: not found, skipping")
-            continue
+    params = {
+        **DEFAULT_PARAMS,
+        "atr_target_mult": args.atr_target,
+        "atr_sl_mult": args.atr_sl,
+        "max_hold_days": args.max_hold,
+        "capital_per_trade": args.capital,
+        "time_sl_enabled": not args.no_time_sl,
+    }
 
-        n_cand = len(snapshot["candidates"])
-        top_label = f"top {args.top}" if args.top else "all"
-        print(f"\nSnapshot {date_str}: {n_cand} candidates ({top_label})")
+    print(f"Fetching data for {len(symbols)} symbol(s), period={args.period}...")
+    data = fetch_data(symbols, args.period)
+    print(f"Got data for {len(data)} symbols")
 
-        results = backtest_snapshot(
-            smart_api, snapshot,
-            trading_days=args.days,
-            top_n=args.top,
-            no_cache=args.no_cache,
-        )
-        all_results.extend(results)
+    if not data:
+        print("No data available")
+        sys.exit(1)
 
-    # Aggregate and report
-    stats = aggregate_stats(all_results, args.days)
-    print_backtest_report(stats, all_results)
-    save_backtest_results(stats, all_results)
+    engine = BacktestEngine(params)
+    engine.run_multi(data)
+    stats = engine.compute_stats()
+    engine.print_report(stats)
 
-    # Compute and save signal win rates for screener scoring
-    horizon_key = f"{args.days}d"
-    win_rates = compute_signal_win_rates(all_results, horizon=horizon_key)
-    if win_rates:
-        save_win_rates(win_rates)
-    else:
-        print(f"No win rates computed (need >= {MIN_SAMPLES_FOR_WIN_RATE} samples per combo)")
+    if args.output:
+        output = {
+            "params": params,
+            "stats": stats,
+            "trades": engine.trades,
+        }
+        Path(args.output).write_text(json.dumps(output, indent=2, default=str))
+        print(f"Results saved to {args.output}")
 
 
 if __name__ == "__main__":

@@ -2170,6 +2170,28 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
             portfolio["available_capital"] - position["allocated"], 2)
         opened += 1
 
+        # Journal: record entry thesis
+        try:
+            from journal import record_entry
+            record_entry(
+                symbol=symbol, direction=direction,
+                instrument=position.get("instrument", "EQ"),
+                entry_price=position["entry_price"],
+                entry_date=today,
+                signals={"categories": alloc.get("categories", [])},
+                regime=regime,
+                macro_gate=macro.get("hard_gate", "NONE") if macro else "",
+                supertrend=supertrend_signal,
+                pcr=pcr,
+                breadth=breadth.get("signal", "") if breadth else "",
+                sector_rotation=(sector_rotation.get("top_sector", "") if sector_rotation else ""),
+                x_sentiment=x_sentiment.get("sentiment", "") if x_sentiment else "",
+                score=alloc.get("score", 0),
+                allocation=position["allocated"],
+            )
+        except Exception:
+            pass  # journal is optional
+
     return opened
 
 
@@ -2334,6 +2356,20 @@ def close_position(portfolio: dict, pos: dict, exit_price: float, reason: str,
     _notify("Paper Trade Exit",
             f"{pos['symbol']} {reason_label}: {pnl_pct:+.1f}% (₹{emoji}{pnl:,.0f})")
     _telegram_notify_exit(pos, reason, pnl, pnl_pct, exit_price, portfolio)
+
+    # Journal: record exit review
+    try:
+        from journal import record_exit
+        holding = _trading_days_between(pos["entry_date"], _today_ist())
+        record_exit(
+            symbol=pos["symbol"], entry_date=pos["entry_date"],
+            direction=direction, exit_price=exit_price,
+            exit_date=_today_ist(), exit_reason=reason,
+            pnl=pnl, pnl_pct=pnl_pct, costs=costs["total"],
+            holding_days=holding,
+        )
+    except Exception:
+        pass
 
     return closed
 
@@ -3306,6 +3342,29 @@ def generate_weekly_report(portfolio: dict) -> str:
     lines.append(f"\nCapital: ₹{portfolio.get('capital', 0):,.0f}  |  Open: {open_count}")
     lines.append(f"All-time P&amp;L: ₹{stats.get('total_pnl', 0):+,.0f} ({stats.get('total_pnl_pct', 0):+.1f}%)")
 
+    # Tax estimate
+    total_pnl = stats.get("total_pnl", 0)
+    if total_pnl > 0:
+        eq_trades = [t for t in closed if t.get("instrument", "EQ") == "EQ"]
+        fo_trades = [t for t in closed if t.get("instrument", "EQ") != "EQ"]
+        eq_pnl = sum(t["pnl"] for t in eq_trades)
+        fo_pnl = sum(t["pnl"] for t in fo_trades)
+        stcg_eq = max(0, eq_pnl) * 0.15  # 15% STCG on equity
+        stcg_fo = max(0, fo_pnl) * 0.30  # ~30% slab rate estimate for F&O
+        total_tax = stcg_eq + stcg_fo
+        lines.append(f"\n<b>Tax Estimate:</b>")
+        lines.append(f"Equity STCG (15%): ₹{stcg_eq:,.0f}  |  F&amp;O (30% est): ₹{stcg_fo:,.0f}")
+        lines.append(f"Net after tax: ₹{total_pnl - total_tax:+,.0f}")
+
+    # Journal stats
+    try:
+        from journal import get_journal_stats
+        jstats = get_journal_stats()
+        if jstats.get("closed", 0) > 0:
+            lines.append(f"\n<b>Journal:</b> Thesis accuracy {jstats['thesis_accuracy']:.0f}%")
+    except Exception:
+        pass
+
     return "\n".join(lines)
 
 
@@ -3315,6 +3374,35 @@ def send_weekly_report() -> None:
     report = generate_weekly_report(portfolio)
     _telegram_send(report)
     logger.info("Weekly report sent to Telegram.")
+
+
+def archive_and_reset() -> str:
+    """Archive current portfolio and start fresh.
+
+    Saves current portfolio to data/paper_trades/archive_YYYY-MM-DD.json,
+    then resets to empty portfolio with full capital.
+    Returns path to archive file.
+    """
+    portfolio = load_portfolio()
+    today = _today_ist()
+
+    # Archive
+    archive_file = PORTFOLIO_DIR / f"archive_{today}.json"
+    archive_file.write_text(json.dumps(portfolio, indent=2, default=str))
+
+    # Summary of archived period
+    stats = portfolio.get("stats", {})
+    total_trades = stats.get("total_trades", 0)
+    total_pnl = stats.get("total_pnl", 0)
+    logger.info("Archived portfolio: %d trades, P&L ₹%+,.0f → %s",
+                total_trades, total_pnl, archive_file)
+
+    # Reset
+    new_portfolio = _empty_portfolio()
+    save_portfolio(new_portfolio)
+    logger.info("Portfolio reset to ₹%,.0f capital.", TOTAL_CAPITAL)
+
+    return str(archive_file)
 
 
 # ---------------------------------------------------------------------------
@@ -3448,6 +3536,16 @@ def run_paper_trade(smart_api, mode: str) -> None:
         logger.info("\n=== PAPER TRADE: Weekly Performance Report ===\n")
         send_weekly_report()
 
+    elif mode == "reset":
+        logger.info("\n=== PAPER TRADE: Archive & Reset Portfolio ===\n")
+        msg = archive_and_reset()
+        logger.info(msg)
+
+    elif mode == "journal":
+        from journal import generate_journal_report
+        report = generate_journal_report()
+        logger.info(report)
+
     else:
         logger.error("Unknown mode: %s", mode)
         logger.info("Usage: python paper_trade.py [open|monitor|status|close-all|weekly-report]")
@@ -3460,12 +3558,15 @@ def run_paper_trade(smart_api, mode: str) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="Paper trading engine for F&O screener signals")
-    parser.add_argument("mode", choices=["open", "monitor", "status", "close-all", "weekly-report"],
+    parser.add_argument("mode", choices=["open", "monitor", "status", "close-all",
+                                          "weekly-report", "reset", "journal"],
                         help="open: run screener + open positions, "
                              "monitor: check exits, "
                              "status: print dashboard, "
                              "close-all: force close everything, "
-                             "weekly-report: send weekly performance summary to Telegram")
+                             "weekly-report: send weekly performance summary, "
+                             "reset: archive portfolio + start fresh, "
+                             "journal: print trade journal report")
     args = parser.parse_args()
 
     logger.info("Connecting to AngelOne SmartAPI...")
