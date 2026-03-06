@@ -3394,13 +3394,13 @@ def archive_and_reset() -> str:
     stats = portfolio.get("stats", {})
     total_trades = stats.get("total_trades", 0)
     total_pnl = stats.get("total_pnl", 0)
-    logger.info("Archived portfolio: %d trades, P&L ₹%+,.0f → %s",
+    logger.info("Archived portfolio: %d trades, P&L ₹%+.0f → %s",
                 total_trades, total_pnl, archive_file)
 
     # Reset
     new_portfolio = _empty_portfolio()
     save_portfolio(new_portfolio)
-    logger.info("Portfolio reset to ₹%,.0f capital.", TOTAL_CAPITAL)
+    logger.info("Portfolio reset to ₹%.0f capital.", TOTAL_CAPITAL)
 
     return str(archive_file)
 
