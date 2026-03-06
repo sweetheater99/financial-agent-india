@@ -2003,6 +2003,16 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
             logger.info("SKIP %s: earnings within 48 hours (blackout)", symbol)
             continue
 
+        # Multi-timeframe confirmation
+        try:
+            from multi_timeframe import check_multi_timeframe
+            aligned, mtf_reason, mtf_confidence = check_multi_timeframe(symbol, direction)
+            if not aligned:
+                logger.info("SKIP %s: weekly trend disagrees (%s)", symbol, mtf_reason)
+                continue
+        except Exception:
+            pass  # optional signal, don't block on failure
+
         quality_filtered.append(c)
 
     if not quality_filtered:
@@ -2230,6 +2240,18 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
             portfolio["available_capital"] - position["allocated"], 2)
         opened += 1
 
+        # Live execution bridge: place real order if LIVE_MODE is on
+        if config.LIVE_MODE:
+            try:
+                from live_execution import execute_live_entry
+                live_result = execute_live_entry(smart_api, position)
+                if live_result and live_result.get("status") == "filled":
+                    logger.info("Live order filled for %s: order_id=%s, fill=%.2f, slippage=%s",
+                                symbol, live_result["order_id"],
+                                live_result["fill_price"], live_result.get("slippage"))
+            except Exception as e:
+                logger.error("Live execution entry failed for %s: %s", symbol, e)
+
         # Journal: record entry thesis
         try:
             from journal import record_entry
@@ -2325,7 +2347,7 @@ def calc_round_trip_costs(instrument: str, entry_price: float, exit_price: float
 
 
 def close_position(portfolio: dict, pos: dict, exit_price: float, reason: str,
-                   close_qty: int | None = None) -> dict:
+                   close_qty: int | None = None, smart_api=None) -> dict:
     """
     Close a position (fully or partially): move to closed_trades, update stats, free capital.
 
@@ -2417,6 +2439,18 @@ def close_position(portfolio: dict, pos: dict, exit_price: float, reason: str,
             f"{pos['symbol']} {reason_label}: {pnl_pct:+.1f}% (₹{emoji}{pnl:,.0f})")
     _telegram_notify_exit(pos, reason, pnl, pnl_pct, exit_price, portfolio)
 
+    # Live execution bridge: place real exit order if LIVE_MODE is on
+    if config.LIVE_MODE and smart_api is not None:
+        try:
+            from live_execution import execute_live_exit
+            live_result = execute_live_exit(smart_api, pos, exit_price, reason)
+            if live_result and live_result.get("status") == "filled":
+                closed["live_exit_order_id"] = live_result["order_id"]
+                closed["live_exit_fill_price"] = live_result["fill_price"]
+                closed["live_exit_slippage"] = live_result.get("slippage")
+        except Exception as e:
+            logger.error("Live execution exit failed for %s: %s", pos["symbol"], e)
+
     # Journal: record exit review
     try:
         from journal import record_exit
@@ -2507,7 +2541,7 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
                 pnl_pct = (spread_pnl / pos["allocated"]) * 100 if pos["allocated"] > 0 else 0
                 logger.info("EXIT %s spread (%s): P&L ₹%.0f (%.1f%%), reason=%s",
                             symbol, pos.get("strategy", ""), spread_pnl, pnl_pct, exit_reason)
-                close_position(portfolio, pos, exit_price, exit_reason)
+                close_position(portfolio, pos, exit_price, exit_reason, smart_api=smart_api)
                 exits += 1
             else:
                 # HOLD — log spread status
@@ -2567,7 +2601,7 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
             if exit_reason:
                 logger.info("EXIT NIFTY condor: P&L ₹%.0f (%.1f%%), reason=%s",
                             condor_pnl, pnl_pct, exit_reason)
-                close_position(portfolio, pos, underlying_ltp, exit_reason)
+                close_position(portfolio, pos, underlying_ltp, exit_reason, smart_api=smart_api)
                 exits += 1
             else:
                 unrealized_pnl += condor_pnl
@@ -2616,7 +2650,7 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
             if exit_reason:
                 logger.info("EXIT NIFTY momentum %s: P&L ₹%.0f (%.1f%%), reason=%s",
                             pos.get("direction", ""), pnl, pnl_pct, exit_reason)
-                close_position(portfolio, pos, current_premium, exit_reason)
+                close_position(portfolio, pos, current_premium, exit_reason, smart_api=smart_api)
                 exits += 1
             else:
                 unrealized_pnl += pnl
@@ -2678,7 +2712,7 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
                 pnl = round((pos["entry_price"] - exit_price) * abs(pos["quantity"]), 2)
             pnl_pct = calc_pnl_pct(pos["entry_price"], exit_price, pnl_direction)
             logger.warning("FORCE EXIT %s: gap through SL → P&L ₹%.0f (%.1f%%)", symbol, pnl, pnl_pct)
-            close_position(portfolio, pos, exit_price, "gap_through_sl")
+            close_position(portfolio, pos, exit_price, "gap_through_sl", smart_api=smart_api)
             _telegram_notify_exit(pos, "gap_through_sl", pnl, pnl_pct, exit_price, portfolio)
             exits += 1
             continue
@@ -2862,7 +2896,7 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
             partial_qty = abs(pos["quantity"]) // 2
             if partial_qty >= 1:
                 exit_price = apply_slippage(ltp, "EQ", "sell")
-                close_position(portfolio, pos, exit_price, "partial_target", close_qty=partial_qty)
+                close_position(portfolio, pos, exit_price, "partial_target", close_qty=partial_qty, smart_api=smart_api)
                 pos["partial_exit_done"] = True
                 logger.info("%s: PARTIAL EXIT (%d/%d) @ ₹%.2f  [remaining holds]",
                             symbol, partial_qty, abs(pos["quantity"]) + partial_qty, exit_price)
@@ -2876,7 +2910,7 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
                 partial_qty = partial_lots * pos.get("lot_size", abs(pos["quantity"]))
                 if partial_qty < abs(pos["quantity"]):
                     exit_price = apply_slippage(ltp, "OPT", "sell")
-                    close_position(portfolio, pos, exit_price, "opt_partial_profit", close_qty=partial_qty)
+                    close_position(portfolio, pos, exit_price, "opt_partial_profit", close_qty=partial_qty, smart_api=smart_api)
                     pos["opt_partial_done"] = True
                     pos["num_lots"] = total_lots - partial_lots
                     logger.info("%s PE%d: OPT PARTIAL PROFIT (%d/%d lots) @ ₹%.2f (+%.1f%%)  [remaining holds]",
@@ -2887,7 +2921,7 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
         instrument = pos.get("instrument", "EQ")
         exit_price = apply_slippage(ltp, instrument, "sell")
 
-        closed = close_position(portfolio, pos, exit_price, reason)
+        closed = close_position(portfolio, pos, exit_price, reason, smart_api=smart_api)
         tag = reason.upper().replace("_", " ")
         if is_option:
             logger.info("%s PE%d: EXIT (%s) @ ₹%.2f  P&L: %+.1f%% (₹%+.0f)",
@@ -2914,6 +2948,45 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
                         pos["stoploss_price"] = new_sl
                         logger.info("FRIDAY RISK: %s SL tightened to breakeven ₹%.2f (was ₹%.2f)",
                                    pos["symbol"], new_sl, old_sl)
+
+    # ── Greeks computation for option positions ─────────────────────────
+    remaining_open = [p for p in portfolio["positions"] if p["status"] == "open"]
+    opt_positions = [p for p in remaining_open if p.get("instrument") in ("OPT", "MOMENTUM")]
+    if opt_positions:
+        try:
+            from greeks import compute_position_greeks, portfolio_greeks_summary
+            # Build spot prices map from underlying tokens
+            spot_map = {}
+            for p in opt_positions:
+                sym = p["symbol"]
+                if sym not in spot_map:
+                    token = p.get("token", "")
+                    if token:
+                        try:
+                            sp = get_ltp(smart_api, sym, token)
+                            if sp:
+                                spot_map[sym] = sp
+                            time.sleep(config.API_DELAY)
+                        except Exception:
+                            pass
+                    # Fallback: use underlying_price_at_entry if LTP unavailable
+                    if sym not in spot_map and p.get("underlying_price_at_entry"):
+                        spot_map[sym] = p["underlying_price_at_entry"]
+
+            if spot_map:
+                pg = compute_position_greeks(opt_positions, spot_map, config.RISK_FREE_RATE)
+                if pg:
+                    summary = portfolio_greeks_summary(pg)
+                    logger.info("Greeks: Delta=%+.2f  Gamma=%+.4f  Theta=₹%+.0f/day  Vega=%+.2f  Premium@Risk=₹%,.0f",
+                                summary["net_delta"], summary["net_gamma"],
+                                summary["theta_decay_daily_rupees"], summary["net_vega"],
+                                summary["total_premium_at_risk"])
+                    if summary["total_premium_at_risk"] > 0:
+                        theta_pct = abs(summary["theta_decay_daily_rupees"]) / summary["total_premium_at_risk"] * 100
+                        if theta_pct >= config.GREEKS_THETA_WARN_PCT:
+                            logger.warning("THETA WARN: Daily decay %.1f%% of premium at risk", theta_pct)
+        except Exception as e:
+            logger.debug("Greeks computation skipped: %s", e)
 
     # Clean up closed positions from the open list
     portfolio["positions"] = [p for p in portfolio["positions"] if p["status"] == "open"]
@@ -2963,7 +3036,7 @@ def close_all_positions(smart_api, portfolio: dict) -> int:
 
         instrument = pos.get("instrument", "EQ")
         exit_price = apply_slippage(ltp, instrument, "sell")
-        closed = close_position(portfolio, pos, exit_price, "manual")
+        closed = close_position(portfolio, pos, exit_price, "manual", smart_api=smart_api)
         logger.info("%s: CLOSED @ ₹%.2f  P&L: %+.1f%% (₹%+.0f)",
                     pos['symbol'], exit_price, closed['pnl_pct'], closed['pnl'])
         exits += 1
@@ -3606,9 +3679,58 @@ def run_paper_trade(smart_api, mode: str) -> None:
         report = generate_journal_report()
         logger.info(report)
 
+    elif mode == "greeks":
+        logger.info("\n=== PAPER TRADE: Greeks Dashboard ===\n")
+        opt_positions = [p for p in portfolio["positions"]
+                         if p["status"] == "open" and p.get("instrument") in ("OPT", "MOMENTUM")]
+        if not opt_positions:
+            logger.info("No open option positions.")
+        else:
+            from greeks import compute_position_greeks, portfolio_greeks_summary, generate_greeks_report
+            spot_map = {}
+            for p in opt_positions:
+                sym = p["symbol"]
+                if sym not in spot_map:
+                    token = p.get("token", "")
+                    if token:
+                        try:
+                            sp = get_ltp(smart_api, sym, token)
+                            if sp:
+                                spot_map[sym] = sp
+                            time.sleep(config.API_DELAY)
+                        except Exception:
+                            pass
+                    if sym not in spot_map and p.get("underlying_price_at_entry"):
+                        spot_map[sym] = p["underlying_price_at_entry"]
+
+            pg = compute_position_greeks(opt_positions, spot_map, config.RISK_FREE_RATE)
+            summary = portfolio_greeks_summary(pg)
+            report = generate_greeks_report(pg, summary)
+            # Print plain text (strip HTML tags for console)
+            import re
+            plain = re.sub(r"<[^>]+>", "", report)
+            print(plain)
+
+    elif mode == "attribution":
+        logger.info("\n=== PAPER TRADE: Performance Attribution ===\n")
+        from attribution import compute_attribution, generate_attribution_report
+        from journal import _load_journal
+        journal = _load_journal()
+        closed = portfolio["closed_trades"]
+        attr = compute_attribution(journal, closed)
+        report = generate_attribution_report(attr)
+        logger.info(report)
+
+    elif mode == "tax-report":
+        logger.info("\n=== PAPER TRADE: Tax-Ready P&L Report ===\n")
+        from tax_report import generate_tax_report, generate_tax_pnl_statement
+        tax_data = generate_tax_report(portfolio["closed_trades"])
+        statement = generate_tax_pnl_statement(portfolio["closed_trades"])
+        logger.info(statement)
+
     else:
         logger.error("Unknown mode: %s", mode)
-        logger.info("Usage: python paper_trade.py [open|monitor|status|close-all|weekly-report]")
+        logger.info("Usage: python paper_trade.py [open|monitor|status|close-all|weekly-report|greeks|attribution|tax-report]")
         sys.exit(1)
 
 
@@ -3619,14 +3741,18 @@ def run_paper_trade(smart_api, mode: str) -> None:
 def main():
     parser = argparse.ArgumentParser(description="Paper trading engine for F&O screener signals")
     parser.add_argument("mode", choices=["open", "monitor", "status", "close-all",
-                                          "weekly-report", "reset", "journal"],
+                                          "weekly-report", "reset", "journal", "greeks",
+                                          "attribution", "tax-report"],
                         help="open: run screener + open positions, "
                              "monitor: check exits, "
                              "status: print dashboard, "
                              "close-all: force close everything, "
                              "weekly-report: send weekly performance summary, "
                              "reset: archive portfolio + start fresh, "
-                             "journal: print trade journal report")
+                             "journal: print trade journal report, "
+                             "greeks: show Greeks for option positions, "
+                             "attribution: performance attribution analysis, "
+                             "tax-report: tax-ready P&L statement")
     args = parser.parse_args()
 
     logger.info("Connecting to AngelOne SmartAPI...")

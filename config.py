@@ -333,6 +333,9 @@ PAPER_TRADE_SLIPPAGE_PCT = 0.005  # 0.5%
 # Risk-free rate for Black-Scholes
 RISK_FREE_RATE = 0.065
 
+# Greeks monitoring
+GREEKS_THETA_WARN_PCT = 2.0  # warn if daily theta > 2% of premium at risk
+
 # ── V3 Global Macro Intelligence ────────────────────────────────────────────
 
 # US Market hard gates
@@ -453,6 +456,14 @@ RBI_POLICY_DATES = [
     "2026-02-07", "2026-04-09", "2026-06-06",
     "2026-08-08", "2026-10-08", "2026-12-05",
 ]
+
+
+# ── Live Execution ─────────────────────────────────────────────────────────
+LIVE_MODE = False                       # MUST be explicitly enabled — places real orders
+LIVE_MAX_ORDER_VALUE = 15000            # safety cap per order (INR)
+LIVE_CONFIRM_TELEGRAM = True            # send Telegram alert before every live order
+LIVE_MAX_PRICE_DEVIATION_PCT = 2.0      # reject if price deviates >2% from LTP
+LIVE_CONSECUTIVE_FAIL_KILL = 3          # disable LIVE_MODE after 3 consecutive failures
 
 
 if __name__ == "__main__":
