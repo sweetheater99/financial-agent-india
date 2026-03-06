@@ -275,7 +275,8 @@ def _telegram_notify_entry(positions_opened: list[dict]) -> None:
     _telegram_send("\n".join(lines))
 
 
-def _telegram_notify_exit(pos: dict, reason: str, pnl: float, pnl_pct: float) -> None:
+def _telegram_notify_exit(pos: dict, reason: str, pnl: float, pnl_pct: float,
+                          exit_price: float = 0, portfolio: dict | None = None) -> None:
     """Send Telegram alert for position exits."""
     emoji = "✅" if pnl >= 0 else "❌"
     reason_label = {
@@ -284,13 +285,43 @@ def _telegram_notify_exit(pos: dict, reason: str, pnl: float, pnl_pct: float) ->
         "partial_target": "Partial target", "expiry": "Max hold expired",
         "manual": "Manual close",
     }.get(reason, reason)
-    text = (
-        f"{emoji} <b>Paper Trade Exit: {pos['symbol']}</b>\n"
-        f"  Reason: {reason_label}\n"
-        f"  P&amp;L: {pnl_pct:+.1f}% (₹{pnl:+,.0f})\n"
-        f"  Entry: ₹{pos['entry_price']:,.2f} → Exit: ₹{pos.get('exit_price', 0):,.2f}"
-    )
-    _telegram_send(text)
+    # Holding period
+    try:
+        entry_dt = datetime.strptime(pos["entry_date"], "%Y-%m-%d")
+        today_dt = datetime.strptime(_today_ist(), "%Y-%m-%d")
+        held_days = (today_dt - entry_dt).days
+    except Exception:
+        held_days = 0
+    lines = [
+        f"{emoji} <b>Paper Trade Exit: {pos['symbol']}</b>",
+        f"  Reason: {reason_label}",
+        f"  P&amp;L: {pnl_pct:+.1f}% (₹{pnl:+,.0f})",
+        f"  Entry: ₹{pos['entry_price']:,.2f} → Exit: ₹{exit_price:,.2f}",
+        f"  Held: {held_days} day{'s' if held_days != 1 else ''}",
+    ]
+    if portfolio:
+        stats = portfolio.get("stats", {})
+        total_trades = stats.get("total_trades", 0)
+        wins = stats.get("winning_trades", 0)
+        losses = stats.get("losing_trades", 0)
+        realized = stats.get("total_pnl", 0)
+        win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
+        capital = portfolio.get("capital", 100000)
+        # Unrealized P&L from open positions (peak_price is updated each monitor cycle)
+        open_pos = [p for p in portfolio.get("positions", []) if p.get("status") == "open"]
+        unrealized = round(sum(
+            (p.get("peak_price", p["entry_price"]) - p["entry_price"]) * abs(p["quantity"])
+            if p["direction"] == "bullish"
+            else (p["entry_price"] - p.get("peak_price", p["entry_price"])) * abs(p["quantity"])
+            for p in open_pos
+        ), 0)
+        total_pnl = realized + unrealized
+        total_pct = total_pnl / capital * 100
+        lines.append("")
+        lines.append(f"  <b>Realized:</b> ₹{realized:+,.0f}  |  <b>Unrealized:</b> ~₹{unrealized:+,.0f}")
+        lines.append(f"  <b>Total:</b> {total_pct:+.1f}% on capital  |  <b>Open:</b> {len(open_pos)}")
+        lines.append(f"  <b>Win Rate:</b> {win_rate:.0f}% ({wins}W / {losses}L)")
+    _telegram_send("\n".join(lines))
 
 
 def _telegram_daily_summary(portfolio: dict) -> None:
@@ -591,21 +622,25 @@ def _open_put_position(smart_api, symbol: str, eq_token: str, spot_price: float,
 
     Returns position dict or None if skipped.
     """
-    expiry = get_nearest_expiry()
+    expiry = get_nearest_expiry(min_dte=MIN_DTE_TO_OPEN)
     if not expiry:
-        logger.info("SKIP %s: could not determine option expiry", symbol)
+        logger.info("SKIP %s: could not determine option expiry with min %dd DTE", symbol, MIN_DTE_TO_OPEN)
         return None
 
     dte = days_to_expiry(expiry)
-    if dte < MIN_DTE_TO_OPEN:
-        logger.info("SKIP %s: expiry %s only %dd away (min %dd)", symbol, expiry, dte, MIN_DTE_TO_OPEN)
-        return None
+    logger.info("  %s: using expiry %s (%dd DTE)", symbol, expiry, dte)
 
-    # Fetch option chain
+    # Fetch option chain (retry once on failure)
     option_chain = fetch_option_chain(smart_api, symbol, eq_token)
     time.sleep(config.API_DELAY)
     if not option_chain:
-        logger.info("SKIP %s: option chain fetch failed", symbol)
+        logger.info("  %s: option chain fetch failed, retrying...", symbol)
+        smart_api = refresh_session()
+        time.sleep(config.API_DELAY)
+        option_chain = fetch_option_chain(smart_api, symbol, eq_token)
+        time.sleep(config.API_DELAY)
+    if not option_chain:
+        logger.info("SKIP %s: option chain fetch failed after retry", symbol)
         return None
 
     # Select strike
@@ -684,6 +719,139 @@ def _open_put_position(smart_api, symbol: str, eq_token: str, spot_price: float,
                 entry_premium, raw_premium, actual_allocated, alloc['score'], dte)
 
     return position
+
+
+# ---------------------------------------------------------------------------
+# Spread Position Helpers
+# ---------------------------------------------------------------------------
+
+def calc_spread_pnl(entry_long_premium, current_long_premium,
+                    entry_short_premium, current_short_premium, quantity):
+    """Calculate current P&L for a spread position.
+
+    For debit spreads: paid (long - short) at entry, now worth (long - short) current.
+    P&L = (current_spread_value - entry_spread_value) * quantity
+
+    For credit spreads: received (short - long) at entry.
+    P&L = entry_credit - current_cost_to_close
+    """
+    entry_spread = entry_long_premium - entry_short_premium
+    current_spread = current_long_premium - current_short_premium
+    return (current_spread - entry_spread) * quantity
+
+
+def _open_spread_position(portfolio, symbol, direction, spread_data, allocation,
+                          regime_at_entry, iv_percentile_at_entry, expiry_str):
+    """Open a vertical spread position (debit or credit).
+
+    This is for paper trading -- no actual orders placed. Records both legs
+    in a single position entry in the portfolio.
+
+    Args:
+        portfolio: portfolio dict
+        symbol: underlying symbol (e.g. "NIFTY" or "RELIANCE")
+        direction: "bullish" or "bearish"
+        spread_data: dict from select_spread_strikes() with keys:
+            long_strike, short_strike, long_premium, short_premium,
+            net_debit, max_profit, max_loss, rr_ratio, width,
+            long_option_type, short_option_type
+        allocation: amount allocated from capital
+        regime_at_entry: current market regime string
+        iv_percentile_at_entry: IV percentile at entry time
+        expiry_str: expiry date string in "DDMONYYYY" format
+
+    Returns:
+        position dict if opened, None if failed
+    """
+    try:
+        slippage_pct = config.PAPER_TRADE_SLIPPAGE_PCT
+
+        # Determine strategy name
+        if direction == "bullish":
+            strategy_name = "bull_call_spread"
+        else:
+            strategy_name = "bear_put_spread"
+
+        # Apply slippage to premiums
+        long_premium_raw = spread_data["long_premium"]
+        short_premium_raw = spread_data["short_premium"]
+
+        long_premium_with_slippage = round(long_premium_raw * (1 + slippage_pct), 2)
+        short_premium_with_slippage = round(short_premium_raw * (1 - slippage_pct), 2)
+
+        # Lot size from spread_data or default to 75 (NIFTY lot size)
+        lot_size = spread_data.get("lot_size", 75)
+
+        # Net debit after slippage
+        net_debit_with_slippage = round(
+            (long_premium_with_slippage - short_premium_with_slippage) * lot_size, 2
+        )
+
+        # Max profit = (width - net_debit_per_unit) * quantity
+        net_debit_per_unit = long_premium_with_slippage - short_premium_with_slippage
+        max_profit = round((spread_data["width"] - net_debit_per_unit) * lot_size, 2)
+
+        # Risk-reward ratio
+        if net_debit_with_slippage > 0:
+            rr_ratio = round(max_profit / net_debit_with_slippage, 2)
+        else:
+            rr_ratio = spread_data.get("rr_ratio", 0)
+
+        today = _today_ist()
+
+        position = {
+            "id": f"spread_{today}_{symbol}_{strategy_name}",
+            "strategy": strategy_name,
+            "spread_type": "debit",
+            "spread_direction": direction,
+            "symbol": symbol,
+            "instrument": "SPREAD",
+            "underlying_at_entry": spread_data.get("spot", 0),
+            "entry_date": today,
+            "expiry": expiry_str,
+            "quantity": lot_size,
+            "long_leg": {
+                "strike": spread_data["long_strike"],
+                "option_type": spread_data["long_option_type"],
+                "entry_premium": long_premium_with_slippage,
+            },
+            "short_leg": {
+                "strike": spread_data["short_strike"],
+                "option_type": spread_data["short_option_type"],
+                "entry_premium": short_premium_with_slippage,
+            },
+            "net_debit": net_debit_with_slippage,
+            "net_credit": 0,
+            "max_profit": max_profit,
+            "max_loss": net_debit_with_slippage,
+            "spread_width": spread_data["width"],
+            "rr_ratio": rr_ratio,
+            "allocated": allocation,
+            "status": "open",
+            "regime_at_entry": regime_at_entry,
+            "iv_percentile_at_entry": iv_percentile_at_entry,
+            "peak_pnl": 0,
+        }
+
+        # Update portfolio
+        portfolio["positions"].append(position)
+        portfolio["available_capital"] = round(
+            portfolio["available_capital"] - allocation, 2
+        )
+
+        logger.info(
+            "OPENED %s %s %s/%s @ net_debit=%.2f (alloc=%.0f, regime=%s, IV%%=%.0f)",
+            symbol, strategy_name,
+            spread_data["long_strike"], spread_data["short_strike"],
+            net_debit_with_slippage, allocation, regime_at_entry,
+            iv_percentile_at_entry,
+        )
+
+        return position
+
+    except Exception as e:
+        logger.error("Failed to open spread position for %s: %s", symbol, e)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -975,9 +1143,6 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict]) -> int:
     # --- Market Regime Filter ---
     regime_info = fetch_market_regime(smart_api)
     regime = regime_info["regime"]
-    if regime == "skip":
-        logger.warning("Market regime: SKIP — %s", regime_info["detail"])
-        return 0
 
     available_capital = portfolio["available_capital"]
     if regime == "caution":
@@ -999,7 +1164,7 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict]) -> int:
         if check_cooldown(c["symbol"], portfolio["closed_trades"], today):
             logger.info("SKIP %s: cooldown active (recent stoploss)", c["symbol"])
             continue
-        if check_sector_limit(c["symbol"], portfolio["positions"]):
+        if c["direction"] == "bullish" and check_sector_limit(c["symbol"], portfolio["positions"]):
             logger.info("SKIP %s: sector limit reached (%s)", c["symbol"], get_sector(c["symbol"]))
             continue
         filtered.append(c)
@@ -1008,11 +1173,16 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict]) -> int:
         logger.info("No candidates after cooldown/sector filters.")
         return 0
 
-    # --- Entry Quality Filters (RSI, volume, news) ---
+    # --- Entry Quality Filters (regime, RSI, volume, news) ---
     quality_filtered = []
     for c in filtered:
         symbol = c["symbol"]
         direction = c["direction"]
+
+        # Regime filter: skip bullish entries in bearish regime, but allow bearish
+        if regime == "skip" and direction == "bullish":
+            logger.info("SKIP %s: bullish entry blocked in bearish regime", symbol)
+            continue
         rsi = c.get("rsi")
         vol_ratio = c.get("volume_ratio")
         news = c.get("news_sentiment")
@@ -1275,16 +1445,6 @@ def close_position(portfolio: dict, pos: dict, exit_price: float, reason: str,
 
     portfolio["closed_trades"].append(closed)
 
-    # macOS notification
-    emoji = "+" if pnl >= 0 else ""
-    reason_label = {"target": "Target hit", "stoploss": "Stop-loss hit",
-                    "trailing_stop": "Trailing stop hit", "theta_decay": "Theta decay exit",
-                    "partial_target": "Partial target", "expiry": "Max hold expired",
-                    "manual": "Manual close"}.get(reason, reason)
-    _notify("Paper Trade Exit",
-            f"{pos['symbol']} {reason_label}: {pnl_pct:+.1f}% (₹{emoji}{pnl:,.0f})")
-    _telegram_notify_exit(pos, reason, pnl, pnl_pct)
-
     if close_qty is not None:
         # Partial close: reduce position, free proportional capital
         ratio = exit_qty / abs_qty
@@ -1316,6 +1476,16 @@ def close_position(portfolio: dict, pos: dict, exit_price: float, reason: str,
         stats["best_trade"] = {"symbol": pos["symbol"], "pnl_pct": round(pnl_pct, 2)}
     if stats["worst_trade"] is None or pnl_pct < stats["worst_trade"]["pnl_pct"]:
         stats["worst_trade"] = {"symbol": pos["symbol"], "pnl_pct": round(pnl_pct, 2)}
+
+    # Notifications (after stats update so portfolio summary is accurate)
+    emoji = "+" if pnl >= 0 else ""
+    reason_label = {"target": "Target hit", "stoploss": "Stop-loss hit",
+                    "trailing_stop": "Trailing stop hit", "theta_decay": "Theta decay exit",
+                    "partial_target": "Partial target", "expiry": "Max hold expired",
+                    "manual": "Manual close"}.get(reason, reason)
+    _notify("Paper Trade Exit",
+            f"{pos['symbol']} {reason_label}: {pnl_pct:+.1f}% (₹{emoji}{pnl:,.0f})")
+    _telegram_notify_exit(pos, reason, pnl, pnl_pct, exit_price, portfolio)
 
     return closed
 
