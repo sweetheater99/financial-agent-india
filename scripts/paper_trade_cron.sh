@@ -43,6 +43,13 @@ if [ "$HOUR" -eq 15 ] && [ "$MIN" -ge 15 ]; then
     python paper_trade.py monitor >> "$LOG" 2>&1
 fi
 
+# V4: Weekly report (Sunday 10 AM IST)
+DOW=$(TZ=Asia/Kolkata date +%u)  # 7=Sunday
+if [ "$DOW" -eq 7 ] && [ "$HOUR" -eq 10 ] && [ "$MIN" -le 30 ]; then
+    echo "[WEEKLY] Sending weekly performance report" >> "$LOG"
+    python paper_trade.py weekly-report >> "$LOG" 2>&1
+fi
+
 # --- V3 Heartbeat / Failure Alert ---
 EXIT_CODE=${OPEN_EXIT:-$MON_EXIT}
 OPEN_COUNT=$(python -c "

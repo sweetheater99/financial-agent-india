@@ -388,6 +388,14 @@ def _telegram_daily_summary(portfolio: dict) -> None:
     except Exception:
         pass
 
+    try:
+        from sector_rotation import get_sector_rotation
+        rotation = get_sector_rotation()
+        if rotation and rotation.get("rotation_detected"):
+            lines.append(f"Rotation: ↑{','.join(rotation['strengthening'][:3])} ↓{','.join(rotation['weakening'][:3])}")
+    except Exception:
+        pass
+
     if open_pos:
         lines.append(f"\n<b>Open Positions ({len(open_pos)}):</b>")
         for p in open_pos:
@@ -1829,6 +1837,20 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
     except Exception as e:
         logger.debug("Breadth unavailable: %s", e)
 
+    # --- V4 Sector Rotation ---
+    sector_rotation = None
+    try:
+        from sector_rotation import get_sector_rotation
+        sector_rotation = get_sector_rotation()
+        if sector_rotation and sector_rotation.get("rotation_detected"):
+            logger.info("SECTOR ROTATION: strengthening=%s, weakening=%s",
+                        sector_rotation["strengthening"], sector_rotation["weakening"])
+    except Exception as e:
+        logger.debug("Sector rotation unavailable: %s", e)
+
+    # --- V4 Unusual OI (per-stock, applied in allocation loop) ---
+    # Will be checked per-candidate below using existing option chain data
+
     # Filter out stocks already held
     open_symbols = {p["symbol"] for p in portfolio["positions"] if p["status"] == "open"}
     eligible = [c for c in candidates if c["symbol"] not in open_symbols]
@@ -1972,6 +1994,18 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
         # Risk manager: check position limits before opening
         sector = SYMBOL_SECTOR.get(symbol, "Other")
         allocation = alloc["allocation"]
+
+        # V4: Apply allocation_multiplier from Supertrend disagreement
+        allocation = round(allocation * alloc.get("allocation_multiplier", 1.0), 2)
+
+        # V4: Sector rotation adjustment
+        if sector_rotation and sector != "Other":
+            if sector in sector_rotation.get("strengthening", []):
+                allocation = round(allocation * (1 + config.SECTOR_ROTATION_BOOST), 2)
+                logger.info("  %s: sector %s strengthening → +%.0f%% allocation", symbol, sector, config.SECTOR_ROTATION_BOOST * 100)
+            elif sector in sector_rotation.get("weakening", []):
+                allocation = round(allocation * (1 - config.SECTOR_ROTATION_CUT), 2)
+                logger.info("  %s: sector %s weakening → -%.0f%% allocation", symbol, sector, config.SECTOR_ROTATION_CUT * 100)
         open_pos_for_rm = [
             {"strategy": p.get("instrument", "EQ"), "sector": SYMBOL_SECTOR.get(p["symbol"], "Other"),
              "max_loss": p.get("allocated", 0)}
@@ -2007,6 +2041,24 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
                     logger.info("SKIP %s: intraday momentum %s", symbol, momentum_detail)
                     continue
                 logger.info("  %s: intraday momentum %s", symbol, momentum_detail)
+
+        # V4: Unusual OI activity check
+        try:
+            from oi_unusual import detect_unusual_oi, get_oi_signal_for_trade
+            stock_chain = fetch_option_chain(smart_api, symbol, token)
+            time.sleep(config.API_DELAY)
+            if stock_chain:
+                unusual_oi = detect_unusual_oi(stock_chain, symbol)
+                if unusual_oi.get("has_unusual_activity"):
+                    oi_signal = get_oi_signal_for_trade(unusual_oi, direction, ltp)
+                    if oi_signal["signal"] == "cautionary":
+                        allocation = round(allocation * (1 - config.OI_UNUSUAL_CAUTIONARY_CUT), 2)
+                        logger.info("  %s: unusual OI cautionary (%s) → -%.0f%% allocation",
+                                    symbol, oi_signal["reason"], config.OI_UNUSUAL_CAUTIONARY_CUT * 100)
+                    elif oi_signal["signal"] == "confirming":
+                        logger.info("  %s: unusual OI confirms %s (%s)", symbol, direction, oi_signal["reason"])
+        except Exception as e:
+            logger.debug("Unusual OI check failed for %s: %s", symbol, e)
 
         # V3: F&O ban check for options/spreads
         if direction == "bearish":
@@ -2060,6 +2112,17 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
             if candles:
                 atr_at_entry = compute_atr(candles, ATR_PERIOD)
 
+            # V4: Volatility-adjusted position sizing
+            if config.VOL_SIZING_ENABLED and atr_at_entry is not None and ltp > 0:
+                atr_pct = (atr_at_entry / ltp) * 100
+                if atr_pct > 0:
+                    vol_mult = config.VOL_SIZING_BASELINE_ATR_PCT / atr_pct
+                    vol_mult = max(config.VOL_SIZING_MIN_MULT, min(config.VOL_SIZING_MAX_MULT, vol_mult))
+                    old_alloc = allocation
+                    allocation = round(allocation * vol_mult, 2)
+                    logger.info("  %s: ATR%%=%.2f → vol_mult=%.2f (alloc ₹%.0f → ₹%.0f)",
+                                symbol, atr_pct, vol_mult, old_alloc, allocation)
+
             if atr_at_entry is not None:
                 target_price = round(entry_price + ATR_TARGET_MULTIPLIER * atr_at_entry, 2)
                 stoploss_price = round(entry_price - ATR_STOPLOSS_MULTIPLIER * atr_at_entry, 2)
@@ -2069,6 +2132,13 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
                 stoploss_price = round(entry_price * (1 + STOPLOSS_PCT / 100), 2)
 
             max_hold_date = _add_trading_days(today, MAX_HOLD_DAYS)
+
+            # Recompute quantity with volatility-adjusted allocation
+            quantity = math.floor(allocation / entry_price)
+            if quantity < 1:
+                logger.info("SKIP %s: vol-adjusted allocation ₹%.0f < 1 share at ₹%.2f", symbol, allocation, entry_price)
+                continue
+            actual_allocated = round(quantity * entry_price, 2)
 
             position = {
                 "symbol": symbol,
@@ -2626,6 +2696,35 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
                     elif ltp >= effective_sl:
                         reason = "trailing_stop" if trailing_sl < fixed_sl else "stoploss"
 
+            # V4: Time-based SL tightening — as max_hold approaches, tighten stops
+            if reason is None and config.TIME_SL_ENABLED and not is_option:
+                atr_time = pos.get("atr_at_entry")
+                if atr_time is not None:
+                    day_num_t = _trading_days_between(pos["entry_date"], today)
+                    max_days_t = _trading_days_between(pos["entry_date"], pos["max_hold_date"])
+                    if max_days_t > 0:
+                        progress = day_num_t / max_days_t
+                        if progress >= 0.75:
+                            # At 75%+ of hold period: tighten to breakeven or 0.5x ATR
+                            if pos["direction"] == "bullish":
+                                time_sl = max(pos["entry_price"], peak - config.TIME_SL_THREE_QUARTER_MULT * atr_time)
+                                if ltp <= time_sl and time_sl > pos.get("stoploss_price", 0):
+                                    reason = "time_tightened_sl"
+                            else:
+                                time_sl = min(pos["entry_price"], peak + config.TIME_SL_THREE_QUARTER_MULT * atr_time)
+                                if ltp >= time_sl and time_sl < pos.get("stoploss_price", float("inf")):
+                                    reason = "time_tightened_sl"
+                        elif progress >= 0.5:
+                            # At 50-75%: tighten to 0.75x ATR
+                            if pos["direction"] == "bullish":
+                                time_sl = peak - config.TIME_SL_HALF_LIFE_MULT * atr_time
+                                if ltp <= time_sl and time_sl > pos.get("stoploss_price", 0):
+                                    reason = "time_tightened_sl"
+                            else:
+                                time_sl = peak + config.TIME_SL_HALF_LIFE_MULT * atr_time
+                                if ltp >= time_sl and time_sl < pos.get("stoploss_price", float("inf")):
+                                    reason = "time_tightened_sl"
+
             if reason is None and expired:
                 reason = "expiry"
 
@@ -2672,6 +2771,21 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
                 logger.info("%s: PARTIAL EXIT (%d/%d) @ ₹%.2f  [remaining holds]",
                             symbol, partial_qty, abs(pos["quantity"]) + partial_qty, exit_price)
                 continue
+
+        # --- V4: Partial profit booking on options ---
+        if is_option and not pos.get("opt_partial_done") and pnl_pct >= config.OPT_PARTIAL_PROFIT_PCT:
+            total_lots = pos.get("num_lots", 1)
+            partial_lots = max(1, int(total_lots * config.OPT_PARTIAL_RATIO))
+            if partial_lots < total_lots:
+                partial_qty = partial_lots * pos.get("lot_size", abs(pos["quantity"]))
+                if partial_qty < abs(pos["quantity"]):
+                    exit_price = apply_slippage(ltp, "OPT", "sell")
+                    close_position(portfolio, pos, exit_price, "opt_partial_profit", close_qty=partial_qty)
+                    pos["opt_partial_done"] = True
+                    pos["num_lots"] = total_lots - partial_lots
+                    logger.info("%s PE%d: OPT PARTIAL PROFIT (%d/%d lots) @ ₹%.2f (+%.1f%%)  [remaining holds]",
+                                symbol, int(pos.get("strike", 0)), partial_lots, total_lots, exit_price, pnl_pct)
+                    continue
 
         # Apply slippage on exit
         instrument = pos.get("instrument", "EQ")
@@ -3099,6 +3213,111 @@ def _try_index_strategies(smart_api, portfolio: dict) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Weekly Performance Report
+# ---------------------------------------------------------------------------
+
+
+def generate_weekly_report(portfolio: dict) -> str:
+    """Generate weekly performance report for Telegram.
+
+    Analyzes trades from the past 7 days, computes per-strategy win rates,
+    P&L attribution, and portfolio health metrics.
+    """
+    today = _today_ist()
+    week_ago = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=7)).strftime("%Y-%m-%d")
+
+    closed = portfolio.get("closed_trades", [])
+    weekly_trades = [t for t in closed if t.get("exit_date", "") >= week_ago]
+
+    lines = ["<b>📊 Weekly Performance Report</b>\n"]
+    lines.append(f"Period: {week_ago} to {today}\n")
+
+    if not weekly_trades:
+        lines.append("No trades closed this week.")
+        # Still show portfolio status
+        stats = portfolio.get("stats", {})
+        lines.append(f"\nCapital: ₹{portfolio.get('capital', 0):,.0f}")
+        lines.append(f"Total P&amp;L: ₹{stats.get('total_pnl', 0):+,.0f}")
+        open_count = len([p for p in portfolio.get("positions", []) if p.get("status") == "open"])
+        lines.append(f"Open positions: {open_count}")
+        return "\n".join(lines)
+
+    # Overall stats this week
+    total_pnl = sum(t["pnl"] for t in weekly_trades)
+    wins = [t for t in weekly_trades if t["pnl"] >= 0]
+    losses = [t for t in weekly_trades if t["pnl"] < 0]
+    win_rate = len(wins) / len(weekly_trades) * 100 if weekly_trades else 0
+
+    lines.append(f"<b>Week Summary:</b>")
+    lines.append(f"Trades: {len(weekly_trades)}  |  Win Rate: {win_rate:.0f}%")
+    lines.append(f"P&amp;L: ₹{total_pnl:+,.0f}")
+    if wins:
+        avg_win = sum(t["pnl_pct"] for t in wins) / len(wins)
+        lines.append(f"Avg Win: {avg_win:+.1f}%")
+    if losses:
+        avg_loss = sum(t["pnl_pct"] for t in losses) / len(losses)
+        lines.append(f"Avg Loss: {avg_loss:+.1f}%")
+
+    # Per-strategy breakdown
+    strategy_stats = {}
+    for t in weekly_trades:
+        strat = t.get("instrument", "EQ")
+        if t.get("exit_reason", "").startswith("opt_partial"):
+            strat = "OPT"
+        if strat not in strategy_stats:
+            strategy_stats[strat] = {"trades": 0, "wins": 0, "pnl": 0.0}
+        strategy_stats[strat]["trades"] += 1
+        strategy_stats[strat]["pnl"] += t["pnl"]
+        if t["pnl"] >= 0:
+            strategy_stats[strat]["wins"] += 1
+
+    lines.append(f"\n<b>Per-Strategy:</b>")
+    for strat, data in sorted(strategy_stats.items()):
+        wr = data["wins"] / data["trades"] * 100 if data["trades"] > 0 else 0
+        lines.append(f"  {strat}: {data['trades']} trades, {wr:.0f}% WR, ₹{data['pnl']:+,.0f}")
+
+    # Exit reason breakdown
+    reason_counts = {}
+    for t in weekly_trades:
+        reason = t.get("exit_reason", "unknown")
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+
+    lines.append(f"\n<b>Exit Reasons:</b>")
+    for reason, count in sorted(reason_counts.items(), key=lambda x: -x[1]):
+        lines.append(f"  {reason}: {count}")
+
+    # Best and worst trades
+    if weekly_trades:
+        best = max(weekly_trades, key=lambda t: t["pnl_pct"])
+        worst = min(weekly_trades, key=lambda t: t["pnl_pct"])
+        lines.append(f"\nBest: {best['symbol']} ({best['pnl_pct']:+.1f}%, ₹{best['pnl']:+,.0f})")
+        lines.append(f"Worst: {worst['symbol']} ({worst['pnl_pct']:+.1f}%, ₹{worst['pnl']:+,.0f})")
+
+    # Portfolio health
+    stats = portfolio.get("stats", {})
+    analytics = calc_performance_analytics(closed, portfolio.get("capital", TOTAL_CAPITAL))
+    if analytics:
+        lines.append(f"\n<b>Portfolio Health:</b>")
+        pf = f"{analytics['profit_factor']:.2f}" if analytics["profit_factor"] != float("inf") else "∞"
+        lines.append(f"Sharpe: {analytics['sharpe_ratio']:.2f}  |  PF: {pf}")
+        lines.append(f"Max DD: {analytics['max_drawdown_pct']:.1f}%  |  Avg Hold: {analytics['avg_holding_days']:.1f}d")
+
+    open_count = len([p for p in portfolio.get("positions", []) if p.get("status") == "open"])
+    lines.append(f"\nCapital: ₹{portfolio.get('capital', 0):,.0f}  |  Open: {open_count}")
+    lines.append(f"All-time P&amp;L: ₹{stats.get('total_pnl', 0):+,.0f} ({stats.get('total_pnl_pct', 0):+.1f}%)")
+
+    return "\n".join(lines)
+
+
+def send_weekly_report() -> None:
+    """Send weekly performance report via Telegram."""
+    portfolio = load_portfolio()
+    report = generate_weekly_report(portfolio)
+    _telegram_send(report)
+    logger.info("Weekly report sent to Telegram.")
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
@@ -3225,9 +3444,13 @@ def run_paper_trade(smart_api, mode: str) -> None:
         save_portfolio(portfolio)
         print_portfolio_status(portfolio)
 
+    elif mode == "weekly-report":
+        logger.info("\n=== PAPER TRADE: Weekly Performance Report ===\n")
+        send_weekly_report()
+
     else:
         logger.error("Unknown mode: %s", mode)
-        logger.info("Usage: python paper_trade.py [open|monitor|status|close-all]")
+        logger.info("Usage: python paper_trade.py [open|monitor|status|close-all|weekly-report]")
         sys.exit(1)
 
 
@@ -3237,11 +3460,12 @@ def run_paper_trade(smart_api, mode: str) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="Paper trading engine for F&O screener signals")
-    parser.add_argument("mode", choices=["open", "monitor", "status", "close-all"],
+    parser.add_argument("mode", choices=["open", "monitor", "status", "close-all", "weekly-report"],
                         help="open: run screener + open positions, "
                              "monitor: check exits, "
                              "status: print dashboard, "
-                             "close-all: force close everything")
+                             "close-all: force close everything, "
+                             "weekly-report: send weekly performance summary to Telegram")
     args = parser.parse_args()
 
     logger.info("Connecting to AngelOne SmartAPI...")

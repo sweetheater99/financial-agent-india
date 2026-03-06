@@ -401,6 +401,31 @@ X_SEARCH_QUERIES = [
 X_CACHE_HOURS = 1
 X_MIN_LIKES = 50
 
+# Volatility-adjusted sizing
+VOL_SIZING_ENABLED = True
+VOL_SIZING_BASELINE_ATR_PCT = 2.0  # ATR% considered "normal" volatility
+VOL_SIZING_MIN_MULT = 0.4          # minimum size multiplier for very volatile stocks
+VOL_SIZING_MAX_MULT = 1.5          # maximum size multiplier for very steady stocks
+
+# Time-based SL tightening
+TIME_SL_ENABLED = True
+TIME_SL_HALF_LIFE_MULT = 0.75      # at 50% of max_hold, tighten to 0.75x ATR
+TIME_SL_THREE_QUARTER_MULT = 0.5   # at 75% of max_hold, tighten to breakeven or 0.5x ATR
+
+# Partial profit on options
+OPT_PARTIAL_PROFIT_PCT = 30.0      # book half when option is up 30%
+OPT_PARTIAL_RATIO = 0.5            # book 50% of lots
+
+# Weekly performance report
+WEEKLY_REPORT_DAY = 6              # Sunday (0=Mon, 6=Sun)
+
+# Sector rotation
+SECTOR_ROTATION_BOOST = 0.15       # +15% allocation for strengthening sectors
+SECTOR_ROTATION_CUT = 0.15         # -15% allocation for weakening sectors
+
+# Unusual OI
+OI_UNUSUAL_CAUTIONARY_CUT = 0.10   # -10% allocation on cautionary OI signal
+
 # Global intel caching
 GLOBAL_INTEL_CACHE_HOURS = 6
 FII_DII_CACHE_HOURS = 12
