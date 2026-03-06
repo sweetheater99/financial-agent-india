@@ -740,6 +740,134 @@ def calc_spread_pnl(entry_long_premium, current_long_premium,
     return (current_spread - entry_spread) * quantity
 
 
+def estimate_premium_from_underlying(pos, leg, underlying_ltp, today):
+    """Estimate current option premium based on underlying move.
+
+    Simple model: intrinsic value + decayed time value.
+    For paper trading approximation only.
+
+    Args:
+        pos: spread position dict
+        leg: "long" or "short"
+        underlying_ltp: current underlying price
+        today: date string "YYYY-MM-DD" or date object
+
+    Returns:
+        estimated premium (float, min 0.05)
+    """
+    from datetime import date as _date
+
+    leg_data = pos["long_leg"] if leg == "long" else pos["short_leg"]
+    strike = leg_data["strike"]
+    entry_premium = leg_data["entry_premium"]
+    opt_type = leg_data["option_type"]
+
+    # Intrinsic value
+    if opt_type == "CE":
+        intrinsic = max(0, underlying_ltp - strike)
+    else:  # PE
+        intrinsic = max(0, strike - underlying_ltp)
+
+    # Original intrinsic at entry
+    underlying_at_entry = pos["underlying_at_entry"]
+    if opt_type == "CE":
+        entry_intrinsic = max(0, underlying_at_entry - strike)
+    else:
+        entry_intrinsic = max(0, strike - underlying_at_entry)
+
+    # Time value at entry
+    time_value_at_entry = max(0, entry_premium - entry_intrinsic)
+
+    # Decay time value (simple linear decay)
+    entry_date = datetime.strptime(pos["entry_date"], "%Y-%m-%d").date()
+    if isinstance(today, str):
+        today_date = datetime.strptime(today, "%Y-%m-%d").date()
+    else:
+        today_date = today
+    days_held = (today_date - entry_date).days
+
+    # Rough total DTE at entry (assume 30 if not available)
+    total_dte = 30
+    remaining_fraction = max(0, (total_dte - days_held) / total_dte)
+    time_value_now = time_value_at_entry * remaining_fraction * 0.8  # 0.8 for non-linear decay
+
+    return max(0.05, intrinsic + time_value_now)
+
+
+def check_spread_exit(pos, underlying_ltp, today, long_premium, short_premium):
+    """Check if a spread position should be exited.
+
+    Returns exit reason string or None if no exit needed.
+
+    Exit conditions for DEBIT spreads (checked in order):
+    1. Profit cap: P&L >= 80% of max_profit
+    2. Underlying target: moved 2.0x ATR in favorable direction
+    3. Stoploss: moved 1.5x ATR in adverse direction
+    4. Time exit: held >= SPREAD_TIME_EXIT_DAYS trading days
+    5. Expiry safety: DTE <= 5 calendar days
+    """
+    # Only handle debit spreads for now
+    if pos.get("spread_type") != "debit":
+        return None
+
+    direction = pos["spread_direction"]
+    underlying_at_entry = pos["underlying_at_entry"]
+    atr = pos.get("atr_at_entry", pos["spread_width"] / 3)
+    quantity = pos.get("quantity", 75)
+
+    # 1. Profit cap
+    current_pnl = calc_spread_pnl(
+        pos["long_leg"]["entry_premium"], long_premium,
+        pos["short_leg"]["entry_premium"], short_premium,
+        quantity
+    )
+    profit_cap = pos["max_profit"] * config.SPREAD_PROFIT_CAP_PCT
+    if current_pnl >= profit_cap:
+        return "spread_profit_cap"
+
+    # 2. Underlying target
+    target_move = atr * config.SPREAD_TARGET_ATR_MULT
+    if direction == "bullish" and underlying_ltp >= underlying_at_entry + target_move:
+        return "spread_target"
+    if direction == "bearish" and underlying_ltp <= underlying_at_entry - target_move:
+        return "spread_target"
+
+    # 3. Stoploss
+    sl_move = atr * config.SPREAD_SL_ATR_MULT
+    if direction == "bullish" and underlying_ltp <= underlying_at_entry - sl_move:
+        return "spread_stoploss"
+    if direction == "bearish" and underlying_ltp >= underlying_at_entry + sl_move:
+        return "spread_stoploss"
+
+    # 4. Time exit
+    trading_days = _trading_days_between(pos["entry_date"], today)
+    if trading_days >= config.SPREAD_TIME_EXIT_DAYS:
+        return "spread_time_exit"
+
+    # 5. Expiry safety (DTE <= 5 calendar days)
+    if isinstance(today, str):
+        today_date = datetime.strptime(today, "%Y-%m-%d").date()
+    else:
+        today_date = today
+
+    # Parse expiry "DDMONYYYY" format (e.g. "26MAR2026")
+    expiry_str = pos.get("expiry", "")
+    try:
+        expiry_date = datetime.strptime(expiry_str, "%d%b%Y").date()
+    except ValueError:
+        try:
+            expiry_date = datetime.strptime(expiry_str, "%Y-%m-%d").date()
+        except ValueError:
+            expiry_date = None
+
+    if expiry_date is not None:
+        dte = (expiry_date - today_date).days
+        if dte <= 5:
+            return "spread_expiry_safety"
+
+    return None
+
+
 def _open_spread_position(portfolio, symbol, direction, spread_data, allocation,
                           regime_at_entry, iv_percentile_at_entry, expiry_str):
     """Open a vertical spread position (debit or credit).
