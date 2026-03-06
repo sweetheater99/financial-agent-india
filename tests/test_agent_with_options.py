@@ -129,3 +129,66 @@ def test_select_spread_max_loss_equals_debit():
     result = select_spread_strikes(chain, spot=1305, direction="bullish", atr=30, budget=10000, lot_size=250)
     if result:
         assert result["max_loss"] == result["net_debit"]
+
+
+# ── select_credit_spread_strikes tests ─────────────────────────────────────
+
+from agent_with_options import select_credit_spread_strikes
+
+
+def test_select_credit_spread_bull_put():
+    chain = [
+        {"strikePrice": 22000, "PE": {"openInterest": 50000, "impliedVolatility": 18, "delta": -0.10, "lastPrice": 45}, "CE": {}},
+        {"strikePrice": 22100, "PE": {"openInterest": 80000, "impliedVolatility": 19, "delta": -0.15, "lastPrice": 65}, "CE": {}},
+        {"strikePrice": 22200, "PE": {"openInterest": 120000, "impliedVolatility": 20, "delta": -0.22, "lastPrice": 95}, "CE": {}},
+        {"strikePrice": 22300, "PE": {"openInterest": 90000, "impliedVolatility": 21, "delta": -0.28, "lastPrice": 130}, "CE": {}},
+        {"strikePrice": 22400, "PE": {"openInterest": 60000, "impliedVolatility": 22, "delta": -0.35, "lastPrice": 175}, "CE": {}},
+    ]
+    result = select_credit_spread_strikes(
+        chain, spot=22500, direction="bullish", max_loss_budget=6000, lot_size=75
+    )
+    assert result is not None
+    assert result["short_strike"] > result["long_strike"]  # bull put: sell higher put, buy lower put
+    assert result["net_credit"] > 0
+    assert result["max_loss"] <= 6000
+    # max_loss = (width * lot_size) - net_credit
+    assert result["max_loss"] == (result["short_strike"] - result["long_strike"]) * 75 - result["net_credit"]
+
+
+def test_select_credit_spread_bear_call():
+    chain = [
+        {"strikePrice": 22600, "CE": {"openInterest": 60000, "impliedVolatility": 22, "delta": 0.35, "lastPrice": 170}, "PE": {}},
+        {"strikePrice": 22700, "CE": {"openInterest": 90000, "impliedVolatility": 21, "delta": 0.28, "lastPrice": 125}, "PE": {}},
+        {"strikePrice": 22800, "CE": {"openInterest": 120000, "impliedVolatility": 20, "delta": 0.22, "lastPrice": 90}, "PE": {}},
+        {"strikePrice": 22900, "CE": {"openInterest": 80000, "impliedVolatility": 19, "delta": 0.15, "lastPrice": 60}, "PE": {}},
+        {"strikePrice": 23000, "CE": {"openInterest": 50000, "impliedVolatility": 18, "delta": 0.10, "lastPrice": 40}, "PE": {}},
+    ]
+    result = select_credit_spread_strikes(
+        chain, spot=22500, direction="bearish", max_loss_budget=6000, lot_size=75
+    )
+    assert result is not None
+    assert result["short_strike"] < result["long_strike"]  # bear call: sell lower call, buy higher call
+    assert result["net_credit"] > 0
+    assert result["max_loss"] <= 6000
+
+
+def test_select_credit_spread_none_if_credit_too_low():
+    chain = [
+        {"strikePrice": 21000, "PE": {"openInterest": 50000, "impliedVolatility": 12, "delta": -0.02, "lastPrice": 2}, "CE": {}},
+        {"strikePrice": 21100, "PE": {"openInterest": 40000, "impliedVolatility": 13, "delta": -0.03, "lastPrice": 5}, "CE": {}},
+    ]
+    result = select_credit_spread_strikes(
+        chain, spot=22500, direction="bullish", max_loss_budget=2000, lot_size=75
+    )
+    assert result is None  # credit too low
+
+
+def test_select_credit_spread_none_if_low_oi():
+    chain = [
+        {"strikePrice": 22200, "PE": {"openInterest": 100, "impliedVolatility": 20, "delta": -0.22, "lastPrice": 95}, "CE": {}},
+        {"strikePrice": 22300, "PE": {"openInterest": 200, "impliedVolatility": 21, "delta": -0.28, "lastPrice": 130}, "CE": {}},
+    ]
+    result = select_credit_spread_strikes(
+        chain, spot=22500, direction="bullish", max_loss_budget=2000, lot_size=75
+    )
+    assert result is None  # OI too low

@@ -236,6 +236,94 @@ def select_spread_strikes(chain, spot, direction, atr, budget, lot_size, min_oi=
     return best
 
 
+def select_credit_spread_strikes(chain, spot, direction, max_loss_budget, lot_size,
+                                  min_oi=500, min_credit_per_lot=30, target_delta=0.25):
+    """Select strikes for a credit spread (bull put or bear call).
+
+    Bull put: sell OTM put (delta ~0.25), buy further OTM put for protection.
+    Bear call: sell OTM call (delta ~0.25), buy further OTM call for protection.
+    Net credit received upfront. Max loss = width - credit.
+
+    Returns dict with short_strike, long_strike, net_credit, max_loss, max_profit, rr_ratio
+    or None if no valid spread found.
+    """
+    if direction == "bullish":
+        opt_key = "PE"
+        candidates = [s for s in chain if s["strikePrice"] < spot and s.get(opt_key, {}).get("openInterest", 0) >= min_oi]
+        candidates.sort(key=lambda s: s["strikePrice"], reverse=True)
+    else:
+        opt_key = "CE"
+        candidates = [s for s in chain if s["strikePrice"] > spot and s.get(opt_key, {}).get("openInterest", 0) >= min_oi]
+        candidates.sort(key=lambda s: s["strikePrice"])
+
+    if len(candidates) < 2:
+        return None
+
+    # Find short leg: closest to target delta (prefer closer to spot on ties)
+    best_short = None
+    best_delta_diff = float("inf")
+    for c in candidates:
+        delta = abs(c[opt_key].get("delta", 0))
+        diff = abs(delta - target_delta)
+        if diff < best_delta_diff - 1e-9:
+            best_delta_diff = diff
+            best_short = c
+        elif abs(diff - best_delta_diff) < 1e-9 and best_short is not None:
+            # Tie: prefer strike closer to spot (higher premium, more credit)
+            if abs(c["strikePrice"] - spot) < abs(best_short["strikePrice"] - spot):
+                best_short = c
+
+    if not best_short:
+        return None
+
+    short_premium = best_short[opt_key]["lastPrice"]
+    short_strike = best_short["strikePrice"]
+
+    # Find long leg: 1-3 strikes further OTM from short
+    if direction == "bullish":
+        long_candidates = [c for c in candidates if c["strikePrice"] < short_strike]
+    else:
+        long_candidates = [c for c in candidates if c["strikePrice"] > short_strike]
+
+    if not long_candidates:
+        return None
+
+    best_spread = None
+    for lc in long_candidates[:3]:
+        long_premium = lc[opt_key]["lastPrice"]
+        long_strike = lc["strikePrice"]
+        width = abs(short_strike - long_strike)
+
+        net_credit = (short_premium - long_premium) * lot_size
+        max_loss = (width * lot_size) - net_credit
+        max_profit = net_credit
+
+        per_unit_credit = short_premium - long_premium
+        if net_credit <= 0 or per_unit_credit < min_credit_per_lot:
+            continue
+        if max_loss > max_loss_budget:
+            continue
+        if max_loss <= 0:
+            continue
+
+        rr = max_profit / max_loss
+
+        if best_spread is None or rr > best_spread["rr_ratio"]:
+            best_spread = {
+                "short_strike": short_strike,
+                "long_strike": long_strike,
+                "short_premium": short_premium,
+                "long_premium": long_premium,
+                "net_credit": net_credit,
+                "max_loss": max_loss,
+                "max_profit": max_profit,
+                "rr_ratio": round(rr, 2),
+                "width": width,
+            }
+
+    return best_spread
+
+
 def format_candles_for_prompt(candles: list, symbol: str) -> str:
     """Format candle data as a text table."""
     lines = [f"Stock: {symbol} (NSE) — Last {len(candles)} trading days\n"]
