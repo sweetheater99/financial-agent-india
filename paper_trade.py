@@ -1694,6 +1694,79 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
         available_capital = round(available_capital * REGIME_SIZE_REDUCTION, 2)
         logger.info("VOLATILE regime — reducing available capital to ₹%.0f", available_capital)
 
+    # --- V3 Global Macro Intelligence ---
+    pcr = 1.0  # default neutral
+    max_pain = 0
+    try:
+        from oi_analysis import compute_pcr, compute_max_pain
+        chain = fetch_option_chain(smart_api, "NIFTY", NIFTY_TOKEN)
+        time.sleep(config.API_DELAY)
+        if chain:
+            pcr = compute_pcr(chain)
+            max_pain = compute_max_pain(chain)
+            logger.info("PCR: %.2f | Max Pain: %.0f", pcr, max_pain)
+    except Exception as e:
+        logger.debug("OI analysis failed: %s", e)
+
+    # Fetch macro context (US, GIFT, Asia, FII/DII)
+    macro = None
+    try:
+        from global_intel import fetch_macro_context
+        prev_close = nifty_candles[-1][4] if nifty_candles else 0
+        macro = fetch_macro_context(prev_nifty_close=prev_close, pcr=pcr)
+        logger.info("Global: S&P %+.1f%% | Nasdaq %+.1f%% | GIFT gap %+.1f%% | FII %+.0fcr",
+                    macro.get("sp500_pct_change", 0), macro.get("nasdaq_pct_change", 0),
+                    macro.get("gift_nifty_gap_pct", 0), macro.get("fii_net_crores", 0))
+    except Exception as e:
+        logger.debug("Global intel failed: %s", e)
+
+    # Apply macro hard gates
+    if macro:
+        gate = macro.get("hard_gate", "NONE")
+        gate_reason = macro.get("hard_gate_reason", "")
+
+        if gate == "BLOCK_ALL":
+            logger.warning("MACRO BLOCK ALL: %s — skipping all new positions", gate_reason)
+            return 0
+        elif gate == "BLOCK_BULLISH":
+            logger.warning("MACRO BLOCK BULLISH: %s", gate_reason)
+            # Filter out bullish candidates in the loop below
+        elif gate == "REDUCE_50":
+            available_capital = round(available_capital * 0.5, 2)
+            logger.info("MACRO REDUCE 50%%: %s → capital ₹%.0f", gate_reason, available_capital)
+        elif gate == "REDUCE_25":
+            available_capital = round(available_capital * 0.75, 2)
+            logger.info("MACRO REDUCE 25%%: %s → capital ₹%.0f", gate_reason, available_capital)
+
+    # --- V3 Supertrend + CPR ---
+    supertrend_signal = "unknown"
+    cpr_day_type = "normal"
+    try:
+        from indicators_v3 import compute_supertrend, compute_cpr
+        if nifty_candles and len(nifty_candles) >= 15:
+            nifty_df_st = pd.DataFrame(nifty_candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
+            supertrend_signal = compute_supertrend(nifty_df_st)
+            logger.info("Supertrend: %s", supertrend_signal)
+
+            prev_candle = nifty_candles[-2] if len(nifty_candles) >= 2 else nifty_candles[-1]
+            cpr_result = compute_cpr(prev_high=prev_candle[2], prev_low=prev_candle[3], prev_close=prev_candle[4])
+            cpr_day_type = cpr_result["day_type"]
+            logger.info("CPR: %s (width=%.3f%%, pivot=%.0f)", cpr_day_type, cpr_result["cpr_width_pct"], cpr_result["pivot"])
+    except Exception as e:
+        logger.debug("Supertrend/CPR failed: %s", e)
+
+    # --- X/Twitter sentiment (soft signal) ---
+    x_sentiment = None
+    try:
+        from x_intel import fetch_x_sentiment
+        x_sentiment = fetch_x_sentiment()
+        if x_sentiment:
+            logger.info("X sentiment: %s (confidence=%s, themes=%s)",
+                        x_sentiment.get("sentiment"), x_sentiment.get("confidence"),
+                        x_sentiment.get("key_themes", []))
+    except Exception as e:
+        logger.debug("X intel unavailable: %s", e)
+
     # Filter out stocks already held
     open_symbols = {p["symbol"] for p in portfolio["positions"] if p["status"] == "open"}
     eligible = [c for c in candidates if c["symbol"] not in open_symbols]
@@ -1773,6 +1846,31 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
                 if direction == "bearish" and sentiment == "positive":
                     logger.info("SKIP %s: bearish signal contradicts positive news", symbol)
                     continue
+
+        # V3: Macro BLOCK_BULLISH gate
+        if macro and macro.get("hard_gate") == "BLOCK_BULLISH" and direction == "bullish":
+            logger.info("SKIP %s: bullish blocked by macro gate (%s)", symbol, macro.get("hard_gate_reason", ""))
+            continue
+
+        # V3: Nasdaq IT crash → block IT sector bullish
+        if macro and macro.get("hard_gate") == "BLOCK_IT_BULLISH" and direction == "bullish":
+            sector = SYMBOL_SECTOR.get(symbol, "")
+            if sector == "IT":
+                logger.info("SKIP %s: IT bullish blocked by Nasdaq crash", symbol)
+                continue
+
+        # V3: Supertrend disagreement → reduce allocation
+        if supertrend_signal != "unknown":
+            if direction == "bullish" and supertrend_signal == "sell":
+                c["allocation_multiplier"] = c.get("allocation_multiplier", 1.0) * (1 - config.SUPERTREND_DISAGREE_REDUCTION)
+                logger.info("%s: Supertrend disagrees (sell vs bullish), reducing allocation 25%%", symbol)
+            elif direction == "bearish" and supertrend_signal == "buy":
+                c["allocation_multiplier"] = c.get("allocation_multiplier", 1.0) * (1 - config.SUPERTREND_DISAGREE_REDUCTION)
+                logger.info("%s: Supertrend disagrees (buy vs bearish), reducing allocation 25%%", symbol)
+
+        # V3: X/Twitter contradiction filter (soft)
+        if x_sentiment and x_sentiment.get("sentiment") == "crisis":
+            logger.warning("X sentiment: CRISIS detected — %s", x_sentiment.get("key_themes", []))
 
         # YouTube stock intel gate (Mode B) — only as contradiction filter
         try:
