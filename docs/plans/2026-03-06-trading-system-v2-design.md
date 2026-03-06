@@ -484,10 +484,10 @@ The design says "no positions within 5 trading days of earnings" but doesn't spe
 
 Regime detection needs ADX, EMA, and Bollinger Bands. These are NOT in the current codebase.
 
-**Library**: Use `pandas_ta` (already a common dependency) or calculate manually:
-- **ADX(10)**: `pandas_ta.adx(high, low, close, length=10)` — returns ADX, +DI, -DI
-- **EMA(20)**: `pandas_ta.ema(close, length=20)` — or `close.ewm(span=20).mean()`
-- **Bollinger Bands**: `pandas_ta.bbands(close, length=20, std=2)` — returns upper, mid, lower, bandwidth
+**Library**: Use `ta` library (v0.11.0, works on Python 3.11):
+- **ADX(10)**: `ta.trend.ADXIndicator(high, low, close, window=10).adx()`
+- **EMA(20)**: `ta.trend.EMAIndicator(close, window=20).ema_indicator()`
+- **Bollinger Bands**: `ta.volatility.BollingerBands(close, window=20, window_dev=2).bollinger_wband()`
 
 **Data needed**: 50+ daily candles for Nifty (for ADX warm-up). Fetch via SmartAPI `getCandleData()` for NIFTY 50 index, last 60 trading days.
 
@@ -615,7 +615,7 @@ MAX_SIMULTANEOUS_LOSS_PCT = 10   # don't open if all positions losing simultaneo
 
 Add to requirements.txt:
 ```
-pandas-ta>=0.3.14b0    # ADX, EMA, Bollinger Bands for regime detection
+ta>=0.11.0              # ADX, EMA, Bollinger Bands for regime detection (pandas-ta broken on 3.11)
 yt-dlp                  # YouTube video search for youtube_intel.py
 youtube-transcript-api  # YouTube transcript extraction
 ```

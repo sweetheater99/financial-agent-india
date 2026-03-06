@@ -3,3 +3,6 @@ pyotp
 anthropic
 python-dotenv
 duckduckgo-search
+ta>=0.11.0
+yt-dlp
+youtube-transcript-api
