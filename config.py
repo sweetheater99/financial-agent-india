@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import sys
+from datetime import date
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -162,6 +163,140 @@ def is_market_open(_now=None) -> tuple[bool, str]:
         return (False, f"Market closed (after 3:30 PM IST, current time {now.strftime('%H:%M')} IST)")
 
     return (True, "Market is open")
+
+
+# ── V2 Trading System Constants ──────────────────────────────────────────────
+
+NSE_HOLIDAYS_2026 = {
+    date(2026, 1, 26),   # Republic Day
+    date(2026, 2, 26),   # Maha Shivaratri
+    date(2026, 3, 10),   # Holi
+    date(2026, 3, 30),   # Id-Ul-Fitr
+    date(2026, 4, 2),    # Ram Navami
+    date(2026, 4, 3),    # Good Friday
+    date(2026, 4, 14),   # Dr. Ambedkar Jayanti
+    date(2026, 5, 1),    # Maharashtra Day
+    date(2026, 6, 5),    # Id-Ul-Adha
+    date(2026, 7, 6),    # Muharram
+    date(2026, 8, 15),   # Independence Day
+    date(2026, 8, 19),   # Janmashtami
+    date(2026, 10, 2),   # Mahatma Gandhi Jayanti
+    date(2026, 10, 20),  # Dussehra
+    date(2026, 11, 9),   # Diwali (Laxmi Pujan)
+    date(2026, 11, 30),  # Guru Nanak Jayanti
+}
+
+
+def is_trading_day(d: date) -> bool:
+    """Returns True if the given date is a valid NSE trading day (not weekend, not holiday)."""
+    if d.weekday() >= 5:  # Saturday or Sunday
+        return False
+    if d in NSE_HOLIDAYS_2026:
+        return False
+    return True
+
+
+VIX_TIERS = {
+    "extreme_low": {"max_vix": 12, "size_multiplier": 0.50, "iron_condor": False},
+    "normal":      {"min_vix": 12, "max_vix": 18, "size_multiplier": 1.00, "iron_condor": True},
+    "elevated":    {"min_vix": 18, "max_vix": 22, "size_multiplier": 0.75, "iron_condor": False},
+    "high":        {"min_vix": 22, "max_vix": 28, "size_multiplier": 0.50, "iron_condor": False},
+    "crisis":      {"min_vix": 28, "size_multiplier": 0.00, "iron_condor": False},
+}
+
+
+def get_vix_tier(vix: float) -> dict:
+    """Return the VIX tier dict matching the given VIX value."""
+    if vix < 12:
+        return VIX_TIERS["extreme_low"]
+    elif vix < 18:
+        return VIX_TIERS["normal"]
+    elif vix < 22:
+        return VIX_TIERS["elevated"]
+    elif vix < 28:
+        return VIX_TIERS["high"]
+    else:
+        return VIX_TIERS["crisis"]
+
+
+# Capital allocation limits
+ALLOC_EQUITY_MAX = 0.40
+ALLOC_SPREADS_MAX = 0.30
+ALLOC_IRON_CONDOR_MAX = 0.10
+ALLOC_MOMENTUM_MAX = 0.15
+ALLOC_CASH_MIN = 0.05
+MAX_CONCURRENT_POSITIONS = 8
+MAX_SAME_SECTOR = 2
+MAX_SIMULTANEOUS_LOSS_PCT = 10
+
+# Spread strategy constants
+SPREAD_MIN_DTE = 30
+SPREAD_MAX_DTE = 45
+SPREAD_MAX_RISK_PCT = 0.02  # 2% of capital
+SPREAD_TARGET_ATR_MULT = 2.0
+SPREAD_SL_ATR_MULT = 1.5
+SPREAD_PROFIT_CAP_PCT = 0.80
+SPREAD_TIME_EXIT_DAYS = 5
+SPREAD_MIN_OI = 500
+SPREAD_MIN_VOLUME = 100
+SPREAD_MAX_BID_ASK_PCT = 0.05
+
+# Credit spread config
+CREDIT_SPREAD_MIN_IV_PERCENTILE = 50
+CREDIT_SPREAD_PREFER_IV_PERCENTILE = 70
+DEBIT_SPREAD_MAX_IV_PERCENTILE = 70
+CREDIT_SPREAD_TARGET_PCT = 0.50
+CREDIT_SPREAD_SL_MULTIPLIER = 2.0
+CREDIT_SPREAD_TIME_EXIT_DAYS = 5
+CREDIT_SPREAD_MAX_DELTA = 0.35
+CREDIT_SPREAD_MIN_VIX = 15
+CREDIT_SPREAD_MAX_VIX = 25
+
+# Momentum options constants
+MOMENTUM_MAX_RISK_PCT = 0.01  # 1% of capital
+MOMENTUM_SL_PCT = 0.35
+MOMENTUM_TARGET_PCT = 0.90
+MOMENTUM_TIME_EXIT_DAYS = 3
+MOMENTUM_MIN_RR = 2.0
+
+# Iron condor constants
+CONDOR_MAX_RISK_PCT = 0.02
+CONDOR_MIN_VIX = 12
+CONDOR_MAX_VIX = 18
+CONDOR_TARGET_PCT = 0.50
+CONDOR_SL_MULTIPLIER = 2.0
+CONDOR_DELTA_EXIT = 0.30
+CONDOR_TIME_EXIT_DAYS = 5
+CONDOR_MIN_CREDIT_PER_LOT = 50
+
+# Drawdown circuit breakers
+DRAWDOWN_DAILY_HALT = 0.03
+DRAWDOWN_WEEKLY_REDUCE = 0.05
+DRAWDOWN_MONTHLY_HALT = 0.08
+DRAWDOWN_TOTAL_STOP = 0.15
+CONSECUTIVE_LOSS_PAUSE = 3
+
+# CASH regime triggers
+CASH_TRIGGER_MONTHLY_DRAWDOWN_PCT = 8.0
+CASH_TRIGGER_SEVERE_DRAWDOWN_PCT = 12.0
+CASH_TRIGGER_CONSECUTIVE_LOSSES = 5
+CASH_TRIGGER_VIX = 25
+CASH_DURATION_NORMAL = 5
+CASH_DURATION_SEVERE = 10
+CASH_DURATION_LOSSES = 5
+
+# Slippage
+PAPER_TRADE_SLIPPAGE_PCT = 0.005  # 0.5%
+
+# Risk-free rate for Black-Scholes
+RISK_FREE_RATE = 0.065
+
+# YouTube intel config
+YT_CHANNEL_ALLOWLIST = [
+    "PR Sundar", "CA Rachana Ranade", "Power of Stocks",
+    "Pranjal Kamra", "Nitin Bhatia",
+]
+YT_CACHE_HOURS = 12
 
 
 if __name__ == "__main__":
