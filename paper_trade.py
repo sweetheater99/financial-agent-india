@@ -18,7 +18,7 @@ import math
 import subprocess
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -2777,6 +2777,32 @@ def print_portfolio_status(portfolio: dict, smart_api=None) -> None:
               f"Avg Holding: {analytics['avg_holding_days']:.1f} days")
 
     print(f"\n{border}\n")
+
+
+def _is_weekly_theta_day(d: date = None) -> bool:
+    """True if today is Friday (4) or Monday (0) — good days to sell weekly theta."""
+    if d is None:
+        d = datetime.now(IST).date()
+    return d.weekday() in (0, 4)  # Monday or Friday
+
+
+def check_weekly_theta_exit(pos: dict, current_call_prem: float, current_put_prem: float) -> str | None:
+    """Check exit conditions for weekly theta (short strangle).
+
+    Returns exit reason or None.
+    """
+    total_current = current_call_prem + current_put_prem
+    total_entry = pos["total_credit"]
+
+    # Target: 50% premium decay
+    if total_current <= total_entry * config.WEEKLY_THETA_TARGET_PCT:
+        return "target"
+
+    # Stop loss: premium doubles
+    if total_current >= total_entry * config.WEEKLY_THETA_SL_MULTIPLIER:
+        return "stoploss"
+
+    return None
 
 
 # ---------------------------------------------------------------------------

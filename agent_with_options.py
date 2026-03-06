@@ -626,5 +626,53 @@ def main():
     print_report(analysis, args.symbol)
 
 
+def select_strangle_strikes(chain, spot, otm_points, lot_size, min_oi=500):
+    """Select OTM strangle strikes for theta harvesting.
+
+    Args:
+        chain: option chain list
+        spot: current underlying price
+        otm_points: how far OTM each leg should be
+        lot_size: contract lot size
+        min_oi: minimum OI per leg
+
+    Returns dict with call_strike, put_strike, call_premium, put_premium,
+    total_credit, lot_size, or None if no valid strikes.
+    """
+    target_call = spot + otm_points
+    target_put = spot - otm_points
+
+    call_candidates = [
+        s for s in chain
+        if s["strikePrice"] >= target_call
+        and s.get("CE", {}).get("openInterest", 0) >= min_oi
+        and s.get("CE", {}).get("lastPrice", 0) > 0
+    ]
+    put_candidates = [
+        s for s in chain
+        if s["strikePrice"] <= target_put
+        and s.get("PE", {}).get("openInterest", 0) >= min_oi
+        and s.get("PE", {}).get("lastPrice", 0) > 0
+    ]
+
+    if not call_candidates or not put_candidates:
+        return None
+
+    call_strike_data = min(call_candidates, key=lambda s: abs(s["strikePrice"] - target_call))
+    put_strike_data = min(put_candidates, key=lambda s: abs(s["strikePrice"] - target_put))
+
+    call_prem = call_strike_data["CE"]["lastPrice"]
+    put_prem = put_strike_data["PE"]["lastPrice"]
+
+    return {
+        "call_strike": call_strike_data["strikePrice"],
+        "put_strike": put_strike_data["strikePrice"],
+        "call_premium": call_prem,
+        "put_premium": put_prem,
+        "total_credit": call_prem + put_prem,
+        "lot_size": lot_size,
+    }
+
+
 if __name__ == "__main__":
     main()
