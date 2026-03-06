@@ -151,6 +151,13 @@ VIX_HIGH_THRESHOLD = 25.0        # reduce sizes above this
 VIX_BEARISH_THRESHOLD = 20.0     # skip opens above this AND Nifty < SMA
 REGIME_SIZE_REDUCTION = 0.5
 
+INDEX_CONFIGS = [
+    {"name": "NIFTY", "token": NIFTY_TOKEN, "lot_size": 75,
+     "otm_points": config.WEEKLY_THETA_OTM_POINTS_NIFTY, "vix_mult": 1.0},
+    {"name": "BANKNIFTY", "token": config.BANKNIFTY_TOKEN, "lot_size": config.BANKNIFTY_LOT_SIZE,
+     "otm_points": config.WEEKLY_THETA_OTM_POINTS_BANKNIFTY, "vix_mult": config.BANKNIFTY_VIX_MULTIPLIER},
+]
+
 # --- Partial Exits (equity only) ---
 PARTIAL_EXIT_RATIO = 0.5
 
