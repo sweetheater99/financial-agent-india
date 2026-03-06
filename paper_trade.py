@@ -2456,7 +2456,15 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
                     if ltp >= pos["target_price"]:
                         reason = "target"
                     else:
-                        trailing_sl = peak - ATR_TRAILING_MULTIPLIER * atr_at_entry
+                        # V3: Enhanced trailing after activation threshold
+                        unrealized_pct = calc_pnl_pct(pos["entry_price"], ltp, "bullish")
+                        if unrealized_pct >= config.TRAILING_SL_ACTIVATION_PCT:
+                            # Tighter trail: 1.5x ATR from high water mark, floored at entry
+                            trailing_sl = peak - config.TRAILING_SL_ATR_MULT * atr_at_entry
+                            trailing_sl = max(trailing_sl, pos["entry_price"])
+                        else:
+                            # Standard trail before activation
+                            trailing_sl = peak - ATR_TRAILING_MULTIPLIER * atr_at_entry
                         fixed_sl = pos["stoploss_price"]
                         effective_sl = max(trailing_sl, fixed_sl)
                         if ltp <= effective_sl:
@@ -2465,7 +2473,13 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
                     if ltp <= pos["target_price"]:
                         reason = "target"
                     else:
-                        trailing_sl = peak + ATR_TRAILING_MULTIPLIER * atr_at_entry
+                        # V3: Enhanced trailing after activation threshold
+                        unrealized_pct = calc_pnl_pct(pos["entry_price"], ltp, "bearish")
+                        if unrealized_pct >= config.TRAILING_SL_ACTIVATION_PCT:
+                            trailing_sl = peak + config.TRAILING_SL_ATR_MULT * atr_at_entry
+                            trailing_sl = min(trailing_sl, pos["entry_price"])
+                        else:
+                            trailing_sl = peak + ATR_TRAILING_MULTIPLIER * atr_at_entry
                         fixed_sl = pos["stoploss_price"]
                         effective_sl = min(trailing_sl, fixed_sl)
                         if ltp >= effective_sl:
