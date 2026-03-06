@@ -1984,6 +1984,16 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
                     continue
                 logger.info("  %s: intraday momentum %s", symbol, momentum_detail)
 
+        # V3: F&O ban check for options/spreads
+        if direction == "bearish":
+            try:
+                from fo_ban import is_in_fo_ban
+                if is_in_fo_ban(symbol):
+                    logger.info("SKIP %s: F&O ban active — no new F&O positions", symbol)
+                    continue
+            except Exception:
+                pass  # fail-open if ban check unavailable
+
         if direction == "bearish":
             # --- Bearish path: spread if low IV, else put ---
             if iv_percentile < 70:
