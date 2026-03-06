@@ -1036,6 +1036,8 @@ def _open_iron_condor(portfolio, condor_data, allocation, regime_at_entry, iv_pc
         "max_loss": max_loss,
         "allocated": allocation,
         "max_hold_date": max_hold_str,
+        "underlying_at_entry": condor_data.get("spot", 0),
+        "vix_at_entry": condor_data.get("vix_at_entry", 0),
         "status": "open",
         "regime_at_entry": regime_at_entry,
         "iv_percentile_at_entry": iv_pct,
@@ -1788,6 +1790,11 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
         except Exception:
             pass  # YouTube intel is optional
 
+        # Earnings blackout check
+        if is_near_earnings(symbol, today):
+            logger.info("SKIP %s: earnings within 48 hours (blackout)", symbol)
+            continue
+
         quality_filtered.append(c)
 
     if not quality_filtered:
@@ -2150,6 +2157,108 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
                 logger.info("%s spread: underlying ₹%.2f  P&L: ₹%.0f (%.1f%%)  [HOLD]",
                             symbol, underlying_ltp, spread_pnl, pnl_pct)
             continue  # skip the EQ/OPT logic below
+
+        # --- Iron Condor monitoring ---
+        is_condor = pos.get("instrument") == "CONDOR"
+        if is_condor:
+            underlying_ltp = get_ltp(smart_api, "Nifty 50", NIFTY_TOKEN)
+            time.sleep(config.API_DELAY)
+            if underlying_ltp is None:
+                logger.warning("NIFTY condor: could not fetch LTP, skipping")
+                continue
+
+            # Estimate premiums for all 4 legs
+            call_short_prem = estimate_premium_from_underlying(
+                {"long_leg": pos["call_short"], "underlying_at_entry": pos.get("underlying_at_entry", 0),
+                 "expiry": pos["expiry"]},
+                "long", underlying_ltp, today)
+            call_long_prem = estimate_premium_from_underlying(
+                {"long_leg": pos["call_long"], "underlying_at_entry": pos.get("underlying_at_entry", 0),
+                 "expiry": pos["expiry"]},
+                "long", underlying_ltp, today)
+            put_short_prem = estimate_premium_from_underlying(
+                {"long_leg": pos["put_short"], "underlying_at_entry": pos.get("underlying_at_entry", 0),
+                 "expiry": pos["expiry"]},
+                "long", underlying_ltp, today)
+            put_long_prem = estimate_premium_from_underlying(
+                {"long_leg": pos["put_long"], "underlying_at_entry": pos.get("underlying_at_entry", 0),
+                 "expiry": pos["expiry"]},
+                "long", underlying_ltp, today)
+
+            # Get VIX for spike detection
+            current_vix = get_ltp(smart_api, "India VIX", VIX_TOKEN)
+            time.sleep(config.API_DELAY)
+            prev_vix = pos.get("vix_at_entry", current_vix)
+
+            exit_reason = check_condor_exit(
+                pos, call_short_prem, call_long_prem, put_short_prem, put_long_prem,
+                vix=current_vix, prev_vix=prev_vix,
+            )
+
+            # Calculate condor P&L
+            cost_to_close = (call_short_prem - call_long_prem + put_short_prem - put_long_prem) * pos["quantity"]
+            condor_pnl = pos["net_credit"] - cost_to_close
+            pnl_pct = (condor_pnl / pos["allocated"]) * 100 if pos["allocated"] > 0 else 0
+
+            if exit_reason:
+                logger.info("EXIT NIFTY condor: P&L ₹%.0f (%.1f%%), reason=%s",
+                            condor_pnl, pnl_pct, exit_reason)
+                close_position(portfolio, pos, underlying_ltp, exit_reason)
+                exits += 1
+            else:
+                unrealized_pnl += condor_pnl
+                logger.info("NIFTY condor: Nifty ₹%.0f  P&L: ₹%.0f (%.1f%%)  [HOLD]",
+                            underlying_ltp, condor_pnl, pnl_pct)
+            continue
+
+        # --- Momentum option monitoring ---
+        is_momentum = pos.get("instrument") == "MOMENTUM"
+        if is_momentum:
+            # Get current option premium via underlying estimation
+            underlying_ltp = get_ltp(smart_api, "Nifty 50", NIFTY_TOKEN)
+            time.sleep(config.API_DELAY)
+            if underlying_ltp is None:
+                logger.warning("NIFTY momentum: could not fetch LTP, skipping")
+                continue
+
+            # Estimate current premium
+            strike = pos.get("strike", 0)
+            opt_type = pos.get("option_type", "CE")
+            if opt_type == "CE":
+                intrinsic = max(0, underlying_ltp - strike)
+            else:
+                intrinsic = max(0, strike - underlying_ltp)
+
+            # Simple estimate: intrinsic + time value decay
+            entry_premium = pos["entry_price"]
+            entry_intrinsic = max(0, (pos.get("underlying_at_entry", underlying_ltp) - strike) if opt_type == "CE"
+                                  else (strike - pos.get("underlying_at_entry", underlying_ltp)))
+            time_value_at_entry = max(0, entry_premium - entry_intrinsic)
+
+            dte = days_to_expiry(pos.get("expiry", ""))
+            entry_dte = max(dte + 1, 1)  # rough estimate
+            tv_remaining = time_value_at_entry * (dte / entry_dte) * 0.7
+            current_premium = max(0.05, intrinsic + tv_remaining)
+
+            # Update peak
+            if current_premium > pos.get("peak_premium", 0):
+                pos["peak_premium"] = current_premium
+
+            exit_reason = check_momentum_exit(pos, current_premium, today)
+
+            pnl = (current_premium - entry_premium) * pos["quantity"]
+            pnl_pct = (current_premium - entry_premium) / entry_premium * 100 if entry_premium > 0 else 0
+
+            if exit_reason:
+                logger.info("EXIT NIFTY momentum %s: P&L ₹%.0f (%.1f%%), reason=%s",
+                            pos.get("direction", ""), pnl, pnl_pct, exit_reason)
+                close_position(portfolio, pos, current_premium, exit_reason)
+                exits += 1
+            else:
+                unrealized_pnl += pnl
+                logger.info("NIFTY momentum %s: prem ₹%.2f  P&L: ₹%.0f (%.1f%%)  [HOLD]",
+                            pos.get("direction", ""), current_premium, pnl, pnl_pct)
+            continue
 
         # Check max hold expiry first (doesn't need LTP)
         expired = today > pos["max_hold_date"]
@@ -2559,6 +2668,151 @@ def print_portfolio_status(portfolio: dict, smart_api=None) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Index-Level Strategies (Iron Condor + Momentum)
+# ---------------------------------------------------------------------------
+
+
+def _try_index_strategies(smart_api, portfolio: dict) -> int:
+    """Attempt index-level strategies: iron condor and momentum options on Nifty.
+
+    These strategies don't need screener candidates — they operate on Nifty index directly.
+    Returns number of positions opened.
+    """
+    opened = 0
+    today = _today_ist()
+
+    # Skip if near macro event (applies to iron condors)
+    near_macro = is_near_macro_event(today)
+
+    # Fetch Nifty data (may already be cached from open_positions, but re-fetch is fine)
+    nifty_candles = fetch_daily_candles(smart_api, NIFTY_TOKEN, days=50)
+    if not nifty_candles:
+        return 0
+
+    vix_ltp = get_ltp(smart_api, "India VIX", VIX_TOKEN)
+    time.sleep(config.API_DELAY)
+
+    nifty_ltp = get_ltp(smart_api, "Nifty 50", NIFTY_TOKEN)
+    time.sleep(config.API_DELAY)
+
+    if not nifty_ltp or not vix_ltp:
+        return 0
+
+    # Get regime (re-derive; keeping it self-contained)
+    nifty_df = pd.DataFrame(nifty_candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    regime_result = classify_regime_v2(nifty_df, vix_ltp)
+    regime = regime_result["regime"]
+    iv_percentile = regime_result.get("iv_percentile", 50)
+    confidence = regime_result.get("confidence", 0)
+
+    available = portfolio["available_capital"]
+
+    # Check if we already have index positions open
+    open_instruments = [p.get("instrument") for p in portfolio["positions"] if p["status"] == "open"]
+    has_condor = "CONDOR" in open_instruments
+    has_momentum = "MOMENTUM" in open_instruments
+
+    # --- Iron Condor: SIDEWAYS + VIX 12-18 + no macro event + not Thu/Fri ---
+    if (not has_condor
+        and regime == "SIDEWAYS"
+        and confidence >= 0.70
+        and config.CONDOR_MIN_VIX <= vix_ltp <= config.CONDOR_MAX_VIX
+        and not near_macro
+        and datetime.now(IST).weekday() < 3  # Mon-Wed only (0=Mon, 4=Fri)
+    ):
+        max_condor_alloc = available * config.ALLOC_IRON_CONDOR_MAX
+        max_loss_budget = TOTAL_CAPITAL * config.CONDOR_MAX_RISK_PCT
+
+        try:
+            from agent_with_options import select_iron_condor_strikes
+
+            # Fetch Nifty option chain
+            chain = fetch_option_chain(smart_api, "NIFTY")
+            time.sleep(config.API_DELAY)
+
+            if chain:
+                expiry = get_nearest_expiry(chain, min_dte=config.CONDOR_TIME_EXIT_DAYS + 5)
+                condor_data = select_iron_condor_strikes(
+                    chain, spot=nifty_ltp, lot_size=75,
+                    max_loss_budget=max_loss_budget,
+                    min_credit_per_lot=config.CONDOR_MIN_CREDIT_PER_LOT,
+                )
+
+                if condor_data:
+                    # Attach spot and VIX for monitoring later
+                    condor_data["spot"] = nifty_ltp
+                    condor_data["vix_at_entry"] = vix_ltp
+                    allocation = min(condor_data["max_loss"], max_condor_alloc)
+                    pos = _open_iron_condor(
+                        portfolio, condor_data, allocation, regime, iv_percentile,
+                        expiry or "",
+                    )
+                    if pos:
+                        opened += 1
+                        logger.info("OPENED iron condor on Nifty: credit=₹%.0f, max_loss=₹%.0f",
+                                    condor_data["net_credit"], condor_data["max_loss"])
+        except Exception as e:
+            logger.debug("Iron condor attempt failed: %s", e)
+
+    # --- Momentum: breakout + TRENDING/VOLATILE regime ---
+    if (not has_momentum
+        and regime in ("TRENDING_UP", "TRENDING_DOWN", "VOLATILE")
+        and iv_percentile < 80
+    ):
+        breakout = check_nifty_breakout(nifty_candles, period=20)
+
+        if breakout:
+            # Validate: breakout direction matches regime
+            valid = False
+            if breakout == "bullish" and regime in ("TRENDING_UP", "VOLATILE"):
+                valid = True
+            elif breakout == "bearish" and regime in ("TRENDING_DOWN", "VOLATILE"):
+                valid = True
+
+            if valid:
+                max_momentum_alloc = TOTAL_CAPITAL * config.MOMENTUM_MAX_RISK_PCT  # 1% of capital
+
+                try:
+                    chain = fetch_option_chain(smart_api, "NIFTY")
+                    time.sleep(config.API_DELAY)
+
+                    if chain:
+                        expiry = get_nearest_expiry(chain, min_dte=10)  # monthly, not weekly
+                        opt_type = "CE" if breakout == "bullish" else "PE"
+
+                        # Find ATM strike
+                        strikes = sorted(chain, key=lambda x: abs(x["strikePrice"] - nifty_ltp))
+                        atm = strikes[0] if strikes else None
+
+                        if atm and atm.get(opt_type, {}).get("lastPrice"):
+                            premium = atm[opt_type]["lastPrice"]
+                            strike = atm["strikePrice"]
+                            lot_size = 75
+                            total_cost = premium * lot_size
+
+                            if total_cost <= max_momentum_alloc and premium > 0:
+                                option_data = {
+                                    "strike": strike,
+                                    "premium": premium,
+                                    "lot_size": lot_size,
+                                    "option_type": opt_type,
+                                }
+                                pos = _open_momentum_position(
+                                    portfolio, breakout, option_data,
+                                    round(total_cost, 2), regime, iv_percentile,
+                                    expiry or "",
+                                )
+                                if pos:
+                                    opened += 1
+                                    logger.info("OPENED momentum %s on Nifty: %s %s @ ₹%.2f",
+                                                breakout, opt_type, strike, premium)
+                except Exception as e:
+                    logger.debug("Momentum attempt failed: %s", e)
+
+    return opened
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
@@ -2639,6 +2893,15 @@ def run_paper_trade(smart_api, mode: str) -> None:
         logger.info("\nOpening positions (available capital: ₹%.0f)...", portfolio['available_capital'])
         positions_before = {p["symbol"] for p in portfolio["positions"] if p["status"] == "open"}
         opened = open_positions(smart_api, portfolio, top_buffer, yt_market=yt_market)
+
+        # --- Index-level strategies: Iron Condor + Momentum ---
+        # These don't need screener candidates — they use Nifty index directly
+        try:
+            index_opened = _try_index_strategies(smart_api, portfolio)
+            opened += index_opened
+        except Exception as e:
+            logger.debug("Index strategies error: %s", e)
+
         logger.info("\n  Opened %d position(s).", opened)
 
         # Telegram alert for new entries
