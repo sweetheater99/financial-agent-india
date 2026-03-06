@@ -380,6 +380,14 @@ def _telegram_daily_summary(portfolio: dict) -> None:
     except Exception:
         pass
 
+    try:
+        from breadth import compute_breadth
+        breadth = compute_breadth()
+        if breadth:
+            lines.append(f"Breadth: {breadth['advancing']}/{breadth['total']} above 20EMA ({breadth['breadth_pct']:.0f}%) — {breadth['signal']}")
+    except Exception:
+        pass
+
     if open_pos:
         lines.append(f"\n<b>Open Positions ({len(open_pos)}):</b>")
         for p in open_pos:
@@ -1805,6 +1813,22 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
     except Exception as e:
         logger.debug("X intel unavailable: %s", e)
 
+    # --- V3 Market Breadth ---
+    breadth = None
+    try:
+        from breadth import compute_breadth
+        breadth = compute_breadth()
+        if breadth:
+            logger.info("Breadth: %d/%d advancing (%.0f%%) — %s",
+                        breadth["advancing"], breadth["total"],
+                        breadth["breadth_pct"], breadth["signal"])
+            # Divergent breadth + bullish regime = warning, reduce capital
+            if breadth["signal"] == "divergent" and regime in ("TRENDING_UP",):
+                available_capital = round(available_capital * 0.75, 2)
+                logger.warning("BREADTH DIVERGENCE: market rising but breadth weak — reducing capital 25%%")
+    except Exception as e:
+        logger.debug("Breadth unavailable: %s", e)
+
     # Filter out stocks already held
     open_symbols = {p["symbol"] for p in portfolio["positions"] if p["status"] == "open"}
     eligible = [c for c in candidates if c["symbol"] not in open_symbols]
@@ -2242,6 +2266,34 @@ def close_position(portfolio: dict, pos: dict, exit_price: float, reason: str,
     _telegram_notify_exit(pos, reason, pnl, pnl_pct, exit_price, portfolio)
 
     return closed
+
+
+def detect_gap_through_sl(pos: dict, current_ltp: float) -> bool:
+    """Detect if a position has gapped through its stoploss.
+
+    Returns True if current LTP is beyond the stoploss in the wrong direction.
+    """
+    sl = pos.get("stoploss_price")
+    if sl is None:
+        return False
+
+    if pos["direction"] == "bullish":
+        return current_ltp < sl
+    else:
+        return current_ltp > sl
+
+
+def _is_friday_afternoon(weekday: int = None, hour: int = None, minute: int = None) -> bool:
+    """Check if it's Friday afternoon (2 PM+). Used for weekend risk reduction.
+
+    Args can be overridden for testing; defaults to current IST time.
+    """
+    if weekday is None:
+        now = datetime.now(IST)
+        weekday = now.weekday()
+        hour = now.hour
+        minute = now.minute
+    return weekday == 4 and hour >= 14
 
 
 def monitor_positions(smart_api, portfolio: dict) -> tuple:
