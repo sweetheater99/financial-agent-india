@@ -2859,141 +2859,153 @@ def check_weekly_theta_exit(pos: dict, current_call_prem: float, current_put_pre
 
 
 def _try_index_strategies(smart_api, portfolio: dict) -> int:
-    """Attempt index-level strategies: iron condor and momentum options on Nifty.
+    """Attempt index-level strategies on all configured indices (Nifty + BankNifty).
 
-    These strategies don't need screener candidates — they operate on Nifty index directly.
-    Returns number of positions opened.
+    Runs iron condor and momentum options on each index.
+    Returns total number of positions opened.
     """
     opened = 0
     today = _today_ist()
-
-    # Skip if near macro event (applies to iron condors)
     near_macro = is_near_macro_event(today)
 
-    # Fetch Nifty data (may already be cached from open_positions, but re-fetch is fine)
-    nifty_candles = fetch_daily_candles(smart_api, NIFTY_TOKEN, days=50)
-    if not nifty_candles:
-        return 0
-
-    vix_ltp = get_ltp(smart_api, "India VIX", VIX_TOKEN)
-    time.sleep(config.API_DELAY)
-
-    nifty_ltp = get_ltp(smart_api, "Nifty 50", NIFTY_TOKEN)
-    time.sleep(config.API_DELAY)
-
-    if not nifty_ltp or not vix_ltp:
-        return 0
-
-    # Get regime (re-derive; keeping it self-contained)
-    nifty_df = pd.DataFrame(nifty_candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    regime_result = classify_regime_v2(nifty_df, vix_ltp)
-    regime = regime_result["regime"]
-    iv_percentile = regime_result.get("iv_percentile", 50)
-    confidence = regime_result.get("confidence", 0)
+    # Check which instruments are already open
+    open_instruments = [p.get("instrument") for p in portfolio["positions"] if p["status"] == "open"]
+    open_index_names = [p.get("index_name", "NIFTY") for p in portfolio["positions"] if p["status"] == "open"]
 
     available = portfolio["available_capital"]
 
-    # Check if we already have index positions open
-    open_instruments = [p.get("instrument") for p in portfolio["positions"] if p["status"] == "open"]
-    has_condor = "CONDOR" in open_instruments
-    has_momentum = "MOMENTUM" in open_instruments
+    for idx_cfg in INDEX_CONFIGS:
+        idx_name = idx_cfg["name"]
+        idx_token = idx_cfg["token"]
+        lot_size = idx_cfg["lot_size"]
+        vix_mult = idx_cfg["vix_mult"]
 
-    # --- Iron Condor: SIDEWAYS + VIX 12-18 + no macro event + not Thu/Fri ---
-    if (not has_condor
-        and regime == "SIDEWAYS"
-        and confidence >= 0.70
-        and config.CONDOR_MIN_VIX <= vix_ltp <= config.CONDOR_MAX_VIX
-        and not near_macro
-        and datetime.now(IST).weekday() < 3  # Mon-Wed only (0=Mon, 4=Fri)
-    ):
-        max_condor_alloc = available * config.ALLOC_IRON_CONDOR_MAX
-        max_loss_budget = TOTAL_CAPITAL * config.CONDOR_MAX_RISK_PCT
+        # Fetch candles for this index
+        candles = fetch_daily_candles(smart_api, idx_token, days=50)
+        if not candles:
+            continue
 
-        try:
-            from agent_with_options import select_iron_condor_strikes
+        vix_ltp = get_ltp(smart_api, "India VIX", VIX_TOKEN)
+        time.sleep(config.API_DELAY)
 
-            # Fetch Nifty option chain
-            chain = fetch_option_chain(smart_api, "NIFTY")
-            time.sleep(config.API_DELAY)
+        idx_ltp = get_ltp(smart_api, idx_name, idx_token)
+        time.sleep(config.API_DELAY)
 
-            if chain:
-                expiry = get_nearest_expiry(chain, min_dte=config.CONDOR_TIME_EXIT_DAYS + 5)
-                condor_data = select_iron_condor_strikes(
-                    chain, spot=nifty_ltp, lot_size=75,
-                    max_loss_budget=max_loss_budget,
-                    min_credit_per_lot=config.CONDOR_MIN_CREDIT_PER_LOT,
-                )
+        if not idx_ltp or not vix_ltp:
+            continue
 
-                if condor_data:
-                    # Attach spot and VIX for monitoring later
-                    condor_data["spot"] = nifty_ltp
-                    condor_data["vix_at_entry"] = vix_ltp
-                    allocation = min(condor_data["max_loss"], max_condor_alloc)
-                    pos = _open_iron_condor(
-                        portfolio, condor_data, allocation, regime, iv_percentile,
-                        expiry or "",
+        # Regime detection (using per-index candles for regime)
+        idx_df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        regime_result = classify_regime_v2(idx_df, vix_ltp)
+        regime = regime_result["regime"]
+        iv_percentile = regime_result.get("iv_percentile", 50)
+        confidence = regime_result.get("confidence", 0)
+
+        # Scale VIX thresholds for this index
+        condor_min_vix = config.CONDOR_MIN_VIX * vix_mult
+        condor_max_vix = config.CONDOR_MAX_VIX * vix_mult
+
+        # Check if this index already has positions
+        has_condor = any(i == "CONDOR" and n == idx_name
+                         for i, n in zip(open_instruments, open_index_names))
+        has_momentum = any(i == "MOMENTUM" and n == idx_name
+                            for i, n in zip(open_instruments, open_index_names))
+
+        # --- Iron Condor: SIDEWAYS + VIX in range + no macro event + Mon-Wed ---
+        if (not has_condor
+            and regime == "SIDEWAYS"
+            and confidence >= 0.70
+            and condor_min_vix <= vix_ltp <= condor_max_vix
+            and not near_macro
+            and datetime.now(IST).weekday() < 3
+        ):
+            max_condor_alloc = available * config.ALLOC_IRON_CONDOR_MAX
+            max_loss_budget = TOTAL_CAPITAL * config.CONDOR_MAX_RISK_PCT
+
+            try:
+                from agent_with_options import select_iron_condor_strikes
+
+                chain = fetch_option_chain(smart_api, idx_name)
+                time.sleep(config.API_DELAY)
+
+                if chain:
+                    expiry = get_nearest_expiry(chain, min_dte=config.CONDOR_TIME_EXIT_DAYS + 5)
+                    condor_data = select_iron_condor_strikes(
+                        chain, spot=idx_ltp, lot_size=lot_size,
+                        max_loss_budget=max_loss_budget,
+                        min_credit_per_lot=config.CONDOR_MIN_CREDIT_PER_LOT,
                     )
-                    if pos:
-                        opened += 1
-                        logger.info("OPENED iron condor on Nifty: credit=₹%.0f, max_loss=₹%.0f",
-                                    condor_data["net_credit"], condor_data["max_loss"])
-        except Exception as e:
-            logger.debug("Iron condor attempt failed: %s", e)
 
-    # --- Momentum: breakout + TRENDING/VOLATILE regime ---
-    if (not has_momentum
-        and regime in ("TRENDING_UP", "TRENDING_DOWN", "VOLATILE")
-        and iv_percentile < 80
-    ):
-        breakout = check_nifty_breakout(nifty_candles, period=20)
+                    if condor_data:
+                        condor_data["spot"] = idx_ltp
+                        condor_data["vix_at_entry"] = vix_ltp
+                        condor_data["index_name"] = idx_name
+                        allocation = min(condor_data["max_loss"], max_condor_alloc)
+                        pos = _open_iron_condor(
+                            portfolio, condor_data, allocation, regime, iv_percentile,
+                            expiry or "",
+                        )
+                        if pos:
+                            pos["index_name"] = idx_name
+                            opened += 1
+                            logger.info("OPENED iron condor on %s: credit=₹%.0f, max_loss=₹%.0f",
+                                        idx_name, condor_data["net_credit"], condor_data["max_loss"])
+            except Exception as e:
+                logger.debug("Iron condor attempt on %s failed: %s", idx_name, e)
 
-        if breakout:
-            # Validate: breakout direction matches regime
-            valid = False
-            if breakout == "bullish" and regime in ("TRENDING_UP", "VOLATILE"):
-                valid = True
-            elif breakout == "bearish" and regime in ("TRENDING_DOWN", "VOLATILE"):
-                valid = True
+        # --- Momentum: breakout + TRENDING/VOLATILE regime ---
+        if (not has_momentum
+            and regime in ("TRENDING_UP", "TRENDING_DOWN", "VOLATILE")
+            and iv_percentile < 80
+        ):
+            breakout = check_nifty_breakout(candles, period=20)
 
-            if valid:
-                max_momentum_alloc = TOTAL_CAPITAL * config.MOMENTUM_MAX_RISK_PCT  # 1% of capital
+            if breakout:
+                valid = False
+                if breakout == "bullish" and regime in ("TRENDING_UP", "VOLATILE"):
+                    valid = True
+                elif breakout == "bearish" and regime in ("TRENDING_DOWN", "VOLATILE"):
+                    valid = True
 
-                try:
-                    chain = fetch_option_chain(smart_api, "NIFTY")
-                    time.sleep(config.API_DELAY)
+                if valid:
+                    max_momentum_alloc = TOTAL_CAPITAL * config.MOMENTUM_MAX_RISK_PCT
 
-                    if chain:
-                        expiry = get_nearest_expiry(chain, min_dte=10)  # monthly, not weekly
-                        opt_type = "CE" if breakout == "bullish" else "PE"
+                    try:
+                        chain = fetch_option_chain(smart_api, idx_name)
+                        time.sleep(config.API_DELAY)
 
-                        # Find ATM strike
-                        strikes = sorted(chain, key=lambda x: abs(x["strikePrice"] - nifty_ltp))
-                        atm = strikes[0] if strikes else None
+                        if chain:
+                            expiry = get_nearest_expiry(chain, min_dte=10)
+                            opt_type = "CE" if breakout == "bullish" else "PE"
 
-                        if atm and atm.get(opt_type, {}).get("lastPrice"):
-                            premium = atm[opt_type]["lastPrice"]
-                            strike = atm["strikePrice"]
-                            lot_size = 75
-                            total_cost = premium * lot_size
+                            strikes = sorted(chain, key=lambda x: abs(x["strikePrice"] - idx_ltp))
+                            atm = strikes[0] if strikes else None
 
-                            if total_cost <= max_momentum_alloc and premium > 0:
-                                option_data = {
-                                    "strike": strike,
-                                    "premium": premium,
-                                    "lot_size": lot_size,
-                                    "option_type": opt_type,
-                                }
-                                pos = _open_momentum_position(
-                                    portfolio, breakout, option_data,
-                                    round(total_cost, 2), regime, iv_percentile,
-                                    expiry or "",
-                                )
-                                if pos:
-                                    opened += 1
-                                    logger.info("OPENED momentum %s on Nifty: %s %s @ ₹%.2f",
-                                                breakout, opt_type, strike, premium)
-                except Exception as e:
-                    logger.debug("Momentum attempt failed: %s", e)
+                            if atm and atm.get(opt_type, {}).get("lastPrice"):
+                                premium = atm[opt_type]["lastPrice"]
+                                strike = atm["strikePrice"]
+                                total_cost = premium * lot_size
+
+                                if total_cost <= max_momentum_alloc and premium > 0:
+                                    option_data = {
+                                        "strike": strike,
+                                        "premium": premium,
+                                        "lot_size": lot_size,
+                                        "option_type": opt_type,
+                                        "index_name": idx_name,
+                                    }
+                                    pos = _open_momentum_position(
+                                        portfolio, breakout, option_data,
+                                        round(total_cost, 2), regime, iv_percentile,
+                                        expiry or "",
+                                    )
+                                    if pos:
+                                        pos["index_name"] = idx_name
+                                        opened += 1
+                                        logger.info("OPENED momentum %s on %s: %s %s @ ₹%.2f",
+                                                    breakout, idx_name, opt_type, strike, premium)
+                    except Exception as e:
+                        logger.debug("Momentum attempt on %s failed: %s", idx_name, e)
 
     return opened
 
