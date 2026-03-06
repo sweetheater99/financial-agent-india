@@ -2499,6 +2499,24 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
             logger.warning("%s: could not fetch LTP, skipping", symbol)
             continue
 
+        # V3: Gap-through-SL detection — immediate exit if gapped past SL
+        if not is_option and not is_spread and detect_gap_through_sl(pos, ltp):
+            gap_pct = abs(ltp - pos["stoploss_price"]) / pos["entry_price"] * 100
+            logger.warning("GAP THROUGH SL: %s gapped to ₹%.2f (SL was ₹%.2f, gap=%.1f%%)",
+                          symbol, ltp, pos["stoploss_price"], gap_pct)
+            exit_price = apply_slippage(ltp, "EQ", "sell" if pos["direction"] == "bullish" else "buy")
+            pnl_direction = pos["direction"]
+            if pnl_direction == "bullish":
+                pnl = round((exit_price - pos["entry_price"]) * abs(pos["quantity"]), 2)
+            else:
+                pnl = round((pos["entry_price"] - exit_price) * abs(pos["quantity"]), 2)
+            pnl_pct = calc_pnl_pct(pos["entry_price"], exit_price, pnl_direction)
+            logger.warning("FORCE EXIT %s: gap through SL → P&L ₹%.0f (%.1f%%)", symbol, pnl, pnl_pct)
+            close_position(portfolio, pos, exit_price, "gap_through_sl")
+            _telegram_notify_exit(pos, "gap_through_sl", pnl, pnl_pct, exit_price, portfolio)
+            exits += 1
+            continue
+
         # --- Trailing stop: update peak ---
         if is_option:
             peak_key = "peak_premium"
@@ -2668,6 +2686,24 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
             logger.info("%s: EXIT (%s) @ ₹%.2f  P&L: %+.1f%% (₹%+.0f)",
                         symbol, tag, exit_price, closed['pnl_pct'], closed['pnl'])
         exits += 1
+
+    # V3: Friday afternoon risk reduction — tighten stops for weekend
+    if _is_friday_afternoon():
+        for pos in [p for p in portfolio["positions"] if p["status"] == "open"]:
+            is_fno = pos.get("instrument") in ("OPT", "SPREAD", "CONDOR", "MOMENTUM")
+            if is_fno:
+                # Close marginal F&O positions (less than 1% unrealized gain)
+                # We'd need LTP here but it was already fetched above — log warning for now
+                logger.warning("FRIDAY RISK: F&O position %s open over weekend — monitor closely", pos["symbol"])
+            else:
+                # Tighten equity trailing SL to breakeven if in profit
+                if pos.get("peak_price", pos["entry_price"]) > pos["entry_price"] * 1.01:
+                    old_sl = pos.get("stoploss_price", 0)
+                    new_sl = max(old_sl, pos["entry_price"])
+                    if new_sl > old_sl:
+                        pos["stoploss_price"] = new_sl
+                        logger.info("FRIDAY RISK: %s SL tightened to breakeven ₹%.2f (was ₹%.2f)",
+                                   pos["symbol"], new_sl, old_sl)
 
     # Clean up closed positions from the open list
     portfolio["positions"] = [p for p in portfolio["positions"] if p["status"] == "open"]
