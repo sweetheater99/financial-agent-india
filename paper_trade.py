@@ -924,6 +924,320 @@ def check_spread_exit(pos, underlying_ltp, today, long_premium, short_premium):
     return None
 
 
+def check_condor_exit(pos, call_short_prem, call_long_prem, put_short_prem, put_long_prem,
+                      vix=None, prev_vix=None):
+    """Check exit conditions for an iron condor position.
+
+    Returns exit reason string or None.
+
+    Exit conditions checked in order:
+    1. VIX spike > 20% in 1 day → immediate close
+    2. Stoploss: loss exceeds 2x credit received
+    3. Target: P&L >= 50% of net credit received
+    4. Time exit: past max_hold_date
+    """
+    net_credit = pos["net_credit"]
+    quantity = pos["quantity"]
+    cost_to_close = (call_short_prem - call_long_prem + put_short_prem - put_long_prem) * quantity
+    current_pnl = net_credit - cost_to_close
+
+    # VIX spike > 20%
+    if vix is not None and prev_vix is not None and prev_vix > 0:
+        vix_change = (vix - prev_vix) / prev_vix
+        if vix_change > 0.20:
+            return "condor_vix_spike"
+
+    # Stoploss: loss exceeds 2x credit
+    if current_pnl <= -(net_credit * config.CONDOR_SL_MULTIPLIER):
+        return "condor_stoploss"
+
+    # Target: 50% of credit
+    if current_pnl >= net_credit * config.CONDOR_TARGET_PCT:
+        return "condor_target"
+
+    # Time exit
+    today = _today_ist()
+    max_hold = pos.get("max_hold_date", pos.get("expiry", ""))
+    if max_hold and today >= max_hold:
+        return "condor_time_exit"
+
+    return None
+
+
+def _open_iron_condor(portfolio, condor_data, allocation, regime_at_entry, iv_pct, expiry_str):
+    """Open iron condor position. 4-leg position stored as single entry.
+
+    Args:
+        portfolio: portfolio dict
+        condor_data: dict from select_iron_condor_strikes()
+        allocation: amount allocated from capital
+        regime_at_entry: current market regime string
+        iv_pct: IV percentile at entry
+        expiry_str: expiry date string in "DDMONYYYY" format
+
+    Returns:
+        position dict
+    """
+    today = _today_ist()
+    slippage = config.PAPER_TRADE_SLIPPAGE_PCT
+    lot_size = condor_data.get("lot_size", 75)
+
+    # Apply slippage: sell legs get worse (lower premium), buy legs get worse (higher premium)
+    cs_prem = round(condor_data["call_short_premium"] * (1 - slippage), 2)
+    cl_prem = round(condor_data["call_long_premium"] * (1 + slippage), 2)
+    ps_prem = round(condor_data["put_short_premium"] * (1 - slippage), 2)
+    pl_prem = round(condor_data["put_long_premium"] * (1 + slippage), 2)
+
+    net_credit = round((cs_prem + ps_prem - cl_prem - pl_prem) * lot_size, 2)
+    width = condor_data["width"]
+    max_loss = round(width * lot_size - net_credit, 2)
+
+    # Max hold date = CONDOR_TIME_EXIT_DAYS trading days before expiry
+    try:
+        expiry_date = datetime.strptime(expiry_str, "%d%b%Y").date()
+        from config import add_trading_days as _config_add_td
+        max_hold_date = _config_add_td(expiry_date, -config.CONDOR_TIME_EXIT_DAYS)
+        max_hold_str = max_hold_date.strftime("%Y-%m-%d")
+    except Exception:
+        max_hold_str = _add_trading_days(today, 15)
+
+    position = {
+        "id": f"condor_{today}_NIFTY",
+        "strategy": "iron_condor",
+        "symbol": "NIFTY",
+        "instrument": "CONDOR",
+        "entry_date": today,
+        "expiry": expiry_str,
+        "quantity": lot_size,
+        "direction": "neutral",
+        "entry_price": 0,  # condor uses net_credit instead
+        "call_short": {
+            "strike": condor_data["call_short_strike"],
+            "entry_premium": cs_prem,
+            "option_type": "CE",
+        },
+        "call_long": {
+            "strike": condor_data["call_long_strike"],
+            "entry_premium": cl_prem,
+            "option_type": "CE",
+        },
+        "put_short": {
+            "strike": condor_data["put_short_strike"],
+            "entry_premium": ps_prem,
+            "option_type": "PE",
+        },
+        "put_long": {
+            "strike": condor_data["put_long_strike"],
+            "entry_premium": pl_prem,
+            "option_type": "PE",
+        },
+        "net_credit": net_credit,
+        "max_profit": net_credit,
+        "max_loss": max_loss,
+        "allocated": allocation,
+        "max_hold_date": max_hold_str,
+        "status": "open",
+        "regime_at_entry": regime_at_entry,
+        "iv_percentile_at_entry": iv_pct,
+    }
+
+    portfolio["positions"].append(position)
+    portfolio["available_capital"] = round(portfolio["available_capital"] - allocation, 2)
+    return position
+
+
+# ---------------------------------------------------------------------------
+# Momentum Options
+# ---------------------------------------------------------------------------
+
+def check_nifty_breakout(candles, period=20):
+    """Check if Nifty broke 20-day high or low.
+
+    Args:
+        candles: list of candle lists [date, open, high, low, close, volume]
+        period: lookback period (default 20)
+
+    Returns:
+        "bullish" (broke high), "bearish" (broke low), or None.
+    """
+    if not candles or len(candles) < period + 1:
+        return None
+
+    lookback = candles[-(period + 1):-1]  # previous N days (excluding today)
+    today = candles[-1]
+
+    high_n = max(c[2] for c in lookback)
+    low_n = min(c[3] for c in lookback)
+
+    today_close = today[4]
+
+    if today_close > high_n:
+        return "bullish"
+    if today_close < low_n:
+        return "bearish"
+    return None
+
+
+def check_momentum_exit(pos, current_premium, today):
+    """Check momentum option exit conditions.
+
+    Args:
+        pos: momentum position dict
+        current_premium: current option premium
+        today: date string "YYYY-MM-DD"
+
+    Returns:
+        exit reason string or None.
+    """
+    entry = pos["entry_price"]
+    if entry <= 0:
+        return None
+
+    # Target hit
+    if current_premium >= pos["target_price"]:
+        return "target"
+
+    # Stoploss hit
+    if current_premium <= pos["stoploss_price"]:
+        return "stoploss"
+
+    # Time exit: past max_hold_date with < 15% profit
+    pnl_pct = (current_premium - entry) / entry * 100
+    if today >= pos["max_hold_date"] and pnl_pct < 15:
+        return "time_exit"
+
+    # Trailing stop from peak (only after 30% gain)
+    peak = pos.get("peak_premium", entry)
+    if peak > entry * 1.3:
+        trail_sl = peak * 0.75  # 25% trailing stop from peak
+        if current_premium <= trail_sl:
+            return "trailing_stop"
+
+    return None
+
+
+def _open_momentum_position(portfolio, direction, option_data, allocation, regime, iv_pct, expiry_str):
+    """Open a momentum options position (naked ATM call or put on Nifty).
+
+    Args:
+        portfolio: portfolio dict
+        direction: "bullish" or "bearish"
+        option_data: dict with "premium", "strike", optionally "lot_size"
+        allocation: amount allocated from capital
+        regime: current market regime
+        iv_pct: IV percentile at entry
+        expiry_str: expiry date string in "DDMONYYYY" format
+
+    Returns:
+        position dict
+    """
+    today = _today_ist()
+    slippage = config.PAPER_TRADE_SLIPPAGE_PCT
+
+    entry_premium = round(option_data["premium"] * (1 + slippage), 2)
+    quantity = option_data.get("lot_size", 75)
+
+    position = {
+        "id": f"momentum_{today}_NIFTY_{direction}",
+        "strategy": "momentum",
+        "symbol": "NIFTY",
+        "instrument": "MOMENTUM",
+        "direction": direction,
+        "entry_date": today,
+        "expiry": expiry_str,
+        "option_type": "CE" if direction == "bullish" else "PE",
+        "strike": option_data["strike"],
+        "entry_price": entry_premium,
+        "quantity": quantity,
+        "allocated": allocation,
+        "target_price": round(entry_premium * (1 + config.MOMENTUM_TARGET_PCT), 2),
+        "stoploss_price": round(entry_premium * (1 - config.MOMENTUM_SL_PCT), 2),
+        "max_hold_date": _add_trading_days(today, config.MOMENTUM_TIME_EXIT_DAYS),
+        "peak_premium": entry_premium,
+        "status": "open",
+        "regime_at_entry": regime,
+        "iv_percentile_at_entry": iv_pct,
+    }
+
+    portfolio["positions"].append(position)
+    portfolio["available_capital"] = round(portfolio["available_capital"] - allocation, 2)
+    return position
+
+
+# ---------------------------------------------------------------------------
+# Earnings Calendar & Macro Event Checking
+# ---------------------------------------------------------------------------
+
+MACRO_EVENTS_2026 = [
+    "2026-02-01",  # Union Budget
+    "2026-04-09",  # RBI MPC
+    "2026-06-04",  # RBI MPC
+    "2026-08-06",  # RBI MPC
+    "2026-10-08",  # RBI MPC
+    "2026-12-03",  # RBI MPC
+    # US Fed dates
+    "2026-01-29",  # FOMC
+    "2026-03-19",  # FOMC
+    "2026-05-07",  # FOMC
+    "2026-06-18",  # FOMC
+    "2026-07-30",  # FOMC
+    "2026-09-17",  # FOMC
+    "2026-11-05",  # FOMC
+    "2026-12-17",  # FOMC
+    # Nifty expiry weeks (last Thursday of month)
+    "2026-01-29",
+    "2026-02-26",
+    "2026-03-26",
+    "2026-04-30",
+    "2026-05-28",
+    "2026-06-25",
+    "2026-07-30",
+    "2026-08-27",
+    "2026-09-24",
+    "2026-10-29",
+    "2026-11-26",
+    "2026-12-31",
+]
+
+
+def is_near_earnings(symbol: str, today: str = None, blackout_days: int = 2) -> bool:
+    """Check if symbol has earnings within blackout_days.
+
+    Reads from data/earnings_calendar.json.
+    """
+    if today is None:
+        today = _today_ist()
+
+    cal_path = Path(__file__).parent / "data" / "earnings_calendar.json"
+    if not cal_path.exists():
+        return False
+
+    try:
+        cal = json.loads(cal_path.read_text())
+        dates = cal.get(symbol, [])
+        for d in dates:
+            days_until = (datetime.strptime(d, "%Y-%m-%d") - datetime.strptime(today, "%Y-%m-%d")).days
+            if 0 <= days_until <= blackout_days:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def is_near_macro_event(today: str = None, blackout_days: int = 2) -> bool:
+    """Check if a macro event is within blackout_days."""
+    if today is None:
+        today = _today_ist()
+
+    today_dt = datetime.strptime(today, "%Y-%m-%d")
+    for event_date in MACRO_EVENTS_2026:
+        event_dt = datetime.strptime(event_date, "%Y-%m-%d")
+        days_until = (event_dt - today_dt).days
+        if 0 <= days_until <= blackout_days:
+            return True
+    return False
+
+
 def _open_spread_position(portfolio, symbol, direction, spread_data, allocation,
                           regime_at_entry, iv_percentile_at_entry, expiry_str):
     """Open a vertical spread position (debit or credit).

@@ -324,6 +324,126 @@ def select_credit_spread_strikes(chain, spot, direction, max_loss_budget, lot_si
     return best_spread
 
 
+def select_iron_condor_strikes(chain, spot, lot_size, max_loss_budget,
+                                min_oi=500, min_credit_per_lot=50):
+    """Select 4 strikes for an iron condor on Nifty.
+
+    An iron condor is two credit spreads combined:
+    - Bear call spread: sell OTM call (200-300 pts above), buy further OTM call (protection)
+    - Bull put spread: sell OTM put (200-300 pts below), buy further OTM put (protection)
+
+    Args:
+        chain: list of dicts from option chain (each has strikePrice, CE, PE)
+        spot: current underlying price
+        lot_size: contract lot size (e.g. 75 for NIFTY)
+        max_loss_budget: max acceptable loss in rupees
+        min_oi: minimum open interest per leg
+        min_credit_per_lot: minimum net credit per lot in rupees
+
+    Returns:
+        dict with call_short_strike, call_long_strike, put_short_strike, put_long_strike,
+             call_short_premium, call_long_premium, put_short_premium, put_long_premium,
+             net_credit, max_loss, width
+        or None if no valid condor found.
+    """
+    if not chain:
+        return None
+
+    sorted_chain = sorted(chain, key=lambda r: r.get("strikePrice", 0))
+
+    # Call side candidates: 200-400 pts above spot with sufficient OI
+    call_candidates = [
+        r for r in sorted_chain
+        if 200 <= r.get("strikePrice", 0) - spot <= 400
+        and r.get("CE", {}).get("openInterest", 0) >= min_oi
+    ]
+
+    # Put side candidates: 200-400 pts below spot with sufficient OI
+    put_candidates = [
+        r for r in sorted_chain
+        if 200 <= spot - r.get("strikePrice", 0) <= 400
+        and r.get("PE", {}).get("openInterest", 0) >= min_oi
+    ]
+
+    if not call_candidates or not put_candidates:
+        return None
+
+    # Pick short call closest to 250 pts OTM
+    call_candidates.sort(key=lambda r: abs(r["strikePrice"] - spot - 250))
+    short_call_row = call_candidates[0]
+    short_call_strike = short_call_row["strikePrice"]
+    short_call_premium = short_call_row.get("CE", {}).get("lastPrice", 0) or 0
+
+    # Long call: 100-200 pts above short call, sufficient OI
+    long_call_candidates = [
+        r for r in sorted_chain
+        if 100 <= r.get("strikePrice", 0) - short_call_strike <= 200
+        and r.get("CE", {}).get("openInterest", 0) >= min_oi
+    ]
+    if not long_call_candidates:
+        return None
+
+    long_call_candidates.sort(key=lambda r: abs(r["strikePrice"] - short_call_strike - 100))
+    long_call_row = long_call_candidates[0]
+    long_call_strike = long_call_row["strikePrice"]
+    long_call_premium = long_call_row.get("CE", {}).get("lastPrice", 0) or 0
+
+    # Pick short put closest to 250 pts OTM (below spot)
+    put_candidates.sort(key=lambda r: abs(spot - r["strikePrice"] - 250))
+    short_put_row = put_candidates[0]
+    short_put_strike = short_put_row["strikePrice"]
+    short_put_premium = short_put_row.get("PE", {}).get("lastPrice", 0) or 0
+
+    # Long put: 100-200 pts below short put, sufficient OI
+    long_put_candidates = [
+        r for r in sorted_chain
+        if 100 <= short_put_strike - r.get("strikePrice", 0) <= 200
+        and r.get("PE", {}).get("openInterest", 0) >= min_oi
+    ]
+    if not long_put_candidates:
+        return None
+
+    long_put_candidates.sort(key=lambda r: abs(short_put_strike - r["strikePrice"] - 100))
+    long_put_row = long_put_candidates[0]
+    long_put_strike = long_put_row["strikePrice"]
+    long_put_premium = long_put_row.get("PE", {}).get("lastPrice", 0) or 0
+
+    # Calculate net credit and max loss
+    net_credit_per_unit = (short_call_premium + short_put_premium) - (long_call_premium + long_put_premium)
+    net_credit = net_credit_per_unit * lot_size
+
+    if net_credit <= 0:
+        return None
+
+    call_width = long_call_strike - short_call_strike
+    put_width = short_put_strike - long_put_strike
+    width = max(call_width, put_width)
+
+    max_loss = width * lot_size - net_credit
+
+    # Validate constraints
+    if max_loss > max_loss_budget:
+        return None
+
+    if net_credit_per_unit < min_credit_per_lot:
+        return None
+
+    return {
+        "call_short_strike": short_call_strike,
+        "call_long_strike": long_call_strike,
+        "put_short_strike": short_put_strike,
+        "put_long_strike": long_put_strike,
+        "call_short_premium": short_call_premium,
+        "call_long_premium": long_call_premium,
+        "put_short_premium": short_put_premium,
+        "put_long_premium": long_put_premium,
+        "net_credit": net_credit,
+        "max_loss": max_loss,
+        "width": width,
+        "lot_size": lot_size,
+    }
+
+
 def format_candles_for_prompt(candles: list, symbol: str) -> str:
     """Format candle data as a text table."""
     lines = [f"Stock: {symbol} (NSE) — Last {len(candles)} trading days\n"]
