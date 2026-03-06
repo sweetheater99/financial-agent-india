@@ -726,6 +726,31 @@ def _open_put_position(smart_api, symbol: str, eq_token: str, spot_price: float,
 
 
 # ---------------------------------------------------------------------------
+# Spread Type Routing
+# ---------------------------------------------------------------------------
+
+def _select_spread_type(direction: str, iv_percentile: int, vix: float | None) -> str | None:
+    """Route between debit and credit spread based on IV environment.
+
+    Returns 'debit', 'credit', or None if neither is viable.
+    """
+    can_debit = iv_percentile <= config.DEBIT_SPREAD_MAX_IV_PERCENTILE
+    can_credit = (
+        iv_percentile >= config.CREDIT_SPREAD_MIN_IV_PERCENTILE
+        and vix is not None
+        and config.CREDIT_SPREAD_MIN_VIX <= vix <= config.CREDIT_SPREAD_MAX_VIX
+    )
+
+    if can_credit and not can_debit:
+        return "credit"
+    if can_debit and not can_credit:
+        return "debit"
+    if can_debit and can_credit:
+        return "debit"  # prefer debit in overlap zone (50-70%)
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Spread Position Helpers
 # ---------------------------------------------------------------------------
 
@@ -803,6 +828,11 @@ def check_spread_exit(pos, underlying_ltp, today, long_premium, short_premium):
 
     Returns exit reason string or None if no exit needed.
 
+    Exit conditions for CREDIT spreads (checked first):
+    1. Target: P&L >= 50% of net credit received
+    2. Stoploss: loss exceeds 2x credit received
+    (then falls through to time/expiry checks)
+
     Exit conditions for DEBIT spreads (checked in order):
     1. Profit cap: P&L >= 80% of max_profit
     2. Underlying target: moved 2.0x ATR in favorable direction
@@ -810,42 +840,64 @@ def check_spread_exit(pos, underlying_ltp, today, long_premium, short_premium):
     4. Time exit: held >= SPREAD_TIME_EXIT_DAYS trading days
     5. Expiry safety: DTE <= 5 calendar days
     """
-    # Only handle debit spreads for now
-    if pos.get("spread_type") != "debit":
+    spread_type = pos.get("spread_type")
+
+    # ── Credit spread exits ──────────────────────────────────────────────
+    if spread_type == "credit":
+        net_credit = pos.get("net_credit", 0)
+        cost_to_close = abs(short_premium - long_premium) * pos.get("quantity", 75)
+        current_pnl = net_credit - cost_to_close
+
+        # Target: 50% of credit received
+        if net_credit > 0 and current_pnl >= net_credit * config.CREDIT_SPREAD_TARGET_PCT:
+            return "credit_target"
+
+        # Stoploss: loss exceeds 2x credit
+        if net_credit > 0 and current_pnl <= -(net_credit * config.CREDIT_SPREAD_SL_MULTIPLIER):
+            return "credit_stoploss"
+
+        # Fall through to time/expiry checks below
+
+    # ── Debit spread exits ───────────────────────────────────────────────
+    elif spread_type == "debit":
+        direction = pos["spread_direction"]
+        underlying_at_entry = pos["underlying_at_entry"]
+        atr = pos.get("atr_at_entry", pos["spread_width"] / 3)
+        quantity = pos.get("quantity", 75)
+
+        # 1. Profit cap
+        current_pnl = calc_spread_pnl(
+            pos["long_leg"]["entry_premium"], long_premium,
+            pos["short_leg"]["entry_premium"], short_premium,
+            quantity
+        )
+        profit_cap = pos["max_profit"] * config.SPREAD_PROFIT_CAP_PCT
+        if current_pnl >= profit_cap:
+            return "spread_profit_cap"
+
+        # 2. Underlying target
+        target_move = atr * config.SPREAD_TARGET_ATR_MULT
+        if direction == "bullish" and underlying_ltp >= underlying_at_entry + target_move:
+            return "spread_target"
+        if direction == "bearish" and underlying_ltp <= underlying_at_entry - target_move:
+            return "spread_target"
+
+        # 3. Stoploss
+        sl_move = atr * config.SPREAD_SL_ATR_MULT
+        if direction == "bullish" and underlying_ltp <= underlying_at_entry - sl_move:
+            return "spread_stoploss"
+        if direction == "bearish" and underlying_ltp >= underlying_at_entry + sl_move:
+            return "spread_stoploss"
+    else:
         return None
 
-    direction = pos["spread_direction"]
-    underlying_at_entry = pos["underlying_at_entry"]
-    atr = pos.get("atr_at_entry", pos["spread_width"] / 3)
-    quantity = pos.get("quantity", 75)
-
-    # 1. Profit cap
-    current_pnl = calc_spread_pnl(
-        pos["long_leg"]["entry_premium"], long_premium,
-        pos["short_leg"]["entry_premium"], short_premium,
-        quantity
-    )
-    profit_cap = pos["max_profit"] * config.SPREAD_PROFIT_CAP_PCT
-    if current_pnl >= profit_cap:
-        return "spread_profit_cap"
-
-    # 2. Underlying target
-    target_move = atr * config.SPREAD_TARGET_ATR_MULT
-    if direction == "bullish" and underlying_ltp >= underlying_at_entry + target_move:
-        return "spread_target"
-    if direction == "bearish" and underlying_ltp <= underlying_at_entry - target_move:
-        return "spread_target"
-
-    # 3. Stoploss
-    sl_move = atr * config.SPREAD_SL_ATR_MULT
-    if direction == "bullish" and underlying_ltp <= underlying_at_entry - sl_move:
-        return "spread_stoploss"
-    if direction == "bearish" and underlying_ltp >= underlying_at_entry + sl_move:
-        return "spread_stoploss"
-
+    # ── Shared time/expiry exits (both debit and credit) ─────────────────
     # 4. Time exit
+    time_exit_days = (config.CREDIT_SPREAD_TIME_EXIT_DAYS
+                      if spread_type == "credit"
+                      else config.SPREAD_TIME_EXIT_DAYS)
     trading_days = _trading_days_between(pos["entry_date"], today)
-    if trading_days >= config.SPREAD_TIME_EXIT_DAYS:
+    if trading_days >= time_exit_days:
         return "spread_time_exit"
 
     # 5. Expiry safety (DTE <= 5 calendar days)
