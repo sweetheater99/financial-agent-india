@@ -2503,7 +2503,7 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
     open_pos = [p for p in portfolio["positions"] if p["status"] == "open"]
     if not open_pos:
         logger.info("No open positions to monitor.")
-        return 0
+        return 0, 0
 
     today = _today_ist()
     exits = 0
