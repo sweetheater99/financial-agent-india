@@ -51,13 +51,18 @@ the JSON. The JSON must have exactly these fields:
 }"""
 
 
-def get_nearest_expiry() -> str:
-    """Get the nearest monthly options expiry (last Thursday of the month) in DDMONYYYY format."""
+def get_nearest_expiry(min_dte: int = 0) -> str:
+    """Get the nearest monthly options expiry (last Thursday of the month) in DDMONYYYY format.
+
+    Args:
+        min_dte: minimum calendar days to expiry. If the nearest expiry is
+                 closer than this, skip to the next month's expiry.
+    """
     from datetime import date, timedelta
     import calendar
 
     today = date.today()
-    # Check current month and next month
+    # Check current month and next 2 months
     for month_offset in range(3):
         y = today.year + (today.month + month_offset - 1) // 12
         m = (today.month + month_offset - 1) % 12 + 1
@@ -66,7 +71,7 @@ def get_nearest_expiry() -> str:
         d = date(y, m, last_day)
         while d.weekday() != 3:  # Thursday
             d -= timedelta(days=1)
-        if d >= today:
+        if d >= today and (d - today).days >= min_dte:
             return d.strftime("%d%b%Y").upper()  # e.g. 27FEB2026
     return ""
 
@@ -106,6 +111,129 @@ def fetch_option_chain(smart_api, symbol: str, token: str, exchange: str = "NFO"
         return None
 
     return response.get("data")
+
+
+def select_spread_strikes(chain, spot, direction, atr, budget, lot_size, min_oi=None, min_rr=1.5):
+    """Select strikes for a vertical debit spread.
+
+    Bull call spread (direction="bullish"): Buy ATM/ITM call, sell OTM call
+    Bear put spread (direction="bearish"): Buy ATM/ITM put, sell OTM put
+
+    Args:
+        chain: list of dicts from option chain (each has strikePrice, CE, PE)
+        spot: current underlying price
+        direction: "bullish" or "bearish"
+        atr: average true range of the underlying
+        budget: max debit (max risk) in rupees for the spread
+        lot_size: contract lot size
+        min_oi: minimum open interest per leg (default from config.SPREAD_MIN_OI)
+        min_rr: minimum reward:risk ratio (default 1.5)
+
+    Returns:
+        dict with keys: long_strike, short_strike, long_premium, short_premium,
+                        net_debit, max_profit, max_loss, rr_ratio, width,
+                        long_option_type, short_option_type
+        or None if no valid spread found
+    """
+    if min_oi is None:
+        min_oi = config.SPREAD_MIN_OI
+
+    if not chain or direction not in ("bullish", "bearish"):
+        return None
+
+    # Sort chain by strike price
+    sorted_chain = sorted(chain, key=lambda r: r.get("strikePrice", 0))
+
+    if direction == "bullish":
+        opt_key = "CE"
+        # Find long leg candidates: ATM or 1-strike ITM call (strike <= spot, OI filter)
+        itm_strikes = [
+            r for r in sorted_chain
+            if r.get("strikePrice", 0) <= spot
+            and r.get(opt_key, {}).get("openInterest", 0) >= min_oi
+        ]
+        if not itm_strikes:
+            return None
+        # Sort by distance from spot (closest first), take top 2 (ATM + 1 ITM)
+        itm_strikes.sort(key=lambda r: abs(r["strikePrice"] - spot))
+        long_candidates = itm_strikes[:2]
+
+    else:  # bearish
+        opt_key = "PE"
+        # Find long leg candidates: ATM or 1-strike ITM put (strike >= spot, OI filter)
+        itm_strikes = [
+            r for r in sorted_chain
+            if r.get("strikePrice", 0) >= spot
+            and r.get(opt_key, {}).get("openInterest", 0) >= min_oi
+        ]
+        if not itm_strikes:
+            return None
+        # Sort by distance from spot (closest first), take top 2 (ATM + 1 ITM)
+        itm_strikes.sort(key=lambda r: abs(r["strikePrice"] - spot))
+        long_candidates = itm_strikes[:2]
+
+    # Try all valid (long, short) combinations, pick best R:R that fits budget
+    best = None
+
+    for long_row in long_candidates:
+        long_strike = long_row["strikePrice"]
+        long_premium = long_row.get(opt_key, {}).get("lastPrice", 0) or 0
+
+        if direction == "bullish":
+            # Short leg: OTM strikes above long_strike with sufficient OI
+            short_pool = [
+                r for r in sorted_chain
+                if r.get("strikePrice", 0) > long_strike
+                and r.get(opt_key, {}).get("openInterest", 0) >= min_oi
+            ]
+        else:
+            # Short leg: OTM strikes below long_strike with sufficient OI
+            short_pool = [
+                r for r in sorted_chain
+                if r.get("strikePrice", 0) < long_strike
+                and r.get(opt_key, {}).get("openInterest", 0) >= min_oi
+            ]
+
+        # Consider up to 4 short leg candidates
+        for short_row in short_pool[:4]:
+            short_strike = short_row["strikePrice"]
+            short_premium = short_row.get(opt_key, {}).get("lastPrice", 0) or 0
+
+            per_unit_debit = long_premium - short_premium
+            if per_unit_debit <= 0:
+                continue
+
+            net_debit = per_unit_debit * lot_size
+            width = abs(short_strike - long_strike)
+            max_profit = width * lot_size - net_debit
+            max_loss = net_debit
+
+            if max_loss <= 0 or max_profit <= 0:
+                continue
+            if net_debit > budget:
+                continue
+
+            rr_ratio = max_profit / max_loss
+
+            if rr_ratio < min_rr:
+                continue
+
+            if best is None or rr_ratio > best["rr_ratio"]:
+                best = {
+                    "long_strike": long_strike,
+                    "short_strike": short_strike,
+                    "long_premium": long_premium,
+                    "short_premium": short_premium,
+                    "net_debit": net_debit,
+                    "max_profit": max_profit,
+                    "max_loss": max_loss,
+                    "rr_ratio": rr_ratio,
+                    "width": width,
+                    "long_option_type": opt_key,
+                    "short_option_type": opt_key,
+                }
+
+    return best
 
 
 def format_candles_for_prompt(candles: list, symbol: str) -> str:
