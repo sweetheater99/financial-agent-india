@@ -29,6 +29,14 @@ from agent_with_options import fetch_option_chain, get_nearest_expiry
 from indicators import compute_atr
 from regime import classify_regime as classify_regime_v2, vix_to_iv_percentile
 from risk_manager import RiskManager
+from risk_guardrails import (
+    check_drawdown_circuit_breaker,
+    check_daily_loss_limit,
+    check_correlation_guard,
+    check_portfolio_heat,
+    check_event_calendar,
+    run_all_guards,
+)
 from screener import (
     run_screener, fetch_all_signals, score_signals,
     enrich_candidates, apply_indicator_adjustments,
@@ -45,7 +53,7 @@ PORTFOLIO_FILE = PORTFOLIO_DIR / "portfolio.json"
 TOTAL_CAPITAL = 100_000
 TARGET_PCT = 5.0       # +5% profit target
 STOPLOSS_PCT = -3.0    # -3% stop-loss
-MAX_HOLD_DAYS = 7      # force exit after 7 trading days
+MAX_HOLD_DAYS = 15     # force exit after 15 trading days — tuned via param sweep
 TOP_N = 5              # top candidates to trade
 MIN_CAPITAL = 1_000    # minimum capital to open new positions
 
@@ -130,14 +138,14 @@ SYMBOL_SECTOR = {
 }
 
 # --- Trailing Stop-Loss ---
-ATR_TRAILING_MULTIPLIER = 1.0       # trailing SL = peak ± 1.0*ATR (equity)
+ATR_TRAILING_MULTIPLIER = 2.5       # trailing SL = peak ± 2.5*ATR (equity) — tuned via param sweep
 LEGACY_TRAILING_STOP_PCT = 2.0      # fallback for positions without ATR
 OPT_TRAILING_STOP_PCT = 25.0        # -25% from peak premium for options
 
 # --- ATR-Based Exits (equity only) ---
 ATR_PERIOD = 14
-ATR_TARGET_MULTIPLIER = 2.5     # target = entry + 2.5*ATR
-ATR_STOPLOSS_MULTIPLIER = 1.5   # SL = entry - 1.5*ATR
+ATR_TARGET_MULTIPLIER = 2.0     # target = entry + 2.0*ATR — tuned via param sweep
+ATR_STOPLOSS_MULTIPLIER = 2.0   # SL = entry - 2.0*ATR — wider SL reduces premature exits
 
 # --- Option Theta Awareness ---
 OPT_THETA_DTE_THRESHOLD = 5     # DTE cutoff
@@ -1706,8 +1714,26 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
                         config.DRAWDOWN_TOTAL_STOP * 100)
         return 0
 
+    # --- Risk Guardrails: drawdown circuit breaker ---
+    dd_blocked, dd_reason, dd_mult = check_drawdown_circuit_breaker(portfolio)
+    if dd_blocked:
+        logger.warning("GUARDRAIL BLOCK: %s", dd_reason)
+        _telegram_send(f"<b>Risk Guardrail</b>\n{dd_reason}")
+        return 0
+
+    # --- Risk Guardrails: daily loss limit ---
+    dl_blocked, dl_reason = check_daily_loss_limit(portfolio)
+    if dl_blocked:
+        logger.warning("GUARDRAIL BLOCK: %s", dl_reason)
+        _telegram_send(f"<b>Risk Guardrail</b>\n{dl_reason}")
+        return 0
+
     size_mult = rm.get_size_multiplier()
     risk_state = rm.get_risk_state()
+
+    # Apply drawdown allocation multiplier (weekly DD reduction)
+    if dd_mult < 1.0:
+        logger.info("Risk guardrail: drawdown reduction → allocation multiplier %.2f", dd_mult)
 
     # --- V2 Market Regime Detection ---
     nifty_candles = fetch_daily_candles(smart_api, NIFTY_TOKEN, days=50)
@@ -2015,6 +2041,40 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
         if not allowed:
             logger.info("SKIP %s: %s", symbol, rm_reason)
             continue
+
+        # --- Risk Guardrails: per-candidate checks ---
+        # Correlation guard (sector + direction concentration)
+        corr_blocked, corr_reason, corr_mult = check_correlation_guard(
+            portfolio, symbol, direction, SYMBOL_SECTOR)
+        if corr_blocked:
+            logger.info("SKIP %s: [Correlation] %s", symbol, corr_reason)
+            continue
+        if corr_mult < 1.0:
+            allocation = round(allocation * corr_mult, 2)
+            logger.info("  %s: %s", symbol, corr_reason)
+
+        # Apply drawdown allocation multiplier from portfolio-level check
+        if dd_mult < 1.0:
+            allocation = round(allocation * dd_mult, 2)
+
+        # Portfolio heat check
+        entry_est = allocation  # rough estimate before we know exact entry
+        risk_pct = None  # will use default 3%
+        heat_blocked, heat_reason = check_portfolio_heat(portfolio, allocation, risk_pct)
+        if heat_blocked:
+            logger.info("SKIP %s: [Heat] %s", symbol, heat_reason)
+            _telegram_send(f"<b>Risk Guardrail</b>\nSkipped {symbol}: {heat_reason}")
+            continue
+
+        # Event calendar check
+        evt_blocked, evt_reason, evt_mult = check_event_calendar(symbol)
+        if evt_blocked:
+            logger.info("SKIP %s: [Event] %s", symbol, evt_reason)
+            _telegram_send(f"<b>Risk Guardrail</b>\nSkipped {symbol}: {evt_reason}")
+            continue
+        if evt_mult < 1.0:
+            allocation = round(allocation * evt_mult, 2)
+            logger.info("  %s: %s", symbol, evt_reason)
 
         # Resolve equity token + LTP (needed for both paths)
         resolved = resolve_token(smart_api, symbol)

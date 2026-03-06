@@ -365,8 +365,8 @@ CPR_NARROW_PCT = 0.3
 CPR_WIDE_PCT = 0.8
 
 # Trailing SL enhancement
-TRAILING_SL_ACTIVATION_PCT = 2.0
-TRAILING_SL_ATR_MULT = 1.5
+TRAILING_SL_ACTIVATION_PCT = 3.0    # don't trail until 3% profit — tuned via param sweep
+TRAILING_SL_ATR_MULT = 2.5          # tighter trail once activated — tuned via param sweep
 
 # Weekly theta strategy
 WEEKLY_THETA_MIN_VIX = 14.0
@@ -436,6 +436,23 @@ YT_CHANNEL_ALLOWLIST = [
     "Pranjal Kamra", "Nitin Bhatia",
 ]
 YT_CACHE_HOURS = 12
+
+
+# ── Risk Guardrails ─────────────────────────────────────────────────────────
+MONTHLY_DRAWDOWN_BLOCK_PCT = 0.08      # 8% monthly DD → block all trades
+WEEKLY_DRAWDOWN_REDUCE_PCT = 0.04      # 4% weekly DD → reduce 50%
+DAILY_LOSS_LIMIT_PCT = 0.02            # 2% daily loss → block
+MAX_CONSECUTIVE_LOSSES_PAUSE = 3       # pause 1 day after 3 losses
+MAX_CONSECUTIVE_LOSSES_EXTENDED = 5    # pause 2 days after 5 losses
+MAX_SECTOR_POSITIONS = 2               # max positions per sector
+MAX_DIRECTION_POSITIONS = 3            # max same-direction positions
+MAX_PORTFOLIO_HEAT_PCT = 0.06          # 6% of capital at risk max
+EXPIRY_DAY_ALLOCATION_MULT = 0.5       # 50% allocation on expiry days
+BUDGET_BLOCK_DATES = ["2026-02-01", "2027-02-01"]
+RBI_POLICY_DATES = [
+    "2026-02-07", "2026-04-09", "2026-06-06",
+    "2026-08-08", "2026-10-08", "2026-12-05",
+]
 
 
 if __name__ == "__main__":
