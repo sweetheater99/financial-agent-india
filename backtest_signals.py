@@ -397,6 +397,21 @@ class SignalBacktestEngine:
                 e = float(nifty_ema50.loc[idx])
                 nifty_bullish[d] = c > e
 
+        # Pre-compute per-stock 20-day returns for RS ranking
+        rs_returns: dict[str, dict[str, float]] = {}  # symbol -> {date_str: return_20d}
+        if self.params.get("rs_rank_filter", False):
+            for symbol, df in data.items():
+                close = df["Close"]
+                if isinstance(close, pd.DataFrame):
+                    close = close.iloc[:, 0]
+                ret20 = close.pct_change(20)
+                rs_returns[symbol] = {}
+                for idx in df.index:
+                    d = str(idx.date()) if hasattr(idx, "date") else str(idx)
+                    v = ret20.loc[idx]
+                    if not pd.isna(v):
+                        rs_returns[symbol][d] = float(v)
+
         all_trades = []
         for symbol, df in data.items():
             trades = self.run(symbol, df)
@@ -404,6 +419,42 @@ class SignalBacktestEngine:
                 # Filter: only keep trades entered on Nifty-bullish days
                 trades = [t for t in trades if nifty_bullish.get(t["entry_date"], True)]
             all_trades.extend(trades)
+
+        # Rolling stock quality filter: after a symbol accumulates enough trades,
+        # skip further entries if its win rate is below threshold.
+        # This is forward-safe — each trade only sees past trades for that symbol.
+        if self.params.get("stock_wr_filter", False):
+            min_lookback = self.params.get("stock_wr_lookback", 5)
+            min_wr = self.params.get("stock_wr_min", 0.35)
+            all_trades.sort(key=lambda t: t["entry_date"])
+            filtered = []
+            sym_history: dict[str, list[bool]] = {}
+            for t in all_trades:
+                sym = t["symbol"]
+                hist = sym_history.setdefault(sym, [])
+                if len(hist) >= min_lookback:
+                    wr = sum(hist[-min_lookback:]) / min_lookback
+                    if wr < min_wr:
+                        continue  # skip — this stock's signals aren't working
+                filtered.append(t)
+                hist.append(t["pnl_net"] >= 0)
+            all_trades = filtered
+
+        # Relative strength rank filter: on each entry date, rank all symbols by
+        # 20-day return. Only keep trades in the top N strongest stocks that day.
+        if self.params.get("rs_rank_filter", False) and rs_returns:
+            top_n = self.params.get("rs_top_n", 20)
+            all_trades.sort(key=lambda t: t["entry_date"])
+            filtered = []
+            for t in all_trades:
+                d = t["entry_date"]
+                sym = t["symbol"]
+                # Get all symbols' RS on this date
+                day_rs = {s: rs_returns.get(s, {}).get(d, float("-inf")) for s in data}
+                ranked = sorted(day_rs, key=day_rs.get, reverse=True)[:top_n]
+                if sym in ranked:
+                    filtered.append(t)
+            all_trades = filtered
 
         all_trades.sort(key=lambda t: t["entry_date"])
         self.trades = all_trades
@@ -600,11 +651,16 @@ def main():
     parser.add_argument("--min-score", type=float, default=DEFAULT_MIN_SCORE,
                         help=f"Minimum signal score to enter (default: {DEFAULT_MIN_SCORE})")
     parser.add_argument("--atr-target", type=float, default=2.0, help="ATR target multiplier")
-    parser.add_argument("--atr-sl", type=float, default=2.0, help="ATR stoploss multiplier")
+    parser.add_argument("--atr-sl", type=float, default=2.5, help="ATR stoploss multiplier")
     parser.add_argument("--max-hold", type=int, default=15, help="Max holding days")
     parser.add_argument("--trail", type=float, default=2.5, help="Trailing stop ATR multiplier")
     parser.add_argument("--trail-act", type=float, default=3.0, help="Trailing activation %% profit")
     parser.add_argument("--no-regime-filter", action="store_true", help="Disable Nifty EMA50 regime filter")
+    parser.add_argument("--stock-filter", action="store_true", help="Enable rolling per-stock win rate filter")
+    parser.add_argument("--stock-wr-min", type=float, default=0.35, help="Min win rate to keep trading a stock")
+    parser.add_argument("--stock-lookback", type=int, default=5, help="Lookback trades for stock filter")
+    parser.add_argument("--rs-filter", action="store_true", help="Enable relative strength rank filter")
+    parser.add_argument("--rs-top-n", type=int, default=20, help="Only trade top N stocks by 20d return")
     parser.add_argument("--capital", type=float, default=10000, help="Capital per trade")
     parser.add_argument("--output", type=str, help="Save results to JSON file")
     args = parser.parse_args()
@@ -623,6 +679,11 @@ def main():
         "trailing_mult": args.trail,
         "trailing_activation_pct": args.trail_act,
         "capital_per_trade": args.capital,
+        "stock_wr_filter": args.stock_filter,
+        "stock_wr_min": args.stock_wr_min,
+        "stock_wr_lookback": args.stock_lookback,
+        "rs_rank_filter": args.rs_filter,
+        "rs_top_n": args.rs_top_n,
     }
 
     print(f"Fetching data for {len(symbols)} symbol(s), period={args.period}...")

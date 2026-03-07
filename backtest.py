@@ -32,7 +32,7 @@ EQ_SLIPPAGE_PCT = 0.001
 DEFAULT_PARAMS = {
     "atr_period": 14,
     "atr_target_mult": 2.0,
-    "atr_sl_mult": 2.0,
+    "atr_sl_mult": 2.5,
     "trailing_mult": 2.5,
     "trailing_activation_pct": 3.0,
     "trailing_tight_mult": 2.5,
