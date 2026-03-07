@@ -31,12 +31,12 @@ EQ_SLIPPAGE_PCT = 0.001
 # Default strategy params
 DEFAULT_PARAMS = {
     "atr_period": 14,
-    "atr_target_mult": 2.5,
-    "atr_sl_mult": 1.5,
-    "trailing_mult": 1.0,
-    "trailing_activation_pct": 2.0,
-    "trailing_tight_mult": 1.5,
-    "max_hold_days": 7,
+    "atr_target_mult": 2.0,
+    "atr_sl_mult": 2.0,
+    "trailing_mult": 2.5,
+    "trailing_activation_pct": 3.0,
+    "trailing_tight_mult": 2.5,
+    "max_hold_days": 15,
     "capital_per_trade": 10000,
     "time_sl_enabled": True,
     "time_sl_half_mult": 0.75,
@@ -203,17 +203,17 @@ class BacktestEngine:
                     exit_idx = day_idx
                     break
 
-                # Trailing stop
+                # Trailing stop — only activates after threshold
                 progress = j / p["max_hold_days"]
-                unrealized_pct = (close - entry_price) / entry_price * 100
+                unrealized_pct = (peak - entry_price) / entry_price * 100
 
                 if unrealized_pct >= p["trailing_activation_pct"]:
                     trail_sl = peak - p["trailing_tight_mult"] * atr
-                    trail_sl = max(trail_sl, entry_price)  # floor at entry
+                    trail_sl = max(trail_sl, entry_price)  # never below entry
+                    effective_sl = max(trail_sl, stoploss)
                 else:
-                    trail_sl = peak - p["trailing_mult"] * atr
-
-                effective_sl = max(trail_sl, stoploss)
+                    # Before activation: only fixed SL, no trailing
+                    effective_sl = stoploss
 
                 # Time-based SL tightening
                 if p["time_sl_enabled"]:
@@ -226,7 +226,8 @@ class BacktestEngine:
 
                 if low <= effective_sl:
                     exit_price = effective_sl * (1 - EQ_SLIPPAGE_PCT)
-                    exit_reason = "trailing_stop" if trail_sl > stoploss else "stoploss"
+                    is_trailing = unrealized_pct >= p["trailing_activation_pct"]
+                    exit_reason = "trailing_stop" if is_trailing else "stoploss"
                     exit_idx = day_idx
                     break
 

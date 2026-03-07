@@ -307,17 +307,17 @@ class SignalBacktestEngine:
                     exit_idx = day_idx
                     break
 
-                # Trailing stop
+                # Trailing stop — only activates after threshold
                 progress = j / p["max_hold_days"]
-                unrealized_pct = (close - entry_price) / entry_price * 100
+                unrealized_pct = (peak - entry_price) / entry_price * 100
 
                 if unrealized_pct >= p["trailing_activation_pct"]:
                     trail_sl = peak - p["trailing_tight_mult"] * atr
-                    trail_sl = max(trail_sl, entry_price)
+                    trail_sl = max(trail_sl, entry_price)  # never below entry
+                    effective_sl = max(trail_sl, stoploss)
                 else:
-                    trail_sl = peak - p["trailing_mult"] * atr
-
-                effective_sl = max(trail_sl, stoploss)
+                    # Before activation: only fixed SL, no trailing
+                    effective_sl = stoploss
 
                 # Time-based SL tightening
                 if p["time_sl_enabled"]:
@@ -330,7 +330,8 @@ class SignalBacktestEngine:
 
                 if low <= effective_sl:
                     exit_price = effective_sl * (1 - EQ_SLIPPAGE_PCT)
-                    exit_reason = "trailing_stop" if trail_sl > stoploss else "stoploss"
+                    is_trailing = unrealized_pct >= p["trailing_activation_pct"]
+                    exit_reason = "trailing_stop" if is_trailing else "stoploss"
                     exit_idx = day_idx
                     break
 
@@ -377,11 +378,31 @@ class SignalBacktestEngine:
 
         return trades
 
-    def run_multi(self, data: dict[str, pd.DataFrame]) -> list[dict]:
-        """Run backtest across multiple symbols."""
+    def run_multi(self, data: dict[str, pd.DataFrame], nifty_df: pd.DataFrame | None = None) -> list[dict]:
+        """Run backtest across multiple symbols.
+
+        If nifty_df is provided, only allow long entries when Nifty close > 50-day EMA
+        (regime filter proxy — don't go long in a bear market).
+        """
+        # Build Nifty trend filter: date -> bool (is_bullish)
+        nifty_bullish = {}
+        if nifty_df is not None:
+            nifty_close = nifty_df["Close"]
+            if isinstance(nifty_close, pd.DataFrame):
+                nifty_close = nifty_close.iloc[:, 0]
+            nifty_ema50 = nifty_close.ewm(span=50, adjust=False).mean()
+            for idx in nifty_df.index:
+                d = str(idx.date()) if hasattr(idx, 'date') else str(idx)
+                c = float(nifty_close.loc[idx])
+                e = float(nifty_ema50.loc[idx])
+                nifty_bullish[d] = c > e
+
         all_trades = []
         for symbol, df in data.items():
             trades = self.run(symbol, df)
+            if nifty_bullish:
+                # Filter: only keep trades entered on Nifty-bullish days
+                trades = [t for t in trades if nifty_bullish.get(t["entry_date"], True)]
             all_trades.extend(trades)
 
         all_trades.sort(key=lambda t: t["entry_date"])
@@ -578,11 +599,12 @@ def main():
     parser.add_argument("--period", type=str, default="1y", help="yfinance period (1mo, 3mo, 6mo, 1y, 2y)")
     parser.add_argument("--min-score", type=float, default=DEFAULT_MIN_SCORE,
                         help=f"Minimum signal score to enter (default: {DEFAULT_MIN_SCORE})")
-    parser.add_argument("--atr-target", type=float, default=2.5, help="ATR target multiplier")
-    parser.add_argument("--atr-sl", type=float, default=1.5, help="ATR stoploss multiplier")
-    parser.add_argument("--max-hold", type=int, default=7, help="Max holding days")
-    parser.add_argument("--trail", type=float, default=1.0, help="Trailing stop ATR multiplier")
-    parser.add_argument("--trail-act", type=float, default=2.0, help="Trailing activation %% profit")
+    parser.add_argument("--atr-target", type=float, default=2.0, help="ATR target multiplier")
+    parser.add_argument("--atr-sl", type=float, default=2.0, help="ATR stoploss multiplier")
+    parser.add_argument("--max-hold", type=int, default=15, help="Max holding days")
+    parser.add_argument("--trail", type=float, default=2.5, help="Trailing stop ATR multiplier")
+    parser.add_argument("--trail-act", type=float, default=3.0, help="Trailing activation %% profit")
+    parser.add_argument("--no-regime-filter", action="store_true", help="Disable Nifty EMA50 regime filter")
     parser.add_argument("--capital", type=float, default=10000, help="Capital per trade")
     parser.add_argument("--output", type=str, help="Save results to JSON file")
     args = parser.parse_args()
@@ -611,8 +633,23 @@ def main():
         print("No data available")
         sys.exit(1)
 
+    # Fetch Nifty data for regime filter
+    nifty_df = None
+    if not args.no_regime_filter:
+        import yfinance as yf
+        print("Fetching Nifty 50 data for regime filter...")
+        try:
+            nifty_df = yf.download("^NSEI", period=args.period, progress=False)
+            if nifty_df.empty:
+                print("Warning: Could not fetch Nifty data, running without regime filter")
+                nifty_df = None
+            else:
+                print(f"Nifty data: {len(nifty_df)} rows")
+        except Exception as e:
+            print(f"Warning: Nifty fetch failed ({e}), running without regime filter")
+
     engine = SignalBacktestEngine(params, min_score=args.min_score)
-    engine.run_multi(data)
+    engine.run_multi(data, nifty_df=nifty_df)
     stats = engine.compute_stats()
     engine.print_report(stats)
 
