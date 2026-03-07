@@ -23,6 +23,16 @@ echo "--- $(TZ=Asia/Kolkata date) ---" >> "$LOG"
 HOUR=$(TZ=Asia/Kolkata date +%H)
 MIN=$(TZ=Asia/Kolkata date +%M)
 
+# Override mode from argument (e.g., cron calls with "briefing")
+if [ -n "$1" ]; then
+    echo "[$1] Running with explicit mode" >> "$LOG"
+    python paper_trade.py "$1" >> "$LOG" 2>&1
+    EXIT_CODE=$?
+    # Skip normal flow for explicit mode
+    echo "" >> "$LOG"
+    exit $EXIT_CODE
+fi
+
 # Determine mode
 MODE=""
 OPEN_EXIT=0
