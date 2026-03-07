@@ -1,6 +1,7 @@
 """Performance attribution -- which strategies, signals, and regimes make money."""
 
 import math
+import statistics
 from datetime import datetime
 
 # Import SYMBOL_SECTOR for sector lookups
@@ -244,6 +245,34 @@ def compute_attribution(journal_entries: list[dict], closed_trades: list[dict]) 
                 f"vs winner {time_analysis['avg_winner_hold_days']} days"
             )
 
+    # --- Profit Factor ---
+    total_wins_pnl = sum(t.get("pnl", 0) for t in closed_trades if t.get("pnl", 0) > 0)
+    total_losses_pnl = abs(sum(t.get("pnl", 0) for t in closed_trades if t.get("pnl", 0) < 0))
+    profit_factor = total_wins_pnl / total_losses_pnl if total_losses_pnl > 0 else float('inf')
+
+    # --- Simple Sharpe Ratio (annualized) ---
+    # Group P&L by exit date, compute daily returns as % of capital
+    capital = 100_000  # match paper_trade.py TOTAL_CAPITAL
+    daily_pnls: dict[str, float] = {}
+    for t in closed_trades:
+        d = t.get("exit_date", "")
+        if d:
+            daily_pnls[d] = daily_pnls.get(d, 0) + t.get("pnl", 0)
+    if len(daily_pnls) > 1:
+        daily_returns = [pnl / capital for pnl in daily_pnls.values()]
+        mean_ret = statistics.mean(daily_returns)
+        std_ret = statistics.stdev(daily_returns)
+        sharpe = (mean_ret / std_ret) * (252 ** 0.5) if std_ret > 0 else 0
+    else:
+        sharpe = 0
+
+    # --- Avg Winner / Avg Loser ---
+    winner_pnls = [t.get("pnl", 0) for t in closed_trades if t.get("pnl", 0) > 0]
+    loser_pnls = [t.get("pnl", 0) for t in closed_trades if t.get("pnl", 0) < 0]
+    avg_winner = round(sum(winner_pnls) / len(winner_pnls), 2) if winner_pnls else 0
+    avg_loser = round(abs(sum(loser_pnls) / len(loser_pnls)), 2) if loser_pnls else 0
+    win_loss_ratio = round(avg_winner / avg_loser, 2) if avg_loser > 0 else float('inf')
+
     return {
         "per_strategy": per_strategy,
         "per_signal": per_signal,
@@ -252,6 +281,11 @@ def compute_attribution(journal_entries: list[dict], closed_trades: list[dict]) 
         "per_sector": per_sector,
         "time_analysis": time_analysis,
         "recommendations": recommendations,
+        "profit_factor": round(profit_factor, 2),
+        "sharpe_ratio": round(sharpe, 2),
+        "avg_winner": avg_winner,
+        "avg_loser": avg_loser,
+        "win_loss_ratio": win_loss_ratio,
     }
 
 
@@ -327,6 +361,30 @@ def generate_attribution_report(attribution: dict) -> str:
             f"  Best day: {ta.get('best_day_of_week', 'N/A')}  |  "
             f"Worst day: {ta.get('worst_day_of_week', 'N/A')}"
         )
+
+    # Risk Metrics
+    pf = attribution.get("profit_factor", 0)
+    sr = attribution.get("sharpe_ratio", 0)
+    avg_w = attribution.get("avg_winner", 0)
+    avg_l = attribution.get("avg_loser", 0)
+    wl_ratio = attribution.get("win_loss_ratio", 0)
+    if pf or sr:
+        pf_grade = ">1.5 = pro grade" if pf >= 1.5 else "<1.5 = needs work"
+        if sr >= 2.0:
+            sr_grade = "excellent"
+        elif sr >= 1.0:
+            sr_grade = "good"
+        else:
+            sr_grade = "below avg"
+        lines.append("\n<b>Risk Metrics</b>")
+        pf_display = f"{pf:.2f}" if pf != float('inf') else "inf"
+        lines.append(f"  Profit Factor: {pf_display} ({pf_grade})")
+        lines.append(f"  Sharpe Ratio: {sr:.2f} (annualized, {sr_grade})")
+        lines.append(
+            f"  Avg Winner: Rs.{avg_w:,.0f} | Avg Loser: Rs.{avg_l:,.0f}"
+        )
+        wl_display = f"{wl_ratio:.2f}x" if wl_ratio != float('inf') else "inf"
+        lines.append(f"  Win/Loss Ratio: {wl_display}")
 
     # Recommendations
     recs = attribution.get("recommendations", [])

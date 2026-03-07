@@ -2609,6 +2609,65 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
                             underlying_ltp, condor_pnl, pnl_pct)
             continue
 
+        # --- IV Crush monitoring ---
+        is_iv_crush = pos.get("instrument") == "IV_CRUSH"
+        if is_iv_crush:
+            underlying_ltp = get_ltp(smart_api, "Nifty 50", NIFTY_TOKEN)
+            time.sleep(config.API_DELAY)
+            if underlying_ltp is None:
+                logger.warning("IV crush: could not fetch LTP, skipping")
+                continue
+
+            # Estimate premiums for all 4 legs (same as condor)
+            cs_prem = estimate_premium_from_underlying(
+                {"long_leg": pos["call_short"], "underlying_at_entry": pos.get("underlying_at_entry", 0),
+                 "expiry": pos["expiry"]},
+                "long", underlying_ltp, today)
+            cl_prem = estimate_premium_from_underlying(
+                {"long_leg": pos["call_long"], "underlying_at_entry": pos.get("underlying_at_entry", 0),
+                 "expiry": pos["expiry"]},
+                "long", underlying_ltp, today)
+            ps_prem = estimate_premium_from_underlying(
+                {"long_leg": pos["put_short"], "underlying_at_entry": pos.get("underlying_at_entry", 0),
+                 "expiry": pos["expiry"]},
+                "long", underlying_ltp, today)
+            pl_prem = estimate_premium_from_underlying(
+                {"long_leg": pos["put_long"], "underlying_at_entry": pos.get("underlying_at_entry", 0),
+                 "expiry": pos["expiry"]},
+                "long", underlying_ltp, today)
+
+            # Calculate P&L
+            cost_to_close = (cs_prem - cl_prem + ps_prem - pl_prem) * pos["quantity"]
+            crush_pnl = pos["net_credit"] - cost_to_close
+            pnl_pct = (crush_pnl / pos["allocated"]) * 100 if pos["allocated"] > 0 else 0
+
+            # Set _current_value for check_iv_crush_exit
+            pos["_current_value"] = cost_to_close
+
+            try:
+                from iv_crush import check_iv_crush_exit
+                should_exit, reason = check_iv_crush_exit(
+                    pos, smart_api=smart_api, _today=today,
+                    _underlying_ltp=underlying_ltp,
+                )
+            except Exception as e:
+                logger.debug("IV crush exit check failed: %s", e)
+                should_exit, reason = False, "hold"
+
+            if should_exit:
+                logger.info("EXIT IV crush %s: P&L ₹%.0f (%.1f%%), reason=%s",
+                            pos.get("event_type", ""), crush_pnl, pnl_pct, reason)
+                close_position(portfolio, pos, underlying_ltp, reason, smart_api=smart_api)
+                exits += 1
+            else:
+                unrealized_pnl += crush_pnl
+                logger.info("IV crush %s: Nifty ₹%.0f  P&L: ₹%.0f (%.1f%%)  [HOLD]",
+                            pos.get("event_type", ""), underlying_ltp, crush_pnl, pnl_pct)
+
+            # Clean up temporary field
+            pos.pop("_current_value", None)
+            continue
+
         # --- Momentum option monitoring ---
         is_momentum = pos.get("instrument") == "MOMENTUM"
         if is_momentum:
@@ -2934,7 +2993,7 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
     # V3: Friday afternoon risk reduction — tighten stops for weekend
     if _is_friday_afternoon():
         for pos in [p for p in portfolio["positions"] if p["status"] == "open"]:
-            is_fno = pos.get("instrument") in ("OPT", "SPREAD", "CONDOR", "MOMENTUM")
+            is_fno = pos.get("instrument") in ("OPT", "SPREAD", "CONDOR", "MOMENTUM", "IV_CRUSH")
             if is_fno:
                 # Close marginal F&O positions (less than 1% unrealized gain)
                 # We'd need LTP here but it was already fetched above — log warning for now
@@ -3378,6 +3437,61 @@ def _try_index_strategies(smart_api, portfolio: dict) -> int:
                     except Exception as e:
                         logger.debug("Momentum attempt on %s failed: %s", idx_name, e)
 
+    # --- V7: IV Crush event strategy (Nifty only) ---
+    has_iv_crush = any(
+        p.get("instrument") == "IV_CRUSH" and p.get("status") == "open"
+        for p in portfolio["positions"]
+    )
+    if not has_iv_crush:
+        try:
+            from iv_crush import should_enter_iv_crush, open_iv_crush_condor
+
+            crush_setup = should_enter_iv_crush(
+                smart_api,
+                _vix=get_ltp(smart_api, "India VIX", VIX_TOKEN),
+                _regime=regime_result.get("regime", "UNKNOWN") if 'regime_result' in dir() else "UNKNOWN",
+                _portfolio=portfolio,
+            )
+
+            if crush_setup:
+                from agent_with_options import select_iron_condor_strikes
+
+                chain = fetch_option_chain(smart_api, "NIFTY")
+                time.sleep(config.API_DELAY)
+
+                if chain:
+                    nifty_ltp = get_ltp(smart_api, "NIFTY", NIFTY_TOKEN)
+                    time.sleep(config.API_DELAY)
+
+                    expiry = get_nearest_expiry(
+                        chain,
+                        min_dte=max(crush_setup.get("days_until_event", 2) + 3, 7),
+                    )
+
+                    max_loss_budget = TOTAL_CAPITAL * config.CONDOR_MAX_RISK_PCT * 0.5
+
+                    condor_data = select_iron_condor_strikes(
+                        chain, spot=nifty_ltp or 0, lot_size=75,
+                        max_loss_budget=max_loss_budget,
+                        min_credit_per_lot=40,
+                    )
+
+                    if condor_data:
+                        condor_data["spot"] = nifty_ltp
+                        condor_data["lot_size"] = 75
+                        condor_data["expiry"] = expiry or ""
+
+                        pos = open_iv_crush_condor(portfolio, crush_setup, condor_data)
+                        if pos:
+                            opened += 1
+                            logger.info(
+                                "OPENED IV crush condor for %s (%s): credit=₹%.0f",
+                                crush_setup["event"], crush_setup["event_date"],
+                                pos["net_credit"],
+                            )
+        except Exception as e:
+            logger.debug("IV crush check failed: %s", e)
+
     return opened
 
 
@@ -3655,6 +3769,33 @@ def run_paper_trade(smart_api, mode: str) -> None:
         realized_pnl = portfolio['stats']['total_pnl']
         logger.info(f"Open: {open_count}  |  Unrealized: ₹{unrealized_pnl:+,.0f}  |  Realized: ₹{realized_pnl:+,.0f}  |  Total: ₹{unrealized_pnl + realized_pnl:+,.0f}")
 
+        # Record expected move data at EOD (after 3:15 PM IST)
+        now_ist = datetime.now(IST)
+        if now_ist.hour >= 15 and now_ist.minute >= 15:
+            try:
+                from expected_move import record_daily_move
+                nifty_ltp = get_ltp(smart_api, "NIFTY", NIFTY_TOKEN)
+                vix_ltp = get_ltp(smart_api, "India VIX", VIX_TOKEN)
+                if nifty_ltp and vix_ltp:
+                    # Fetch today's Nifty open from candle data
+                    today_str = now_ist.strftime("%Y-%m-%d")
+                    try:
+                        candle_resp = smart_api.getCandleData({
+                            "exchange": "NSE",
+                            "symboltoken": NIFTY_TOKEN,
+                            "interval": "ONE_DAY",
+                            "fromdate": f"{today_str} 09:15",
+                            "todate": f"{today_str} 15:30",
+                        })
+                        if candle_resp and candle_resp.get("data"):
+                            candle = candle_resp["data"][0]
+                            nifty_open = float(candle[1])  # [timestamp, open, high, low, close]
+                            record_daily_move(nifty_open, nifty_ltp, vix_ltp, today_str)
+                    except Exception as e:
+                        logger.debug("Expected move EOD recording failed: %s", e)
+            except Exception as e:
+                logger.debug("Expected move import/recording failed: %s", e)
+
     elif mode == "status":
         print_portfolio_status(portfolio, smart_api)
 
@@ -3728,6 +3869,20 @@ def run_paper_trade(smart_api, mode: str) -> None:
         statement = generate_tax_pnl_statement(portfolio["closed_trades"])
         logger.info(statement)
 
+    elif mode == "briefing":
+        from premarket_briefing import generate_premarket_briefing
+        msg = generate_premarket_briefing(smart_api)
+        _telegram_send(msg)
+        logger.info("Pre-market briefing sent.")
+
+    elif mode == "expected-move":
+        logger.info("\n=== PAPER TRADE: Expected Move Accuracy ===\n")
+        from expected_move import generate_move_report
+        report = generate_move_report()
+        import re
+        plain = re.sub(r"<[^>]+>", "", report)
+        print(plain)
+
     else:
         logger.error("Unknown mode: %s", mode)
         logger.info("Usage: python paper_trade.py [open|monitor|status|close-all|weekly-report|greeks|attribution|tax-report]")
@@ -3742,7 +3897,8 @@ def main():
     parser = argparse.ArgumentParser(description="Paper trading engine for F&O screener signals")
     parser.add_argument("mode", choices=["open", "monitor", "status", "close-all",
                                           "weekly-report", "reset", "journal", "greeks",
-                                          "attribution", "tax-report"],
+                                          "attribution", "tax-report", "briefing",
+                                          "expected-move"],
                         help="open: run screener + open positions, "
                              "monitor: check exits, "
                              "status: print dashboard, "
@@ -3752,7 +3908,9 @@ def main():
                              "journal: print trade journal report, "
                              "greeks: show Greeks for option positions, "
                              "attribution: performance attribution analysis, "
-                             "tax-report: tax-ready P&L statement")
+                             "tax-report: tax-ready P&L statement, "
+                             "briefing: send pre-market briefing via Telegram, "
+                             "expected-move: IV expected move accuracy report")
     args = parser.parse_args()
 
     logger.info("Connecting to AngelOne SmartAPI...")
