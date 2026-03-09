@@ -28,10 +28,45 @@ from backtest import (
     NIFTY50_SYMBOLS,
     DEFAULT_PARAMS,
     EQ_SLIPPAGE_PCT,
+    FUT_SLIPPAGE_PCT,
+    FUT_MARGIN_PCT,
     calc_round_trip_costs,
+    calc_fut_round_trip_costs,
     compute_atr,
     fetch_data,
 )
+from indicators_v4 import compute_mfi, compute_obv_divergence, compute_vwap_deviation, compute_adx
+
+# ---------------------------------------------------------------------------
+# Nifty 50 sector mapping (for sector momentum filter)
+# ---------------------------------------------------------------------------
+NIFTY50_SECTORS = {
+    "HDFCBANK": "Banking", "ICICIBANK": "Banking", "SBIN": "Banking",
+    "KOTAKBANK": "Banking", "AXISBANK": "Banking", "INDUSINDBK": "Banking",
+    "TCS": "IT", "INFY": "IT", "HCLTECH": "IT", "WIPRO": "IT", "TECHM": "IT",
+    "SUNPHARMA": "Pharma", "DRREDDY": "Pharma", "CIPLA": "Pharma", "APOLLOHOSP": "Pharma",
+    "MARUTI": "Auto", "M&M": "Auto", "BAJAJ-AUTO": "Auto",
+    "HEROMOTOCO": "Auto", "EICHERMOT": "Auto", "TRENT": "Auto",
+    "TATASTEEL": "Metals", "HINDALCO": "Metals", "JSWSTEEL": "Metals",
+    "RELIANCE": "Energy", "ONGC": "Energy", "NTPC": "Energy",
+    "POWERGRID": "Energy", "BPCL": "Energy", "COALINDIA": "Energy",
+    "HINDUNILVR": "FMCG", "ITC": "FMCG", "NESTLEIND": "FMCG",
+    "BRITANNIA": "FMCG", "TITAN": "FMCG", "ASIANPAINT": "FMCG",
+    "BAJFINANCE": "FinServices", "BAJAJFINSV": "FinServices",
+    "HDFCLIFE": "FinServices", "SBILIFE": "FinServices", "SHRIRAMFIN": "FinServices",
+    "LT": "Infra", "ULTRACEMCO": "Infra", "GRASIM": "Infra",
+    "ADANIENT": "Infra", "ADANIPORTS": "Infra",
+    "BHARTIARTL": "Telecom",
+}
+
+# VIX-based position size multipliers (Indian F&O trader standard)
+VIX_SIZE_MAP = [
+    (12, 1.0),   # Low VIX: full size
+    (18, 1.0),   # Normal: full size
+    (22, 0.5),   # Elevated: half size
+    (28, 0.25),  # High: quarter size
+    (99, 0.0),   # Extreme: no trading
+]
 
 # ---------------------------------------------------------------------------
 # Signal computation
@@ -44,6 +79,10 @@ SIGNAL_WEIGHTS = {
     "rsi": 1.0,
     "atr_breakout": 1.5,
     "trend_confirm": 2.0,
+    "mfi": 1.0,
+    "obv_divergence": 1.0,
+    "vwap_deviation": 0.5,
+    "adx_trend": 1.5,
 }
 
 DEFAULT_MIN_SCORE = 3.5
@@ -97,6 +136,19 @@ def compute_signals(df: pd.DataFrame, atr_period: int = 14) -> pd.DataFrame:
     price_down_3d = close < close.shift(3)
     vol_increasing = (volume > volume.shift(1)) & (volume.shift(1) > volume.shift(2))
 
+    # --- V4 indicators (need lowercase columns) ---
+    df_lc = pd.DataFrame({
+        "open": _col("Open"), "high": high, "low": low,
+        "close": close, "volume": volume,
+    }, index=df.index)
+    mfi = compute_mfi(df_lc, period=14)
+    obv_div = compute_obv_divergence(df_lc, lookback=10)
+    vwap_dev = compute_vwap_deviation(df_lc)
+    adx_result = compute_adx(df_lc, period=14)
+    adx_val = adx_result["adx"]
+    di_plus = adx_result["di_plus"]
+    di_minus = adx_result["di_minus"]
+
     # --- Per-bar signal evaluation ---
     n = len(df)
     directions = [None] * n
@@ -108,6 +160,10 @@ def compute_signals(df: pd.DataFrame, atr_period: int = 14) -> pd.DataFrame:
     sig_rsi = [False] * n
     sig_atr_breakout = [False] * n
     sig_trend_confirm = [False] * n
+    sig_mfi = [False] * n
+    sig_obv_divergence = [False] * n
+    sig_vwap_deviation = [False] * n
+    sig_adx_trend = [False] * n
 
     for i in range(n):
         # Need at least 20 bars of history for all indicators
@@ -183,6 +239,57 @@ def compute_signals(df: pd.DataFrame, atr_period: int = 14) -> pd.DataFrame:
                 score += SIGNAL_WEIGHTS["trend_confirm"]
                 sig_trend_confirm[i] = True
 
+        # 6. MFI: oversold buying (bullish) or overbought selling (bearish)
+        if not pd.isna(mfi.iloc[i]):
+            m = float(mfi.iloc[i])
+            if direction == "bullish" and m < 30:
+                fired.append("mfi")
+                score += SIGNAL_WEIGHTS["mfi"]
+                sig_mfi[i] = True
+            elif direction == "bearish" and m > 70:
+                fired.append("mfi")
+                score += SIGNAL_WEIGHTS["mfi"]
+                sig_mfi[i] = True
+
+        # 7. OBV divergence: confirms direction
+        if i < len(obv_div) and obv_div.iloc[i] != "none":
+            od = obv_div.iloc[i]
+            if direction == "bullish" and od == "bullish_div":
+                fired.append("obv_divergence")
+                score += SIGNAL_WEIGHTS["obv_divergence"]
+                sig_obv_divergence[i] = True
+            elif direction == "bearish" and od == "bearish_div":
+                fired.append("obv_divergence")
+                score += SIGNAL_WEIGHTS["obv_divergence"]
+                sig_obv_divergence[i] = True
+
+        # 8. VWAP deviation: oversold bounce / extended warning
+        if not pd.isna(vwap_dev.iloc[i]):
+            vd = float(vwap_dev.iloc[i])
+            if direction == "bullish" and vd < -1.0:
+                fired.append("vwap_deviation")
+                score += SIGNAL_WEIGHTS["vwap_deviation"]
+                sig_vwap_deviation[i] = True
+            elif direction == "bearish" and vd > 1.0:
+                fired.append("vwap_deviation")
+                score += SIGNAL_WEIGHTS["vwap_deviation"]
+                sig_vwap_deviation[i] = True
+
+        # 9. ADX trend strength: strong trend confirms direction
+        if not pd.isna(adx_val.iloc[i]):
+            ax = float(adx_val.iloc[i])
+            dp = float(di_plus.iloc[i]) if not pd.isna(di_plus.iloc[i]) else 0
+            dm = float(di_minus.iloc[i]) if not pd.isna(di_minus.iloc[i]) else 0
+            if ax > 25:
+                if (direction == "bullish" and dp > dm) or (direction == "bearish" and dm > dp):
+                    fired.append("adx_trend")
+                    score += SIGNAL_WEIGHTS["adx_trend"]
+                    sig_adx_trend[i] = True
+
+        # ADX dampening: choppy market reduces all scores
+        if not pd.isna(adx_val.iloc[i]) and float(adx_val.iloc[i]) < 20:
+            score *= 0.7
+
         directions[i] = direction
         scores[i] = score
         signals_lists[i] = fired
@@ -195,6 +302,10 @@ def compute_signals(df: pd.DataFrame, atr_period: int = 14) -> pd.DataFrame:
         "sig_rsi": sig_rsi,
         "sig_atr_breakout": sig_atr_breakout,
         "sig_trend_confirm": sig_trend_confirm,
+        "sig_mfi": sig_mfi,
+        "sig_obv_divergence": sig_obv_divergence,
+        "sig_vwap_deviation": sig_vwap_deviation,
+        "sig_adx_trend": sig_adx_trend,
     }, index=df.index)
     result["signals_fired"] = signals_lists
     return result
@@ -219,6 +330,10 @@ class SignalBacktestEngine:
             "rsi": 0,
             "atr_breakout": 0,
             "trend_confirm": 0,
+            "mfi": 0,
+            "obv_divergence": 0,
+            "vwap_deviation": 0,
+            "adx_trend": 0,
         }
 
     def run(self, symbol: str, df: pd.DataFrame) -> list[dict]:
@@ -253,24 +368,47 @@ class SignalBacktestEngine:
 
             entry_idx = i
             entry_row = df.iloc[entry_idx]
-            entry_price = float(entry_row["Close"]) * (1 + EQ_SLIPPAGE_PCT)
+            is_futures = p.get("futures_mode", False)
+            slippage = FUT_SLIPPAGE_PCT if is_futures else EQ_SLIPPAGE_PCT
+
+            # Gap filter: skip if today's open gapped >2% from yesterday's close
+            if p.get("gap_filter", False) and entry_idx > 0:
+                prev_close = float(df.iloc[entry_idx - 1]["Close"])
+                today_open = float(entry_row["Open"])
+                if prev_close > 0:
+                    gap_pct = abs(today_open - prev_close) / prev_close * 100
+                    if gap_pct > 2.0:
+                        i += 1
+                        continue
+
+            entry_price = float(entry_row["Close"]) * (1 + slippage)
             atr = float(atr_series.iloc[entry_idx])
 
             if atr <= 0 or entry_price <= 0:
                 i += 1
                 continue
 
-            # For bearish signals we would short — but since we're equity-only,
-            # skip bearish entries (same as the real system which picks direction).
-            # If you want to include bearish as short, flip target/SL.
-            if direction == "bearish":
-                # Skip bearish for equity-long-only backtest
+            # Futures can short; equity is long-only
+            if direction == "bearish" and not is_futures:
                 i += 1
                 continue
 
-            target = entry_price + p["atr_target_mult"] * atr
-            stoploss = entry_price - p["atr_sl_mult"] * atr
-            quantity = max(1, int(p["capital_per_trade"] / entry_price))
+            is_short = direction == "bearish" and is_futures
+
+            if is_short:
+                entry_price = float(entry_row["Close"]) * (1 - slippage)
+                target = entry_price - p["atr_target_mult"] * atr
+                stoploss = entry_price + p["atr_sl_mult"] * atr
+            else:
+                target = entry_price + p["atr_target_mult"] * atr
+                stoploss = entry_price - p["atr_sl_mult"] * atr
+
+            if is_futures:
+                # Margin-based sizing: capital / margin_required_per_share
+                margin_per_share = entry_price * FUT_MARGIN_PCT
+                quantity = max(1, int(p["capital_per_trade"] / margin_per_share))
+            else:
+                quantity = max(1, int(p["capital_per_trade"] / entry_price))
 
             peak = entry_price
             exit_price = None
@@ -280,7 +418,7 @@ class SignalBacktestEngine:
             for j in range(1, p["max_hold_days"] + 2):
                 day_idx = entry_idx + j
                 if day_idx >= len(df):
-                    exit_price = float(df.iloc[-1]["Close"]) * (1 - EQ_SLIPPAGE_PCT)
+                    exit_price = float(df.iloc[-1]["Close"]) * (1 - slippage)
                     exit_reason = "data_end"
                     exit_idx = len(df) - 1
                     break
@@ -290,54 +428,96 @@ class SignalBacktestEngine:
                 low = float(day["Low"])
                 close = float(day["Close"])
 
-                if high > peak:
-                    peak = high
+                if is_short:
+                    if low < peak:
+                        peak = low  # track lowest for shorts
 
-                # Target hit
-                if high >= target:
-                    exit_price = target * (1 - EQ_SLIPPAGE_PCT)
-                    exit_reason = "target"
-                    exit_idx = day_idx
-                    break
+                    # Target hit (price drops to target)
+                    if low <= target:
+                        exit_price = target * (1 + slippage)
+                        exit_reason = "target"
+                        exit_idx = day_idx
+                        break
 
-                # Stoploss hit
-                if low <= stoploss:
-                    exit_price = stoploss * (1 - EQ_SLIPPAGE_PCT)
-                    exit_reason = "stoploss"
-                    exit_idx = day_idx
-                    break
+                    # Stoploss hit (price rises to SL)
+                    if high >= stoploss:
+                        exit_price = stoploss * (1 + slippage)
+                        exit_reason = "stoploss"
+                        exit_idx = day_idx
+                        break
 
-                # Trailing stop — only activates after threshold
-                progress = j / p["max_hold_days"]
-                unrealized_pct = (peak - entry_price) / entry_price * 100
+                    # Trailing stop for shorts
+                    progress = j / p["max_hold_days"]
+                    unrealized_pct = (entry_price - peak) / entry_price * 100
 
-                if unrealized_pct >= p["trailing_activation_pct"]:
-                    trail_sl = peak - p["trailing_tight_mult"] * atr
-                    trail_sl = max(trail_sl, entry_price)  # never below entry
-                    effective_sl = max(trail_sl, stoploss)
+                    if unrealized_pct >= p["trailing_activation_pct"]:
+                        trail_sl = peak + p["trailing_tight_mult"] * atr
+                        trail_sl = min(trail_sl, entry_price)
+                        effective_sl = min(trail_sl, stoploss)
+                    else:
+                        effective_sl = stoploss
+
+                    if p["time_sl_enabled"]:
+                        if progress >= 0.75:
+                            time_sl = min(entry_price, peak + p["time_sl_three_quarter_mult"] * atr)
+                            effective_sl = min(effective_sl, time_sl)
+                        elif progress >= 0.5:
+                            time_sl = peak + p["time_sl_half_mult"] * atr
+                            effective_sl = min(effective_sl, time_sl)
+
+                    if high >= effective_sl:
+                        exit_price = effective_sl * (1 + slippage)
+                        is_trailing = unrealized_pct >= p["trailing_activation_pct"]
+                        exit_reason = "trailing_stop" if is_trailing else "stoploss"
+                        exit_idx = day_idx
+                        break
                 else:
-                    # Before activation: only fixed SL, no trailing
-                    effective_sl = stoploss
+                    if high > peak:
+                        peak = high
 
-                # Time-based SL tightening
-                if p["time_sl_enabled"]:
-                    if progress >= 0.75:
-                        time_sl = max(entry_price, peak - p["time_sl_three_quarter_mult"] * atr)
-                        effective_sl = max(effective_sl, time_sl)
-                    elif progress >= 0.5:
-                        time_sl = peak - p["time_sl_half_mult"] * atr
-                        effective_sl = max(effective_sl, time_sl)
+                    # Target hit
+                    if high >= target:
+                        exit_price = target * (1 - slippage)
+                        exit_reason = "target"
+                        exit_idx = day_idx
+                        break
 
-                if low <= effective_sl:
-                    exit_price = effective_sl * (1 - EQ_SLIPPAGE_PCT)
-                    is_trailing = unrealized_pct >= p["trailing_activation_pct"]
-                    exit_reason = "trailing_stop" if is_trailing else "stoploss"
-                    exit_idx = day_idx
-                    break
+                    # Stoploss hit
+                    if low <= stoploss:
+                        exit_price = stoploss * (1 - slippage)
+                        exit_reason = "stoploss"
+                        exit_idx = day_idx
+                        break
 
-                # Max hold expiry
+                    # Trailing stop — only activates after threshold
+                    progress = j / p["max_hold_days"]
+                    unrealized_pct = (peak - entry_price) / entry_price * 100
+
+                    if unrealized_pct >= p["trailing_activation_pct"]:
+                        trail_sl = peak - p["trailing_tight_mult"] * atr
+                        trail_sl = max(trail_sl, entry_price)
+                        effective_sl = max(trail_sl, stoploss)
+                    else:
+                        effective_sl = stoploss
+
+                    if p["time_sl_enabled"]:
+                        if progress >= 0.75:
+                            time_sl = max(entry_price, peak - p["time_sl_three_quarter_mult"] * atr)
+                            effective_sl = max(effective_sl, time_sl)
+                        elif progress >= 0.5:
+                            time_sl = peak - p["time_sl_half_mult"] * atr
+                            effective_sl = max(effective_sl, time_sl)
+
+                    if low <= effective_sl:
+                        exit_price = effective_sl * (1 - slippage)
+                        is_trailing = unrealized_pct >= p["trailing_activation_pct"]
+                        exit_reason = "trailing_stop" if is_trailing else "stoploss"
+                        exit_idx = day_idx
+                        break
+
+                # Max hold expiry (shared)
                 if j >= p["max_hold_days"]:
-                    exit_price = close * (1 - EQ_SLIPPAGE_PCT)
+                    exit_price = close * (1 - slippage) if not is_short else close * (1 + slippage)
                     exit_reason = "expiry"
                     exit_idx = day_idx
                     break
@@ -346,10 +526,21 @@ class SignalBacktestEngine:
                 i += 1
                 continue
 
-            pnl_gross = (exit_price - entry_price) * quantity
-            costs = calc_round_trip_costs(entry_price, exit_price, quantity)
+            if is_short:
+                pnl_gross = (entry_price - exit_price) * quantity
+            else:
+                pnl_gross = (exit_price - entry_price) * quantity
+
+            if is_futures:
+                costs = calc_fut_round_trip_costs(entry_price, exit_price, quantity)
+            else:
+                costs = calc_round_trip_costs(entry_price, exit_price, quantity)
             pnl_net = pnl_gross - costs
-            pnl_pct = (pnl_net / (entry_price * quantity)) * 100
+            if is_futures:
+                margin_used = entry_price * FUT_MARGIN_PCT * quantity
+                pnl_pct = (pnl_net / margin_used) * 100 if margin_used > 0 else 0
+            else:
+                pnl_pct = (pnl_net / (entry_price * quantity)) * 100
 
             trade = {
                 "symbol": symbol,
@@ -378,11 +569,17 @@ class SignalBacktestEngine:
 
         return trades
 
-    def run_multi(self, data: dict[str, pd.DataFrame], nifty_df: pd.DataFrame | None = None) -> list[dict]:
-        """Run backtest across multiple symbols.
+    def run_multi(self, data: dict[str, pd.DataFrame], nifty_df: pd.DataFrame | None = None,
+                  vix_df: pd.DataFrame | None = None) -> list[dict]:
+        """Run backtest across multiple symbols with full F&O trader filters.
 
-        If nifty_df is provided, only allow long entries when Nifty close > 50-day EMA
-        (regime filter proxy — don't go long in a bear market).
+        Filters applied (in order):
+        1. Nifty regime (EMA50) — don't go long in bear market
+        2. Market breadth — skip longs if <40% of stocks above 20-EMA
+        3. Sector momentum — skip stocks in weakening sectors
+        4. RS rank — only trade top N by 20-day return
+        5. Stock win-rate — skip stocks with poor recent track record
+        6. Portfolio risk controls (in _simulate_portfolio)
         """
         # Build Nifty trend filter: date -> bool (is_bullish)
         nifty_bullish = {}
@@ -396,6 +593,82 @@ class SignalBacktestEngine:
                 c = float(nifty_close.loc[idx])
                 e = float(nifty_ema50.loc[idx])
                 nifty_bullish[d] = c > e
+
+        # Build VIX map: date -> vix_value
+        vix_map: dict[str, float] = {}
+        if vix_df is not None and not vix_df.empty:
+            vix_close = vix_df["Close"]
+            if isinstance(vix_close, pd.DataFrame):
+                vix_close = vix_close.iloc[:, 0]
+            for idx in vix_df.index:
+                d = str(idx.date()) if hasattr(idx, 'date') else str(idx)
+                v = vix_close.loc[idx]
+                if not pd.isna(v):
+                    vix_map[d] = float(v)
+
+        # Compute market breadth: date -> % of stocks above their 20-EMA
+        breadth_map: dict[str, float] = {}
+        if self.params.get("breadth_filter", False):
+            # For each date, count how many stocks have close > 20-EMA
+            stock_above_ema: dict[str, dict[str, bool]] = {}  # symbol -> {date: above_ema}
+            for symbol, df in data.items():
+                close = df["Close"]
+                if isinstance(close, pd.DataFrame):
+                    close = close.iloc[:, 0]
+                ema20 = close.ewm(span=20, adjust=False).mean()
+                stock_above_ema[symbol] = {}
+                for idx in df.index:
+                    d = str(idx.date()) if hasattr(idx, 'date') else str(idx)
+                    if not pd.isna(ema20.loc[idx]):
+                        stock_above_ema[symbol][d] = float(close.loc[idx]) > float(ema20.loc[idx])
+
+            # Aggregate per date
+            all_dates = set()
+            for sym_data in stock_above_ema.values():
+                all_dates.update(sym_data.keys())
+            for d in all_dates:
+                above = sum(1 for s in stock_above_ema.values() if s.get(d, False))
+                total = sum(1 for s in stock_above_ema.values() if d in s)
+                breadth_map[d] = (above / total * 100) if total > 0 else 50
+
+        # Compute sector momentum: date -> {sector: momentum_score}
+        # Uses rolling 5-day vs 20-day return differential per sector
+        sector_momentum: dict[str, dict[str, float]] = {}  # date -> {sector: score}
+        if self.params.get("sector_filter", False):
+            # Group stocks by sector, compute sector average returns
+            sector_stocks: dict[str, list[str]] = {}
+            for symbol in data:
+                sym_clean = symbol.replace(".NS", "")
+                sector = NIFTY50_SECTORS.get(sym_clean)
+                if sector:
+                    sector_stocks.setdefault(sector, []).append(symbol)
+
+            # Compute per-sector rolling returns
+            for sector, symbols in sector_stocks.items():
+                sector_ret5: dict[str, list[float]] = {}  # date -> list of 5d returns
+                sector_ret20: dict[str, list[float]] = {}
+                for sym in symbols:
+                    if sym not in data:
+                        continue
+                    close = data[sym]["Close"]
+                    if isinstance(close, pd.DataFrame):
+                        close = close.iloc[:, 0]
+                    ret5 = close.pct_change(5)
+                    ret20 = close.pct_change(20)
+                    for idx in data[sym].index:
+                        d = str(idx.date()) if hasattr(idx, 'date') else str(idx)
+                        r5 = ret5.loc[idx]
+                        r20 = ret20.loc[idx]
+                        if not pd.isna(r5):
+                            sector_ret5.setdefault(d, []).append(float(r5))
+                        if not pd.isna(r20):
+                            sector_ret20.setdefault(d, []).append(float(r20))
+
+                for d in sector_ret5:
+                    avg5 = sum(sector_ret5[d]) / len(sector_ret5[d]) * 100
+                    avg20 = sum(sector_ret20.get(d, [0])) / max(len(sector_ret20.get(d, [1])), 1) * 100
+                    score = avg5 - avg20 / 4  # momentum acceleration
+                    sector_momentum.setdefault(d, {})[sector] = score
 
         # Pre-compute per-stock 20-day returns for RS ranking
         rs_returns: dict[str, dict[str, float]] = {}  # symbol -> {date_str: return_20d}
@@ -415,9 +688,52 @@ class SignalBacktestEngine:
         all_trades = []
         for symbol, df in data.items():
             trades = self.run(symbol, df)
+
+            # 1. Regime filter: only longs when Nifty is bullish
             if nifty_bullish:
-                # Filter: only keep trades entered on Nifty-bullish days
-                trades = [t for t in trades if nifty_bullish.get(t["entry_date"], True)]
+                trades = [t for t in trades
+                          if t["direction"] == "bearish" or nifty_bullish.get(t["entry_date"], True)]
+
+            # 2. VIX filter: tag trades with VIX-based size multiplier
+            if vix_map:
+                for t in trades:
+                    vix_val = vix_map.get(t["entry_date"], 15.0)  # default normal
+                    size_mult = 1.0
+                    for threshold, mult in VIX_SIZE_MAP:
+                        if vix_val <= threshold:
+                            size_mult = mult
+                            break
+                    t["_vix_mult"] = size_mult
+                # Drop trades where VIX says no trading
+                trades = [t for t in trades if t.get("_vix_mult", 1.0) > 0]
+
+            # 3. Breadth filter: skip longs if market breadth < 40%
+            if breadth_map and self.params.get("breadth_filter", False):
+                filtered = []
+                for t in trades:
+                    breadth = breadth_map.get(t["entry_date"], 50)
+                    if t["direction"] == "bullish" and breadth < 40:
+                        continue  # weak breadth — skip long
+                    filtered.append(t)
+                trades = filtered
+
+            # 4. Sector momentum filter: skip stocks in weakening sectors
+            if sector_momentum and self.params.get("sector_filter", False):
+                filtered = []
+                for t in trades:
+                    sym_clean = t["symbol"].replace(".NS", "")
+                    sector = NIFTY50_SECTORS.get(sym_clean)
+                    if sector:
+                        day_sectors = sector_momentum.get(t["entry_date"], {})
+                        sector_score = day_sectors.get(sector, 0)
+                        # Skip longs in weakening sectors, shorts in strengthening
+                        if t["direction"] == "bullish" and sector_score < -0.5:
+                            continue
+                        if t["direction"] == "bearish" and sector_score > 0.5:
+                            continue
+                    filtered.append(t)
+                trades = filtered
+
             all_trades.extend(trades)
 
         # Rolling stock quality filter: after a symbol accumulates enough trades,
@@ -457,8 +773,123 @@ class SignalBacktestEngine:
             all_trades = filtered
 
         all_trades.sort(key=lambda t: t["entry_date"])
+
+        # Portfolio-level risk controls
+        max_positions = self.params.get("max_positions", 0)
+        risk_per_trade = self.params.get("risk_per_trade_pct", 0)  # max loss per trade as % of capital
+        dd_breaker_pct = self.params.get("dd_circuit_breaker_pct", 0)  # pause after X% drawdown
+        total_capital = self.params.get("total_capital", 0)
+
+        if total_capital > 0 and (max_positions > 0 or risk_per_trade > 0 or dd_breaker_pct > 0):
+            all_trades = self._simulate_portfolio(
+                all_trades, total_capital, max_positions, risk_per_trade, dd_breaker_pct
+            )
+
         self.trades = all_trades
         return all_trades
+
+    def _simulate_portfolio(
+        self, trades: list[dict], total_capital: float,
+        max_positions: int, risk_per_trade_pct: float, dd_breaker_pct: float,
+    ) -> list[dict]:
+        """Replay trades with portfolio constraints: position limits, risk sizing, circuit breaker."""
+        is_futures = self.params.get("futures_mode", False)
+
+        # Build timeline of events (entries and exits)
+        events = []
+        for idx, t in enumerate(trades):
+            events.append(("entry", t["entry_date"], idx, t))
+            events.append(("exit", t["exit_date"], idx, t))
+        events.sort(key=lambda e: (e[1], 0 if e[0] == "exit" else 1))  # exits before entries on same day
+
+        open_positions = set()  # set of trade indices currently open
+        equity = total_capital
+        peak_equity = total_capital
+        accepted = set()  # indices of accepted trades
+        paused_until_date = None  # circuit breaker cooldown date
+        dd_cooldown_days = 15  # pause for 15 trading days after breaker trips
+        consecutive_losses = 0  # anti-tilt tracker
+
+        for event_type, date, idx, trade in events:
+            if event_type == "exit" and idx in accepted:
+                open_positions.discard(idx)
+                equity += trade["pnl_net"]
+                if equity > peak_equity:
+                    peak_equity = equity
+                # Track consecutive losses
+                if trade["pnl_net"] < 0:
+                    consecutive_losses += 1
+                else:
+                    consecutive_losses = 0
+
+            elif event_type == "entry":
+                # Circuit breaker cooldown check
+                if dd_breaker_pct > 0 and paused_until_date is not None:
+                    if date < paused_until_date:
+                        continue
+                    else:
+                        paused_until_date = None
+                        # Reset peak to current equity after cooldown
+                        peak_equity = equity
+
+                # Check drawdown circuit breaker trigger
+                if dd_breaker_pct > 0 and peak_equity > 0:
+                    dd_pct = (peak_equity - equity) / peak_equity * 100
+                    if dd_pct >= dd_breaker_pct:
+                        # Pause for cooldown_days trading days
+                        from datetime import datetime as dt, timedelta
+                        try:
+                            d = dt.strptime(date, "%Y-%m-%d")
+                            paused_until_date = (d + timedelta(days=dd_cooldown_days * 1.5)).strftime("%Y-%m-%d")
+                        except ValueError:
+                            paused_until_date = None
+                        continue
+
+                # Max positions check
+                if max_positions > 0 and len(open_positions) >= max_positions:
+                    continue
+
+                # Compute combined size multiplier
+                size_mult = 1.0
+
+                # VIX-based sizing
+                vix_mult = trade.get("_vix_mult", 1.0)
+                size_mult *= vix_mult
+
+                # Consecutive loss scaling (anti-tilt)
+                if consecutive_losses >= 5:
+                    size_mult *= 0.25
+                elif consecutive_losses >= 3:
+                    size_mult *= 0.5
+
+                # Risk-per-trade position sizing: resize quantity so max loss = risk_pct% of equity
+                if risk_per_trade_pct > 0:
+                    max_loss_amount = equity * (risk_per_trade_pct / 100) * size_mult
+                    sl_distance = abs(trade["entry_price"] - trade["stoploss"])
+                    if sl_distance > 0:
+                        risk_qty = max(1, int(max_loss_amount / sl_distance))
+                        old_qty = trade["quantity"]
+                        if risk_qty < old_qty:
+                            ratio = risk_qty / old_qty
+                            trade["quantity"] = risk_qty
+                            trade["pnl_gross"] = round(trade["pnl_gross"] * ratio, 2)
+                            trade["costs"] = round(trade["costs"] * ratio, 2)
+                            trade["pnl_net"] = round(trade["pnl_net"] * ratio, 2)
+                elif size_mult < 1.0:
+                    # Apply size multiplier even without risk-per-trade
+                    old_qty = trade["quantity"]
+                    new_qty = max(1, int(old_qty * size_mult))
+                    if new_qty < old_qty:
+                        ratio = new_qty / old_qty
+                        trade["quantity"] = new_qty
+                        trade["pnl_gross"] = round(trade["pnl_gross"] * ratio, 2)
+                        trade["costs"] = round(trade["costs"] * ratio, 2)
+                        trade["pnl_net"] = round(trade["pnl_net"] * ratio, 2)
+
+                accepted.add(idx)
+                open_positions.add(idx)
+
+        return [t for i, t in enumerate(trades) if i in accepted]
 
     def compute_stats(self) -> dict:
         """Compute performance statistics from completed trades."""
@@ -567,7 +998,8 @@ class SignalBacktestEngine:
               f"SL={self.params['atr_sl_mult']}x, "
               f"hold={self.params['max_hold_days']}d, "
               f"capital/trade=\u20b9{self.params['capital_per_trade']:,}")
-        print(f"  Min signal score: {self.min_score}")
+        mode = "FUTURES (margin-based)" if self.params.get("futures_mode") else "EQUITY"
+        print(f"  Mode: {mode}  |  Min signal score: {self.min_score}")
         print(border)
 
         print(f"\n  Total Trades: {stats['total_trades']}  |  "
@@ -662,6 +1094,15 @@ def main():
     parser.add_argument("--rs-filter", action="store_true", help="Enable relative strength rank filter")
     parser.add_argument("--rs-top-n", type=int, default=20, help="Only trade top N stocks by 20d return")
     parser.add_argument("--capital", type=float, default=10000, help="Capital per trade")
+    parser.add_argument("--futures", action="store_true", help="Use futures mode (margin-based sizing, lower costs, shorts enabled)")
+    parser.add_argument("--vix-filter", action="store_true", help="Enable India VIX-based position sizing")
+    parser.add_argument("--breadth-filter", action="store_true", help="Enable market breadth filter (<40%% skips longs)")
+    parser.add_argument("--sector-filter", action="store_true", help="Enable sector momentum filter")
+    parser.add_argument("--gap-filter", action="store_true", help="Skip entries on >2%% gap days")
+    parser.add_argument("--total-capital", type=float, default=0, help="Total portfolio capital (enables portfolio risk controls)")
+    parser.add_argument("--max-positions", type=int, default=0, help="Max concurrent open positions (0=unlimited)")
+    parser.add_argument("--risk-per-trade", type=float, default=0, help="Max loss per trade as %% of equity (0=disabled)")
+    parser.add_argument("--dd-breaker", type=float, default=0, help="Pause trading after X%% drawdown from peak (0=disabled)")
     parser.add_argument("--output", type=str, help="Save results to JSON file")
     args = parser.parse_args()
 
@@ -684,6 +1125,14 @@ def main():
         "stock_wr_lookback": args.stock_lookback,
         "rs_rank_filter": args.rs_filter,
         "rs_top_n": args.rs_top_n,
+        "futures_mode": args.futures,
+        "gap_filter": args.gap_filter,
+        "breadth_filter": args.breadth_filter,
+        "sector_filter": args.sector_filter,
+        "total_capital": args.total_capital,
+        "max_positions": args.max_positions,
+        "risk_per_trade_pct": args.risk_per_trade,
+        "dd_circuit_breaker_pct": args.dd_breaker,
     }
 
     print(f"Fetching data for {len(symbols)} symbol(s), period={args.period}...")
@@ -709,8 +1158,23 @@ def main():
         except Exception as e:
             print(f"Warning: Nifty fetch failed ({e}), running without regime filter")
 
+    # Fetch India VIX for position sizing
+    vix_df = None
+    if args.vix_filter:
+        import yfinance as yf
+        print("Fetching India VIX for position sizing...")
+        try:
+            vix_df = yf.download("^INDIAVIX", period=args.period, progress=False)
+            if vix_df.empty:
+                print("Warning: Could not fetch VIX data")
+                vix_df = None
+            else:
+                print(f"VIX data: {len(vix_df)} rows")
+        except Exception as e:
+            print(f"Warning: VIX fetch failed ({e})")
+
     engine = SignalBacktestEngine(params, min_score=args.min_score)
-    engine.run_multi(data, nifty_df=nifty_df)
+    engine.run_multi(data, nifty_df=nifty_df, vix_df=vix_df)
     stats = engine.compute_stats()
     engine.print_report(stats)
 
