@@ -3192,6 +3192,50 @@ def _format_signals_for_claude(signals: dict) -> str:
     return "\n".join(lines)
 
 
+def _handle_position_add(pos: dict, current_ltp: float, portfolio: dict) -> bool:
+    """Add to a winning position. Returns True if add executed."""
+    entry = pos["entry_price"]
+    direction = pos.get("direction", "bullish")
+
+    # Safety: never add to losers
+    if direction == "bullish" and current_ltp <= entry:
+        return False
+    if direction == "bearish" and current_ltp >= entry:
+        return False
+
+    # Max 1 add per position
+    if pos.get("_add_count", 0) >= 1:
+        return False
+
+    # Must be at least 1x ATR from entry
+    atr = pos.get("atr_at_entry", 0)
+    if atr > 0:
+        if direction == "bullish" and (current_ltp - entry) < atr:
+            return False
+        if direction == "bearish" and (entry - current_ltp) < atr:
+            return False
+
+    # Add 50% of original quantity
+    add_qty = max(1, pos["quantity"] // 2)
+    add_cost = add_qty * current_ltp
+
+    if portfolio.get("available_capital", 0) < add_cost:
+        return False
+
+    # Safety cap
+    max_alloc = portfolio["capital"] * config.MAX_STRATEGY_ALLOC_PCT
+    if (pos.get("allocated", 0) + add_cost) > max_alloc:
+        return False
+
+    # Execute add
+    pos["quantity"] += add_qty
+    pos["allocated"] = pos.get("allocated", 0) + add_cost
+    pos["_add_count"] = pos.get("_add_count", 0) + 1
+    portfolio["available_capital"] -= add_cost
+
+    return True
+
+
 def monitor_positions(smart_api, portfolio: dict) -> tuple:
     """
     Check each open position for exit conditions. Returns number of exits.
