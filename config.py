@@ -413,6 +413,22 @@ HEDGE_TIGHTEN_THRESHOLD_PCT = 0.40  # tighten when hedge drops to 40% of entry p
 HEDGE_TIGHTEN_CLOSER_POINTS_NIFTY = 200  # re-buy hedge 200pt closer (Nifty)
 HEDGE_TIGHTEN_CLOSER_POINTS_BANKNIFTY = 200  # re-buy hedge 200pt closer (BankNifty)
 
+# ---------------------------------------------------------------------------
+# Overnight Hedge Protection (V10)
+# ---------------------------------------------------------------------------
+OVERNIGHT_HEDGE_ENABLED = True
+OVERNIGHT_HEDGE_TIME_START = "15:15"
+OVERNIGHT_HEDGE_TIME_END = "15:25"
+OVERNIGHT_MIN_GAIN_FOR_NAKED_CARRY = 0.50   # 50% gain required for naked carry
+OVERNIGHT_MIN_GAIN_FOR_HEDGE = 0.30          # below 30% gain -> close, don't hedge
+OVERNIGHT_VIX_NAKED_BLOCK = 20               # VIX above this -> no naked carry allowed
+OVERNIGHT_EXPIRY_CLOSE_DAYS = 2              # close if <= 2 trading days to expiry
+OVERNIGHT_HEDGE_MAX_COST_PCT = 0.01          # max 1% of position value for hedge premium
+OVERNIGHT_HEDGE_OTM_POINTS_NIFTY = 250       # OTM distance for protective leg
+OVERNIGHT_HEDGE_OTM_POINTS_BANKNIFTY = 500
+OVERNIGHT_STOP_TIGHTEN_PCT = 0.20            # tighten SL by 20% on naked carry approval
+OVERNIGHT_NAKED_INSTRUMENTS = ("MOMENTUM", "OPT", "FUT")  # instruments considered naked
+
 # V9: PCR entry filter (Nitin Murarka)
 PCR_FILTER_ENABLED = True
 PCR_BULLISH_CONTRARIAN = 1.3        # PCR > 1.3 → contrarian bullish (too many puts)
