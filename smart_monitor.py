@@ -18,6 +18,7 @@ logger = logging.getLogger("paper_trade")
 
 STATE_FILE = Path("data/paper_trades/monitor_state.json")
 LESSONS_FILE = Path("data/trade_journal/lessons.json")
+VAULT_DIR = Path.home() / "Documents" / "Obsidian"
 
 IST = None  # imported lazily from paper_trade
 
@@ -519,3 +520,99 @@ def is_auction_window() -> bool:
 def get_auction_atr_buffer() -> float:
     """Extra ATR buffer during auction windows to avoid false exits."""
     return 0.5 if is_auction_window() else 0.0
+
+
+# ---------------------------------------------------------------------------
+# Daily Journal → Obsidian
+# ---------------------------------------------------------------------------
+
+def format_daily_journal(portfolio: dict, context: dict, today: str) -> str:
+    """Format trading journal entry for Obsidian daily note."""
+    lines = ["\n## Trading Journal\n"]
+
+    # Entries (today's new positions)
+    entries = [p for p in portfolio.get("positions", [])
+               if p.get("entry_date", "")[:10] == today and p.get("status") == "open"]
+    if entries:
+        lines.append("### Entries")
+        for p in entries:
+            thesis = p.get("entry_thesis", {}).get("reasoning", "N/A")
+            lines.append(f"- **{p['symbol']}** ({p.get('instrument','')}, {p.get('direction','')}) @ ₹{p['entry_price']:,.1f} — \"{thesis}\"")
+        lines.append("")
+
+    # Exits (today's closed trades)
+    exits = [t for t in portfolio.get("closed_trades", [])
+             if t.get("exit_date", "")[:10] == today]
+    if exits:
+        lines.append("### Exits")
+        for t in exits:
+            lines.append(f"- **{t['symbol']}** ({t.get('instrument','')}) @ ₹{t.get('exit_price',0):,.1f} — {t.get('exit_reason','')}, P&L: ₹{t.get('pnl',0):,.0f} ({t.get('pnl_pct',0):+.1f}%)")
+        lines.append("")
+
+    # Portfolio summary
+    open_pos = [p for p in portfolio.get("positions", []) if p.get("status") == "open"]
+    total_realized = sum(t.get("pnl", 0) for t in exits)
+    lines.append("### Portfolio")
+    lines.append(f"- Realized today: ₹{total_realized:,.0f} | Open: {len(open_pos)} positions")
+    lines.append("")
+
+    # Market context
+    if context:
+        lines.append("### Market Context")
+        parts = []
+        if context.get("regime"): parts.append(f"Regime: {context['regime']}")
+        if context.get("vix"): parts.append(f"VIX: {context['vix']:.1f}")
+        if context.get("fii_net"): parts.append(f"FII: {context['fii_net']:,.0f}cr")
+        if context.get("pcr"): parts.append(f"PCR: {context['pcr']:.2f}")
+        if parts:
+            lines.append(f"- {' | '.join(parts)}")
+
+    return "\n".join(lines)
+
+
+def write_daily_journal(portfolio: dict, context: dict, today: str = None) -> str | None:
+    """Append trading journal to Obsidian daily note."""
+    if today is None:
+        today = _now_ist().strftime("%Y-%m-%d")
+
+    journal_md = format_daily_journal(portfolio, context, today)
+
+    daily_file = VAULT_DIR / "daily" / f"{today}.md"
+    try:
+        if daily_file.exists():
+            content = daily_file.read_text()
+            if "## Trading Journal" not in content:
+                with open(daily_file, "a") as f:
+                    f.write(journal_md)
+        else:
+            daily_file.parent.mkdir(parents=True, exist_ok=True)
+            daily_file.write_text(f"# {today}\n{journal_md}")
+        return str(daily_file)
+    except Exception as e:
+        logger.error("Failed to write daily journal: %s", e)
+        return None
+
+
+def read_recent_journal(vault_dir: Path = None, days: int = 3, today: str = None) -> list[str]:
+    """Read recent trading journal entries from Obsidian daily notes."""
+    vault = vault_dir or VAULT_DIR
+    if today is None:
+        today = _now_ist().strftime("%Y-%m-%d")
+
+    journals = []
+    d = datetime.strptime(today, "%Y-%m-%d").date()
+
+    for i in range(1, days + 1):
+        check_date = d - timedelta(days=i)
+        daily_file = vault / "daily" / f"{check_date}.md"
+        if daily_file.exists():
+            content = daily_file.read_text()
+            if "## Trading Journal" in content:
+                idx = content.index("## Trading Journal")
+                rest = content[idx:]
+                next_section = rest.find("\n## ", 3)
+                if next_section > 0:
+                    journals.append(rest[:next_section])
+                else:
+                    journals.append(rest)
+    return journals
