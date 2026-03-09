@@ -20,6 +20,7 @@ from overnight_hedge import (
     find_positions_with_hedge_legs,
     is_naked_fno,
     parse_overnight_decision,
+    run_overnight_hedge_scan,
     tighten_stop_loss,
 )
 
@@ -251,3 +252,123 @@ class TestMorningUnwind:
         result = calc_hedge_pnl(entry_premium=45, exit_premium=120, quantity=25)
         assert result["pnl"] > 0
         assert result["label"] == "hedge_saved"
+
+
+# ── TestIntegrationDryRun ─────────────────────────────────────────────────
+
+
+class MockSmartAPI:
+    """Mock SmartAPI that returns configurable LTP values."""
+
+    def __init__(self, ltp=100.0):
+        self._ltp = ltp
+
+    def ltpData(self, exchange, symbol, token):
+        return {"data": {"ltp": self._ltp}}
+
+    def getMarketData(self, mode=None, exchangeTokens=None):
+        return {"data": {"fetched": [{"ltp": self._ltp}]}}
+
+
+class TestIntegrationDryRun:
+    def _write_portfolio(self, tmp_path, positions):
+        """Write a portfolio JSON file to tmp_path and return the path."""
+        portfolio = {"positions": positions}
+        pf_file = tmp_path / "portfolio.json"
+        pf_file.write_text(json.dumps(portfolio))
+        return pf_file
+
+    def test_full_scan_position_in_loss(self, tmp_path, monkeypatch):
+        """Position in loss should be closed by guardrails."""
+        import paper_trade
+        import regime
+
+        # Portfolio with one naked MOMENTUM position (entry=100, LTP will be 85)
+        positions = [
+            {
+                "symbol": "NIFTY",
+                "instrument": "MOMENTUM",
+                "direction": "bullish",
+                "entry_price": 100,
+                "quantity": 75,
+                "status": "open",
+                "expiry": "30MAR2026",
+                "token": "26000",
+                "trading_symbol": "NIFTY30MAR26FUT",
+            }
+        ]
+        self._write_portfolio(tmp_path, positions)
+
+        # Monkeypatch portfolio paths
+        monkeypatch.setattr(paper_trade, "PORTFOLIO_FILE", tmp_path / "portfolio.json")
+        monkeypatch.setattr(paper_trade, "PORTFOLIO_DIR", tmp_path)
+
+        # Mock regime to avoid SmartAPI calls
+        monkeypatch.setattr(regime, "classify_regime", lambda *a, **kw: {"regime": "TRENDING_UP"})
+
+        # Mock yfinance to avoid network calls — Ticker().history() raises so VIX defaults to 15.0
+        import yfinance
+        bad_ticker = MagicMock()
+        bad_ticker.return_value.history.side_effect = Exception("mocked VIX")
+        monkeypatch.setattr(yfinance, "Ticker", bad_ticker)
+
+        # Mock _telegram_send
+        sent_messages = []
+        monkeypatch.setattr(paper_trade, "_telegram_send", lambda msg: sent_messages.append(msg))
+
+        # Run scan with LTP=85 (position in loss: entry=100, current=85)
+        mock_api = MockSmartAPI(ltp=85.0)
+        results = run_overnight_hedge_scan(mock_api, dry_run=True)
+
+        assert len(results) == 1
+        assert results[0]["action"] == "close"
+        assert "loss" in results[0]["reason"]
+
+    def test_full_scan_no_naked_positions(self, tmp_path, monkeypatch):
+        """Portfolio with only a CONDOR position should produce 0 results."""
+        import paper_trade
+
+        positions = [
+            {
+                "symbol": "NIFTY",
+                "instrument": "CONDOR",
+                "direction": "bullish",
+                "entry_price": 100,
+                "quantity": 75,
+                "status": "open",
+            }
+        ]
+        self._write_portfolio(tmp_path, positions)
+
+        monkeypatch.setattr(paper_trade, "PORTFOLIO_FILE", tmp_path / "portfolio.json")
+        monkeypatch.setattr(paper_trade, "PORTFOLIO_DIR", tmp_path)
+
+        mock_api = MockSmartAPI(ltp=100.0)
+        results = run_overnight_hedge_scan(mock_api, dry_run=True)
+
+        assert results == []
+
+    def test_full_scan_hedged_position_skipped(self, tmp_path, monkeypatch):
+        """MOMENTUM position with hedge_leg should not be treated as naked."""
+        import paper_trade
+
+        positions = [
+            {
+                "symbol": "NIFTY",
+                "instrument": "MOMENTUM",
+                "direction": "bullish",
+                "entry_price": 100,
+                "quantity": 75,
+                "status": "open",
+                "hedge_leg": {"symbol": "NIFTY25300PE", "premium": 45, "quantity": 75},
+            }
+        ]
+        self._write_portfolio(tmp_path, positions)
+
+        monkeypatch.setattr(paper_trade, "PORTFOLIO_FILE", tmp_path / "portfolio.json")
+        monkeypatch.setattr(paper_trade, "PORTFOLIO_DIR", tmp_path)
+
+        mock_api = MockSmartAPI(ltp=100.0)
+        results = run_overnight_hedge_scan(mock_api, dry_run=True)
+
+        assert results == []
