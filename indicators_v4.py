@@ -155,14 +155,13 @@ def compute_adx(df: pd.DataFrame, period: int = 14) -> dict[str, pd.Series]:
         plus_dm[i] = up_move if (up_move > down_move and up_move > 0) else 0
         minus_dm[i] = down_move if (down_move > up_move and down_move > 0) else 0
 
-    # Wilder's smoothing (EMA with alpha = 1/period)
-    alpha = 1.0 / period
-
+    # Wilder's smoothing: prev * (period-1)/period + new_value
+    # NOT the same as EMA — new value is added directly, not multiplied by alpha
     def wilder_smooth(arr: np.ndarray) -> np.ndarray:
         smoothed = np.full(n, np.nan)
-        smoothed[period - 1] = np.mean(arr[:period])
+        smoothed[period - 1] = np.sum(arr[:period])
         for i in range(period, n):
-            smoothed[i] = smoothed[i - 1] * (1 - alpha) + arr[i] * alpha
+            smoothed[i] = smoothed[i - 1] - smoothed[i - 1] / period + arr[i]
         return smoothed
 
     smooth_tr = wilder_smooth(tr)
@@ -177,11 +176,6 @@ def compute_adx(df: pd.DataFrame, period: int = 14) -> dict[str, pd.Series]:
         if smooth_tr[i] > 0:
             di_plus[i] = 100.0 * smooth_plus_dm[i] / smooth_tr[i]
             di_minus[i] = 100.0 * smooth_minus_dm[i] / smooth_tr[i]
-
-    # Also set at period-1 (first valid smoothed value)
-    if smooth_tr[period - 1] > 0:
-        di_plus[period - 1] = 100.0 * smooth_plus_dm[period - 1] / smooth_tr[period - 1]
-        di_minus[period - 1] = 100.0 * smooth_minus_dm[period - 1] / smooth_tr[period - 1]
 
     # NaN out first period bars for DI
     di_plus[:period] = np.nan
@@ -207,7 +201,7 @@ def compute_adx(df: pd.DataFrame, period: int = 14) -> dict[str, pd.Series]:
             adx[first_adx_idx] = np.mean(valid_dx)
             for i in range(first_adx_idx + 1, n):
                 if not np.isnan(dx[i]):
-                    adx[i] = adx[i - 1] * (1 - alpha) + dx[i] * alpha
+                    adx[i] = (adx[i - 1] * (period - 1) + dx[i]) / period
 
     return {
         "adx": pd.Series(adx, index=df.index),
