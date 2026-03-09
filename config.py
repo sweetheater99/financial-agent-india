@@ -17,6 +17,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# ── V6 Claude-First Architecture ──────────────────────────────────────────
+V6_CLAUDE_FIRST = True  # Set False to revert to V5 rule-based decisions
+
 ANGELONE_API_KEY = os.getenv("ANGELONE_API_KEY")
 ANGELONE_CLIENT_ID = os.getenv("ANGELONE_CLIENT_ID")
 ANGELONE_PASSWORD = os.getenv("ANGELONE_PASSWORD")
@@ -269,7 +272,7 @@ ALLOC_MOMENTUM_MAX = 0.15
 ALLOC_CASH_MIN = 0.05
 MAX_CONCURRENT_POSITIONS = 8
 MAX_SAME_SECTOR = 2
-MAX_SIMULTANEOUS_LOSS_PCT = 10
+MAX_SIMULTANEOUS_LOSS_PCT = 20  # V9: loosened from 10% — V8's wide 3.5x ATR SL needs more room
 
 # Spread strategy constants
 SPREAD_MIN_DTE = 30
@@ -312,20 +315,16 @@ CONDOR_TIME_EXIT_DAYS = 5
 CONDOR_MIN_CREDIT_PER_LOT = 50
 
 # Drawdown circuit breakers
-DRAWDOWN_DAILY_HALT = 0.03
-DRAWDOWN_WEEKLY_REDUCE = 0.05
-DRAWDOWN_MONTHLY_HALT = 0.08
-DRAWDOWN_TOTAL_STOP = 0.15
-CONSECUTIVE_LOSS_PAUSE = 3
+DRAWDOWN_DAILY_HALT = 0.03             # V6: to be removed when referencing code is updated (risk_manager.py)
+DRAWDOWN_WEEKLY_REDUCE = 0.05          # V6: to be removed when referencing code is updated (risk_manager.py)
+DRAWDOWN_MONTHLY_HALT = 0.08           # V6: to be removed when referencing code is updated (risk_manager.py)
+DRAWDOWN_TOTAL_STOP = 0.15             # V6: to be removed when referencing code is updated (risk_manager.py, paper_trade.py)
+CONSECUTIVE_LOSS_PAUSE = 3             # V6: to be removed when referencing code is updated (risk_manager.py)
 
 # CASH regime triggers
-CASH_TRIGGER_MONTHLY_DRAWDOWN_PCT = 8.0
-CASH_TRIGGER_SEVERE_DRAWDOWN_PCT = 12.0
-CASH_TRIGGER_CONSECUTIVE_LOSSES = 5
-CASH_TRIGGER_VIX = 25
-CASH_DURATION_NORMAL = 5
-CASH_DURATION_SEVERE = 10
-CASH_DURATION_LOSSES = 5
+CASH_TRIGGER_MONTHLY_DRAWDOWN_PCT = 8.0   # V6: to be removed when referencing code is updated (regime.py)
+CASH_TRIGGER_CONSECUTIVE_LOSSES = 5       # V6: to be removed when referencing code is updated (regime.py)
+CASH_TRIGGER_VIX = 25                     # V6: to be removed when referencing code is updated (regime.py)
 
 # Slippage
 PAPER_TRADE_SLIPPAGE_PCT = 0.005  # 0.5%
@@ -339,37 +338,37 @@ GREEKS_THETA_WARN_PCT = 2.0  # warn if daily theta > 2% of premium at risk
 # ── V3 Global Macro Intelligence ────────────────────────────────────────────
 
 # US Market hard gates
-US_CRASH_BLOCK_PCT = 2.0
-US_SEVERE_CRASH_PCT = 3.0
-US_MILD_RED_PCT = 1.0
-NASDAQ_IT_CRASH_PCT = 3.0
+US_CRASH_BLOCK_PCT = 2.0               # V6: to be removed when referencing code is updated (global_intel.py)
+US_SEVERE_CRASH_PCT = 3.0              # V6: to be removed when referencing code is updated (global_intel.py)
+US_MILD_RED_PCT = 1.0                  # V6: to be removed when referencing code is updated (global_intel.py)
+NASDAQ_IT_CRASH_PCT = 3.0              # V6: to be removed when referencing code is updated (global_intel.py)
 
 # GIFT Nifty hard gates
-GIFT_GAP_REDUCE_PCT = 1.5
-GIFT_GAP_BLOCK_PCT = 2.5
+GIFT_GAP_REDUCE_PCT = 1.5              # V6: to be removed when referencing code is updated (global_intel.py)
+GIFT_GAP_BLOCK_PCT = 2.5               # V6: to be removed when referencing code is updated (global_intel.py)
 
 # FII/DII hard gates (values in crores)
-FII_HEAVY_SELL_CRORES = 5000
-FII_EXTREME_SELL_CRORES = 10000
-DII_SUPPORT_MODERATE_PCT = 0.25
+FII_HEAVY_SELL_CRORES = 5000           # V6: to be removed when referencing code is updated (global_intel.py)
+FII_EXTREME_SELL_CRORES = 10000        # V6: to be removed when referencing code is updated (global_intel.py)
+DII_SUPPORT_MODERATE_PCT = 0.25        # V6: to be removed when referencing code is updated (global_intel.py)
 
 # PCR gates
-PCR_EUPHORIA = 0.5
-PCR_EXTREME_CALL = 0.7
-PCR_EXTREME_PUT = 1.3
+PCR_EUPHORIA = 0.5                     # V6: to be removed when referencing code is updated (global_intel.py)
+PCR_EXTREME_CALL = 0.7                 # V6: to be removed when referencing code is updated (global_intel.py)
+PCR_EXTREME_PUT = 1.3                  # V6: to be removed when referencing code is updated (global_intel.py)
 
 # Supertrend
 SUPERTREND_PERIOD = 10
 SUPERTREND_MULTIPLIER = 3.0
-SUPERTREND_DISAGREE_REDUCTION = 0.25
+SUPERTREND_DISAGREE_REDUCTION = 0.25   # V6: to be removed when referencing code is updated (paper_trade.py)
 
 # CPR thresholds
-CPR_NARROW_PCT = 0.3
-CPR_WIDE_PCT = 0.8
+CPR_NARROW_PCT = 0.3                   # V6: to be removed when referencing code is updated (indicators_v3.py)
+CPR_WIDE_PCT = 0.8                     # V6: to be removed when referencing code is updated (indicators_v3.py)
 
 # Trailing SL enhancement
-TRAILING_SL_ACTIVATION_PCT = 3.0    # don't trail until 3% profit — tuned via param sweep
-TRAILING_SL_ATR_MULT = 2.5          # tighter trail once activated — tuned via param sweep
+TRAILING_SL_ACTIVATION_PCT = 3.0    # don't trail until 3% profit — V8 param sweep confirmed
+TRAILING_SL_ATR_MULT = 2.5          # tighter trail once activated — V8 param sweep confirmed
 
 # Weekly theta strategy
 WEEKLY_THETA_MIN_VIX = 14.0
@@ -391,6 +390,37 @@ ALLOC_IRON_CONDOR_MAX_V3 = 0.15
 ALLOC_MOMENTUM_MAX_V3 = 0.10
 ALLOC_WEEKLY_THETA_MAX = 0.10
 ALLOC_CASH_MIN_V3 = 0.05
+
+# V9: PR Sundar portfolio discipline — always keep 40% cash
+CASH_RESERVE_PCT = 0.40             # never deploy more than 60% of capital
+MAX_STRATEGY_ALLOC_PCT = 0.12       # max 12% of capital per strategy
+WEEKLY_PORTFOLIO_SL_PCT = 0.04      # 4% weekly portfolio SL → stop all new entries
+
+# V9: Monthly iron condor (Reyaansh style)
+MONTHLY_CONDOR_ENABLED = True
+MONTHLY_CONDOR_ENTRY_DAY_MIN = 1    # enter 1st-5th of month
+MONTHLY_CONDOR_ENTRY_DAY_MAX = 5
+MONTHLY_CONDOR_DELTA = 0.25         # 25-delta strikes
+MONTHLY_CONDOR_HEDGE_GAP_NIFTY = 500   # hedge wing gap in points (Nifty)
+MONTHLY_CONDOR_HEDGE_GAP_BANKNIFTY = 700  # hedge wing gap in points (BankNifty)
+MONTHLY_CONDOR_TARGET_PCT = 0.50    # take profit at 50% premium captured
+MONTHLY_CONDOR_MONTHLY_SL_PCT = 0.04  # 4% monthly SL → stop the condor
+MONTHLY_CONDOR_MAX_RISK_PCT = 0.03  # max 3% of capital at risk
+
+# V9: Dynamic hedge tightening (Reyaansh)
+HEDGE_TIGHTEN_ENABLED = True
+HEDGE_TIGHTEN_THRESHOLD_PCT = 0.40  # tighten when hedge drops to 40% of entry premium
+HEDGE_TIGHTEN_CLOSER_POINTS_NIFTY = 200  # re-buy hedge 200pt closer (Nifty)
+HEDGE_TIGHTEN_CLOSER_POINTS_BANKNIFTY = 200  # re-buy hedge 200pt closer (BankNifty)
+
+# V9: PCR entry filter (Nitin Murarka)
+PCR_FILTER_ENABLED = True
+PCR_BULLISH_CONTRARIAN = 1.3        # PCR > 1.3 → contrarian bullish (too many puts)
+PCR_BEARISH_CONTRARIAN = 0.7        # PCR < 0.7 → contrarian bearish (too many calls)
+
+# V9: Max pain gravity near expiry
+MAX_PAIN_FILTER_ENABLED = True
+MAX_PAIN_PROXIMITY_PCT = 2.0        # use max pain if price is >2% away with ≤2 DTE
 
 # X/Twitter intel
 X_SEARCH_QUERIES = [
@@ -422,12 +452,20 @@ OPT_PARTIAL_RATIO = 0.5            # book 50% of lots
 # Weekly performance report
 WEEKLY_REPORT_DAY = 6              # Sunday (0=Mon, 6=Sun)
 
+# ── Smart Monitoring (V5) ─────────────────────────────────────────────────
+DAILY_LOSS_CIRCUIT_BREAKER_PCT = 3.0   # % of capital — block ALL new entries for rest of day
+SECTOR_CORRELATION_NIFTY_PCT = 1.5     # Nifty move % to trigger correlation protection
+SECTOR_CORRELATION_TIGHTEN_ATR = 0.5   # ATR multiplier to tighten SLs on correlated positions
+HOT_CHECK_INTERVAL_MIN = 5            # minutes between checks for HOT positions
+WARM_CHECK_INTERVAL_MIN = 10          # minutes between checks for WARM positions
+COLD_CHECK_INTERVAL_MIN = 30          # minutes between checks when no positions
+
 # Sector rotation
-SECTOR_ROTATION_BOOST = 0.15       # +15% allocation for strengthening sectors
-SECTOR_ROTATION_CUT = 0.15         # -15% allocation for weakening sectors
+SECTOR_ROTATION_BOOST = 0.15       # +15% allocation for strengthening sectors  # V6: to be removed when referencing code is updated (paper_trade.py)
+SECTOR_ROTATION_CUT = 0.15         # -15% allocation for weakening sectors  # V6: to be removed when referencing code is updated (paper_trade.py)
 
 # Unusual OI
-OI_UNUSUAL_CAUTIONARY_CUT = 0.10   # -10% allocation on cautionary OI signal
+OI_UNUSUAL_CAUTIONARY_CUT = 0.10   # -10% allocation on cautionary OI signal  # V6: to be removed when referencing code is updated (paper_trade.py)
 
 # Global intel caching
 GLOBAL_INTEL_CACHE_HOURS = 6
