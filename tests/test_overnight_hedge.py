@@ -1,16 +1,24 @@
 """Tests for overnight hedge guardrail functions."""
 
+import json
 import sys
 from pathlib import Path
+from unittest.mock import patch, MagicMock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytest
 from overnight_hedge import (
     apply_guardrails,
+    build_hedge_leg,
     check_hedge_cost,
     enforce_carry_naked_threshold,
+    execute_carry_naked,
+    execute_close,
+    execute_hedge,
     is_naked_fno,
+    parse_overnight_decision,
+    tighten_stop_loss,
 )
 
 
@@ -133,3 +141,87 @@ class TestHedgeCost:
         # cost = 5.3 * 10 = 53, position = 10_000 → 0.53%
         result = check_hedge_cost(position_value=10_000, hedge_premium=5.3, quantity=10)
         assert result["affordable"] is True
+
+
+# ── TestParseClaudeOvernightDecision ────────────────────────────────────────
+
+
+class TestParseClaudeOvernightDecision:
+    def test_parse_valid_close(self):
+        raw = json.dumps({"action": "close", "reasoning": "risk too high"})
+        result = parse_overnight_decision(raw)
+        assert result["action"] == "close"
+        assert result["reasoning"] == "risk too high"
+
+    def test_parse_valid_hedge(self):
+        raw = json.dumps({"action": "hedge", "reasoning": "protect gains"})
+        result = parse_overnight_decision(raw)
+        assert result["action"] == "hedge"
+        assert result["reasoning"] == "protect gains"
+
+    def test_parse_valid_carry_naked(self):
+        raw = '```json\n{"action": "carry_naked", "reasoning": "strong trend"}\n```'
+        result = parse_overnight_decision(raw)
+        assert result["action"] == "carry_naked"
+        assert result["reasoning"] == "strong trend"
+
+    def test_parse_invalid_defaults_to_hedge(self):
+        raw = "I think you should hedge this position because..."
+        result = parse_overnight_decision(raw)
+        assert result["action"] == "hedge"
+
+    def test_parse_none_defaults_to_close(self):
+        result = parse_overnight_decision(None)
+        assert result["action"] == "close"
+        assert "fail-safe" in result["reasoning"]
+
+
+# ── TestBuildHedgeLeg ───────────────────────────────────────────────────────
+
+
+class TestBuildHedgeLeg:
+    def test_bullish_gets_put(self):
+        pos = _make_position(direction="bullish", instrument="MOMENTUM")
+        pos["quantity"] = 25
+        result = build_hedge_leg(pos, spot_price=25200)
+        assert result["option_type"] == "PE"
+        # 25200 rounded to nearest 50 = 25200, minus 250 = 24950
+        assert result["strike"] == 24950
+        assert result["quantity"] == 25
+
+    def test_bearish_gets_call(self):
+        pos = _make_position(direction="bearish", instrument="MOMENTUM")
+        pos["quantity"] = 25
+        result = build_hedge_leg(pos, spot_price=24800)
+        assert result["option_type"] == "CE"
+        # 24800 rounded to nearest 50 = 24800, plus 250 = 25050
+        assert result["strike"] == 25050
+
+    def test_banknifty_wider_otm(self):
+        pos = _make_position(direction="bullish", instrument="MOMENTUM")
+        pos["symbol"] = "BANKNIFTY"
+        pos["quantity"] = 15
+        result = build_hedge_leg(pos, spot_price=52200)
+        assert result["option_type"] == "PE"
+        # 52200 rounded to nearest 100 = 52200, minus 500 = 51700
+        assert result["strike"] == 51700
+
+    def test_futures_bullish_gets_put(self):
+        pos = _make_position(direction="bullish", instrument="FUT")
+        pos["quantity"] = 25
+        result = build_hedge_leg(pos, spot_price=25100)
+        assert result["option_type"] == "PE"
+
+
+# ── TestTightenStopLoss ─────────────────────────────────────────────────────
+
+
+class TestTightenStopLoss:
+    def test_tighten_raises_stop(self):
+        pos = _make_position(entry_price=100)
+        pos["stoploss_price"] = 65
+        new_sl = tighten_stop_loss(pos, current_price=160)
+        # Gap = 160 - 65 = 95, tightened by 20% → new gap = 76, new SL = 160 - 76 = 84
+        assert new_sl > 65
+        assert new_sl < 160
+        assert new_sl == 84.0

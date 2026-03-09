@@ -615,6 +615,92 @@ Respond with JSON only:
 
 
 # ---------------------------------------------------------------------------
+# OVERNIGHT DECISION
+# ---------------------------------------------------------------------------
+
+def evaluate_overnight(
+    pos: dict,
+    current_price: float,
+    gain_pct: float,
+    vix: float,
+    regime: str,
+    market_context: str = "",
+) -> dict:
+    """Ask Claude whether to close, hedge, or carry_naked a position overnight.
+
+    Returns {"action": "close"|"hedge"|"carry_naked", "reasoning": str}
+    On failure: default to hedge if profitable, close otherwise.
+    """
+    symbol = pos.get("symbol", "?")
+    direction = pos.get("direction", "?")
+    instrument = pos.get("instrument", "?")
+    entry_price = pos.get("entry_price", 0)
+    strike = pos.get("strike", "N/A")
+    expiry = pos.get("expiry", "N/A")
+    option_type = pos.get("option_type", "N/A")
+
+    prompt = f"""You are an overnight risk manager for Indian F&O positions.
+
+POSITION:
+- Symbol: {symbol}
+- Instrument: {instrument}
+- Direction: {direction}
+- Entry price: ₹{entry_price:.2f}
+- Current price: ₹{current_price:.2f}
+- Unrealised gain: {gain_pct:.0%}
+- Strike: {strike}
+- Expiry: {expiry}
+- Option type: {option_type}
+
+MARKET CONTEXT:
+- India VIX: {vix:.1f}
+- Regime: {regime}
+{f"- Additional: {market_context}" if market_context else ""}
+
+ACTIONS (pick exactly one):
+1. "close" — exit the position now to avoid overnight gap risk
+2. "hedge" — buy a protective OTM option to cap downside overnight
+3. "carry_naked" — carry the position unhedged (only if conviction is very high and risk is low)
+
+RULES:
+- If VIX is elevated (>18), prefer hedge or close over carry_naked
+- carry_naked requires strong trend conviction AND low overnight event risk
+- hedge is the balanced choice when the position has decent gains worth protecting
+
+Respond with ONLY a JSON object: {{"action": "<close|hedge|carry_naked>", "reasoning": "<one sentence>"}}"""
+
+    try:
+        result_text = _call_claude(prompt, max_tokens=256)
+        if not result_text:
+            raise ValueError("No response from Claude")
+
+        decision = _parse_json(result_text)
+        if not decision or not isinstance(decision, dict):
+            raise ValueError(f"Could not parse JSON from response: {result_text[:100]}")
+
+        action = decision.get("action", "")
+        if action not in ("close", "hedge", "carry_naked"):
+            raise ValueError(f"Invalid action: {action}")
+
+        result = {
+            "action": action,
+            "reasoning": decision.get("reasoning", "no reasoning provided"),
+        }
+        _save_decision_log("overnight", symbol, prompt, result_text, result)
+        return result
+
+    except Exception as e:
+        logger.warning("evaluate_overnight failed for %s: %s", symbol, e)
+        fallback_action = "hedge" if gain_pct > 0 else "close"
+        fallback = {
+            "action": fallback_action,
+            "reasoning": f"Claude fallback — {fallback_action} (error: {e})",
+        }
+        _save_decision_log("overnight", symbol, prompt if 'prompt' in dir() else "error", str(e), fallback)
+        return fallback
+
+
+# ---------------------------------------------------------------------------
 # TELEGRAM FORMATTING
 # ---------------------------------------------------------------------------
 
