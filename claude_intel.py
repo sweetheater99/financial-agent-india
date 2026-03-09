@@ -275,6 +275,23 @@ def _build_portfolio_context(portfolio: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# CLAUDE FAIL-SAFE — Track failures and activate lockdown
+# ---------------------------------------------------------------------------
+
+def _track_claude_failure(state: dict) -> None:
+    """Track consecutive Claude failures. Lockdown at 5+."""
+    state["claude_consecutive_failures"] = state.get("claude_consecutive_failures", 0) + 1
+    if state["claude_consecutive_failures"] >= 5:
+        state["claude_lockdown_active"] = True
+
+
+def _track_claude_success(state: dict) -> None:
+    """Reset failure counter on successful Claude call."""
+    state["claude_consecutive_failures"] = 0
+    state["claude_lockdown_active"] = False
+
+
+# ---------------------------------------------------------------------------
 # ENTRY EVALUATION — Called before opening ANY position
 # ---------------------------------------------------------------------------
 
@@ -345,6 +362,10 @@ Should I ENTER this trade? Respond with JSON only:
 
     result_text = _call_claude(prompt, max_tokens=512)
     if result_text is None:
+        import config
+        if getattr(config, "V6_CLAUDE_FIRST", False):
+            logger.warning("Claude entry eval unavailable for %s — BLOCKING (V6 fail-safe)", symbol)
+            return (False, "Claude unavailable — blocking entry (fail-safe)", 0.0, {})
         logger.debug("Claude entry eval unavailable for %s — auto-approve", symbol)
         return (True, "", 1.0, {})
 

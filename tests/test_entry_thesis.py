@@ -101,8 +101,9 @@ def test_evaluate_entry_returns_thesis():
 
 
 def test_evaluate_entry_unavailable_returns_empty_thesis():
-    """When Claude is unavailable, evaluate_entry returns empty dict as thesis."""
+    """When Claude is unavailable in V6 mode, evaluate_entry blocks (fail-safe)."""
     from claude_intel import evaluate_entry
+    import config
 
     candidate = {
         "symbol": "INFY",
@@ -119,7 +120,8 @@ def test_evaluate_entry_unavailable_returns_empty_thesis():
         "available_capital": 80_000,
     }
 
-    with patch("claude_intel._call_claude", return_value=None):
+    with patch("claude_intel._call_claude", return_value=None), \
+         patch.object(config, "V6_CLAUDE_FIRST", True):
         result = evaluate_entry(
             candidate, "EQ", "SIDEWAYS", 16.0,
             None, 1.0, 24000, portfolio,
@@ -127,7 +129,7 @@ def test_evaluate_entry_unavailable_returns_empty_thesis():
 
     assert len(result) == 4
     approved, reasoning, adj, thesis = result
-    assert approved is True  # fail-open
+    assert approved is False  # V6 fail-safe blocks entry
     assert thesis == {}
 
 
