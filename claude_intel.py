@@ -10,9 +10,34 @@ Uses Haiku for speed/cost efficiency on the 30-min cron cycle.
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
 logger = logging.getLogger("paper_trade")
+
+DECISION_LOG_DIR = Path("data/paper_trades/claude_decisions")
+
+
+def _save_decision_log(decision_type: str, symbol: str, prompt: str, response: str, parsed: dict, extra: dict = None):
+    """Save Claude decision for replay/debugging."""
+    try:
+        DECISION_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        IST = timezone(timedelta(hours=5, minutes=30))
+        now = datetime.now(IST)
+        filename = f"{now.strftime('%Y-%m-%d_%H-%M')}_{decision_type}_{symbol}.json"
+        data = {
+            "timestamp": now.isoformat(),
+            "type": decision_type,
+            "symbol": symbol,
+            "prompt_sent": prompt,
+            "claude_response": response,
+            "parsed_action": parsed.get("action", ""),
+            **(extra or {}),
+        }
+        (DECISION_LOG_DIR / filename).write_text(json.dumps(data, indent=2, default=str))
+    except Exception as e:
+        logger.debug("Decision log save failed: %s", e)
+
 
 SYSTEM_PROMPT = """You are an expert Indian F&O trader with 15+ years of experience trading Nifty, BankNifty, and stock options/futures on NSE.
 
@@ -278,6 +303,7 @@ Should I ENTER this trade? Respond with JSON only:
         return (True, "", 1.0)
 
     decision = _validate_entry_response(decision)
+    _save_decision_log("entry", candidate.get("symbol", "?"), prompt, result_text, decision)
     action = decision["action"]
     reasoning = decision["reasoning"]
     conviction = decision["conviction"]
@@ -481,6 +507,7 @@ Respond with JSON only:
         return (True, f"Rule-based exit: {exit_reason}")
 
     decision = _validate_exit_response(decision)
+    _save_decision_log("exit", pos.get("symbol", "?"), prompt, result_text, decision)
     action = decision["action"]
     reasoning = decision["reasoning"]
 
