@@ -298,6 +298,120 @@ def execute_carry_naked(pos: dict, current_price: float, reasoning: str) -> dict
 
 
 # ---------------------------------------------------------------------------
+# MORNING UNWIND LOGIC
+# ---------------------------------------------------------------------------
+
+
+def find_positions_with_hedge_legs(positions: list[dict]) -> list[dict]:
+    """Return open positions that have a hedge_leg attached."""
+    return [p for p in positions if p.get("status") == "open" and p.get("hedge_leg")]
+
+
+def calc_hedge_pnl(entry_premium: float, exit_premium: float, quantity: int) -> dict:
+    """Calculate P&L from unwinding a hedge leg.
+
+    Returns {"pnl": float, "label": "hedge_saved"|"insurance_cost"}
+    """
+    pnl = (exit_premium - entry_premium) * quantity
+    label = "hedge_saved" if pnl > 0 else "insurance_cost"
+    return {"pnl": round(pnl, 2), "label": label}
+
+
+def unwind_hedge_legs(smart_api, portfolio: dict) -> list[dict]:
+    """Unwind all hedge legs at market open.
+
+    For each hedged position: get current premium, calc P&L, record history,
+    remove hedge_leg and overnight_carry_approved, send Telegram summary.
+    Returns list of unwind result dicts.
+    """
+    from paper_trade import get_ltp_nfo, resolve_option_contract, _telegram_send
+
+    positions = portfolio.get("positions", [])
+    hedged = find_positions_with_hedge_legs(positions)
+
+    if not hedged:
+        return []
+
+    results = []
+
+    for pos in hedged:
+        hedge = pos["hedge_leg"]
+        symbol = pos.get("symbol", "?")
+        strike = hedge.get("strike", 0)
+        option_type = hedge.get("option_type", "")
+        entry_premium = hedge.get("premium", 0)
+        quantity = hedge.get("quantity", 0)
+
+        # Resolve option contract to get current premium
+        try:
+            contract = resolve_option_contract(smart_api, symbol, strike, pos.get("expiry", ""))
+            if contract:
+                exit_premium = get_ltp_nfo(smart_api, contract["trading_symbol"], contract["token"])
+            else:
+                exit_premium = None
+        except Exception as e:
+            logger.warning("Hedge unwind LTP failed for %s: %s", symbol, e)
+            exit_premium = None
+
+        if exit_premium is None:
+            # Can't get exit price — use entry as fallback (zero P&L)
+            exit_premium = entry_premium
+            logger.warning("Using entry premium as fallback for %s hedge unwind", symbol)
+
+        pnl_result = calc_hedge_pnl(entry_premium, exit_premium, quantity)
+
+        # Record in hedge_pnl_history
+        if "hedge_pnl_history" not in pos:
+            pos["hedge_pnl_history"] = []
+        pos["hedge_pnl_history"].append({
+            "date": datetime.now(IST).strftime("%Y-%m-%d"),
+            "option_type": option_type,
+            "strike": strike,
+            "entry_premium": entry_premium,
+            "exit_premium": exit_premium,
+            "quantity": quantity,
+            **pnl_result,
+        })
+
+        # Remove hedge leg and overnight carry approval
+        del pos["hedge_leg"]
+        pos.pop("overnight_carry_approved", None)
+
+        results.append({
+            "symbol": symbol,
+            "option_type": option_type,
+            "strike": strike,
+            **pnl_result,
+        })
+
+        logger.info(
+            "HEDGE UNWIND %s: %s %s — P&L ₹%.2f (%s)",
+            symbol, option_type, strike, pnl_result["pnl"], pnl_result["label"],
+        )
+
+    # Send Telegram summary
+    if results:
+        lines = ["<b>Morning Hedge Unwind</b>", ""]
+        total_pnl = 0.0
+        for r in results:
+            emoji = "+" if r["pnl"] > 0 else ""
+            lines.append(
+                f"  {r['symbol']} {r['option_type']} {r['strike']}: "
+                f"{emoji}{r['pnl']:.0f} ({r['label']})"
+            )
+            total_pnl += r["pnl"]
+        lines.append("")
+        label = "Net saved" if total_pnl > 0 else "Insurance cost"
+        lines.append(f"<b>{label}: {total_pnl:+,.0f}</b>")
+        try:
+            _telegram_send("\n".join(lines))
+        except Exception as e:
+            logger.error("Telegram send failed for hedge unwind: %s", e)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # TELEGRAM FORMATTING
 # ---------------------------------------------------------------------------
 

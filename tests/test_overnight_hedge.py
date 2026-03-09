@@ -11,11 +11,13 @@ import pytest
 from overnight_hedge import (
     apply_guardrails,
     build_hedge_leg,
+    calc_hedge_pnl,
     check_hedge_cost,
     enforce_carry_naked_threshold,
     execute_carry_naked,
     execute_close,
     execute_hedge,
+    find_positions_with_hedge_legs,
     is_naked_fno,
     parse_overnight_decision,
     tighten_stop_loss,
@@ -225,3 +227,27 @@ class TestTightenStopLoss:
         assert new_sl > 65
         assert new_sl < 160
         assert new_sl == 84.0
+
+
+# ── TestMorningUnwind ─────────────────────────────────────────────────────
+
+
+class TestMorningUnwind:
+    def test_find_positions_with_hedge_legs(self):
+        hedged = _make_position(hedge_leg={"symbol": "NIFTY25300PE", "premium": 45, "quantity": 25})
+        unhedged = _make_position()
+        result = find_positions_with_hedge_legs([hedged, unhedged])
+        assert len(result) == 1
+        assert result[0] is hedged
+
+    def test_calc_hedge_pnl_insurance_cost(self):
+        # Bought at 45, current 30 → lost 15 per unit
+        result = calc_hedge_pnl(entry_premium=45, exit_premium=30, quantity=25)
+        assert result["pnl"] < 0
+        assert result["label"] == "insurance_cost"
+
+    def test_calc_hedge_pnl_hedge_saved(self):
+        # Bought at 45, current 120 → gained 75 per unit
+        result = calc_hedge_pnl(entry_premium=45, exit_premium=120, quantity=25)
+        assert result["pnl"] > 0
+        assert result["label"] == "hedge_saved"

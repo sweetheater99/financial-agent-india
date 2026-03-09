@@ -4920,6 +4920,18 @@ def run_paper_trade(smart_api, mode: str) -> None:
     elif mode == "monitor":
         logger.info("\n=== PAPER TRADE: Monitoring positions ===\n")
 
+        # Unwind overnight hedge legs (morning only, 9:25-9:35 AM)
+        now_ist = datetime.now(IST)
+        if now_ist.hour == 9 and 25 <= now_ist.minute <= 35:
+            try:
+                from overnight_hedge import unwind_hedge_legs
+                unwind_results = unwind_hedge_legs(smart_api, portfolio)
+                if unwind_results:
+                    save_portfolio(portfolio)
+                    logger.info("Morning hedge unwind: %d legs closed", len(unwind_results))
+            except Exception as e:
+                logger.warning("Morning hedge unwind failed: %s", e)
+
         # Smart Monitor: sector correlation check + Nifty session tracking
         try:
             from smart_monitor import (check_sector_correlation, should_send_hourly_digest,
