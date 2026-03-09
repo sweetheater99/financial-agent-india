@@ -63,6 +63,20 @@ PUT_STOPLOSS_PCT = -40.0    # -40% premium loss
 MIN_DTE_TO_OPEN = 3         # don't open puts with < 3 days to expiry
 MIN_DTE_TO_HOLD = 2         # force exit if < 2 days to expiry
 
+# Futures trading (V8 — seasoned F&O trader rules)
+FUT_MARGIN_PCT = 0.15           # ~15% SPAN+exposure margin for stock futures
+FUT_STT_PCT = 0.0005            # 0.05% sell side only (Apr 2026 rate)
+FUT_EXCHANGE_PCT = 0.0019 / 100
+FUT_STAMP_DUTY_PCT = 0.002 / 100
+FUT_SEBI_PCT = 0.000001
+FUT_SLIPPAGE_PCT = 0.0005
+FUT_TARGET_ATR_MULT = 1.5      # tight target — V8 param sweep
+FUT_SL_ATR_MULT = 3.5          # wide SL — V8 param sweep
+FUT_RISK_PER_TRADE_PCT = 2.0   # max 2% of capital at risk per futures trade
+FUT_MIN_SCORE = 4.5            # higher threshold for futures (leveraged = need more conviction)
+MAX_FUT_POSITIONS = 3           # max concurrent futures positions (leveraged — fewer is safer)
+FUT_OI_CONFIRMATION = True      # require OI buildup alignment for futures entry
+
 IST = timezone(timedelta(hours=5, minutes=30))
 
 # --- Transaction Cost Rates (AngelOne) ---
@@ -144,8 +158,9 @@ OPT_TRAILING_STOP_PCT = 25.0        # -25% from peak premium for options
 
 # --- ATR-Based Exits (equity only) ---
 ATR_PERIOD = 14
-ATR_TARGET_MULTIPLIER = 2.0     # target = entry + 2.0*ATR — tuned via param sweep
-ATR_STOPLOSS_MULTIPLIER = 2.0   # SL = entry - 2.0*ATR — wider SL reduces premature exits
+ATR_TARGET_MULTIPLIER = 1.5     # target = entry + 1.5*ATR — V8 param sweep (tight target, wide SL)
+ATR_STOPLOSS_MULTIPLIER = 3.5   # SL = entry - 3.5*ATR — V8 param sweep (wide SL reduces premature exits)
+MAX_EQUITY_POSITIONS = 5        # V8: max concurrent equity positions (portfolio risk control)
 
 # --- Option Theta Awareness ---
 OPT_THETA_DTE_THRESHOLD = 5     # DTE cutoff
@@ -311,8 +326,10 @@ def _telegram_notify_exit(pos: dict, reason: str, pnl: float, pnl_pct: float,
         held_days = (today_dt - entry_dt).days
     except Exception:
         held_days = 0
+    instr = pos.get("instrument", "EQ")
+    instr_suffix = f" ({instr})" if instr != "EQ" else ""
     lines = [
-        f"{emoji} <b>Paper Trade Exit: {pos['symbol']}</b>",
+        f"{emoji} <b>Paper Trade Exit: {pos['symbol']}{instr_suffix}</b>",
         f"  Reason: {reason_label}",
         f"  P&amp;L: {pnl_pct:+.1f}% (₹{pnl:+,.0f})",
         f"  Entry: ₹{pos['entry_price']:,.2f} → Exit: ₹{exit_price:,.2f}",
@@ -429,10 +446,15 @@ def apply_slippage(price: float, instrument: str, side: str) -> float:
     """
     Apply slippage to a price. Buys get worse (higher), sells get worse (lower).
 
-    instrument: "EQ" or "OPT"
+    instrument: "EQ", "OPT", or "FUT"
     side: "buy" or "sell"
     """
-    pct = OPT_SLIPPAGE_PCT if instrument == "OPT" else EQ_SLIPPAGE_PCT
+    if instrument == "OPT":
+        pct = OPT_SLIPPAGE_PCT
+    elif instrument == "FUT":
+        pct = FUT_SLIPPAGE_PCT
+    else:
+        pct = EQ_SLIPPAGE_PCT
     if side == "buy":
         return round(price * (1 + pct), 2)
     else:
@@ -510,16 +532,34 @@ def _empty_portfolio() -> dict:
 
 
 def load_portfolio() -> dict:
-    """Load portfolio from JSON, or create a fresh one."""
-    if PORTFOLIO_FILE.exists():
-        return json.loads(PORTFOLIO_FILE.read_text())
+    """Load portfolio from JSON, or create a fresh one.
+
+    Falls back to .bak if main file is corrupt; returns empty portfolio if both fail.
+    """
+    bak = PORTFOLIO_FILE.with_suffix(".json.bak")
+    for path in (PORTFOLIO_FILE, bak):
+        if path.exists():
+            try:
+                return json.loads(path.read_text())
+            except (json.JSONDecodeError, OSError):
+                logger.warning("Corrupt portfolio file: %s — trying next", path)
     return _empty_portfolio()
 
 
 def save_portfolio(portfolio: dict) -> None:
-    """Persist portfolio state to disk."""
+    """Persist portfolio state to disk with backup + atomic write."""
+    import shutil
+
     PORTFOLIO_DIR.mkdir(parents=True, exist_ok=True)
-    PORTFOLIO_FILE.write_text(json.dumps(portfolio, indent=2, default=str))
+
+    # Backup existing file before overwriting
+    if PORTFOLIO_FILE.exists():
+        shutil.copy2(PORTFOLIO_FILE, PORTFOLIO_FILE.with_suffix(".json.bak"))
+
+    # Atomic write: write to .tmp, then rename
+    tmp = PORTFOLIO_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(portfolio, indent=2, default=str))
+    tmp.replace(PORTFOLIO_FILE)
 
 
 # ---------------------------------------------------------------------------
@@ -679,6 +719,158 @@ def resolve_option_contract(smart_api, symbol: str, strike: float, expiry: str) 
     except Exception as e:
         logger.warning("searchScrip NFO failed for %s: %s", query, e)
     return None
+
+
+def resolve_futures_contract(smart_api, symbol: str) -> dict | None:
+    """Resolve a stock futures contract via searchScrip.
+
+    Searches for the nearest month futures contract.
+    Returns {trading_symbol, token, lot_size, expiry} or None.
+    """
+    # Search for FUT contracts
+    query = f"{symbol}FUT"
+    try:
+        resp = smart_api.searchScrip("NFO", query)
+        if resp and resp.get("data"):
+            # Filter for FUT contracts, pick nearest expiry
+            fut_matches = []
+            for match in resp["data"]:
+                tsym = match.get("tradingsymbol", "")
+                if "FUT" in tsym.upper():
+                    fut_matches.append({
+                        "trading_symbol": tsym,
+                        "token": match["symboltoken"],
+                        "lot_size": int(match.get("lotsize", 1)),
+                        "expiry": match.get("expiry", ""),
+                    })
+            if fut_matches:
+                # Sort by expiry, pick nearest
+                fut_matches.sort(key=lambda x: x["expiry"])
+                return fut_matches[0]
+    except Exception as e:
+        logger.warning("searchScrip NFO FUT failed for %s: %s", symbol, e)
+    return None
+
+
+def _calc_fut_costs(entry_price: float, exit_price: float, quantity: int) -> float:
+    """Calculate futures round-trip transaction costs (Apr 2026 rates)."""
+    entry_turnover = entry_price * quantity
+    exit_turnover = exit_price * quantity
+
+    # Buy side
+    buy_brokerage = min(BROKERAGE_FLAT, entry_turnover * 0.0003)
+    buy_stamp = entry_turnover * FUT_STAMP_DUTY_PCT
+    buy_exchange = entry_turnover * FUT_EXCHANGE_PCT
+    buy_sebi = entry_turnover * FUT_SEBI_PCT
+
+    # Sell side (STT on sell only)
+    sell_brokerage = min(BROKERAGE_FLAT, exit_turnover * 0.0003)
+    sell_stt = exit_turnover * FUT_STT_PCT
+    sell_exchange = exit_turnover * FUT_EXCHANGE_PCT
+    sell_sebi = exit_turnover * FUT_SEBI_PCT
+
+    total_brokerage = buy_brokerage + sell_brokerage
+    total_exchange = buy_exchange + sell_exchange
+    gst = (total_brokerage + total_exchange) * GST_PCT
+
+    return round(total_brokerage + sell_stt + buy_stamp + total_exchange +
+                 buy_sebi + sell_sebi + gst, 2)
+
+
+def _open_futures_position(smart_api, symbol: str, eq_token: str, spot_price: float,
+                           allocation: float, alloc: dict, atr: float,
+                           direction: str = "bullish") -> dict | None:
+    """Open a stock futures position.
+
+    Seasoned F&O trader rules applied:
+    - Risk-based sizing: max loss (SL distance × qty) ≤ 2% of total capital
+    - OI confirmation required: Long Buildup for longs, Short Buildup for shorts
+    - Higher score threshold (4.5) for leveraged instruments
+    - ATR-based target/SL from V8 param sweep
+    """
+    # 1. Resolve futures contract
+    contract = resolve_futures_contract(smart_api, symbol)
+    time.sleep(config.API_DELAY)
+    if not contract:
+        logger.info("SKIP FUT %s: could not resolve futures contract", symbol)
+        return None
+
+    lot_size = contract["lot_size"]
+    logger.info("  %s FUT: %s (lot=%d, expiry=%s)",
+                symbol, contract["trading_symbol"], lot_size, contract.get("expiry", "?"))
+
+    # 2. Get futures LTP
+    fut_ltp = get_ltp_nfo(smart_api, contract["trading_symbol"], contract["token"])
+    time.sleep(config.API_DELAY)
+    if not fut_ltp or fut_ltp <= 0:
+        logger.info("SKIP FUT %s: no LTP available", symbol)
+        return None
+
+    # 3. Risk-based position sizing
+    # Max loss per trade = FUT_RISK_PER_TRADE_PCT% of total capital
+    max_loss = TOTAL_CAPITAL * (FUT_RISK_PER_TRADE_PCT / 100)
+    sl_distance = FUT_SL_ATR_MULT * atr
+
+    if sl_distance <= 0:
+        logger.info("SKIP FUT %s: zero ATR/SL distance", symbol)
+        return None
+
+    # Lots based on risk
+    risk_qty = int(max_loss / sl_distance)
+    risk_lots = max(1, risk_qty // lot_size)
+
+    # Also check margin requirement doesn't exceed allocation
+    margin_per_lot = fut_ltp * lot_size * FUT_MARGIN_PCT
+    margin_lots = max(1, int(allocation / margin_per_lot))
+
+    num_lots = min(risk_lots, margin_lots)
+    quantity = num_lots * lot_size
+    margin_required = round(fut_ltp * quantity * FUT_MARGIN_PCT, 2)
+
+    # Apply slippage
+    if direction == "bullish":
+        entry_price = round(fut_ltp * (1 + FUT_SLIPPAGE_PCT), 2)
+        target_price = round(entry_price + FUT_TARGET_ATR_MULT * atr, 2)
+        stoploss_price = round(entry_price - FUT_SL_ATR_MULT * atr, 2)
+    else:
+        entry_price = round(fut_ltp * (1 - FUT_SLIPPAGE_PCT), 2)
+        target_price = round(entry_price - FUT_TARGET_ATR_MULT * atr, 2)
+        stoploss_price = round(entry_price + FUT_SL_ATR_MULT * atr, 2)
+
+    today = _today_ist()
+    max_hold_date = _add_trading_days(today, MAX_HOLD_DAYS)
+
+    position = {
+        "symbol": symbol,
+        "token": contract["token"],
+        "direction": direction,
+        "instrument": "FUT",
+        "contract_symbol": contract["trading_symbol"],
+        "lot_size": lot_size,
+        "num_lots": num_lots,
+        "entry_price": entry_price,
+        "ltp_at_entry": fut_ltp,
+        "quantity": quantity,
+        "allocated": margin_required,
+        "margin_required": margin_required,
+        "underlying_price_at_entry": spot_price,
+        "atr_at_entry": round(atr, 2),
+        "target_price": target_price,
+        "stoploss_price": stoploss_price,
+        "peak_price": entry_price,
+        "score": alloc["score"],
+        "categories": alloc.get("categories", []),
+        "entry_date": today,
+        "max_hold_date": max_hold_date,
+        "expiry": contract.get("expiry", ""),
+        "status": "open",
+    }
+
+    logger.info("OPENED FUT %s %s x%dlot (%dqty) @ ₹%.2f | T=₹%.2f SL=₹%.2f | Margin=₹%.0f | ATR=%.2f",
+                direction.upper(), symbol, num_lots, quantity,
+                entry_price, target_price, stoploss_price, margin_required, atr)
+
+    return position
 
 
 def _open_put_position(smart_api, symbol: str, eq_token: str, spot_price: float,
@@ -1424,6 +1616,34 @@ def _today_ist() -> str:
     return datetime.now(IST).strftime("%Y-%m-%d")
 
 
+def _compute_weekly_pnl(portfolio: dict) -> float:
+    """Compute realized P&L from trades closed this week (Mon-Sun)."""
+    today = datetime.now(IST).date()
+    # Start of current week (Monday)
+    week_start = today - timedelta(days=today.weekday())
+    week_start_str = week_start.strftime("%Y-%m-%d")
+
+    weekly_realized = 0.0
+    for trade in portfolio.get("closed_trades", []):
+        exit_date = trade.get("exit_date", "")
+        if exit_date >= week_start_str:
+            weekly_realized += trade.get("pnl", 0)
+
+    # Add unrealized P&L from open positions
+    weekly_unrealized = 0.0
+    for pos in portfolio.get("positions", []):
+        if pos.get("status") != "open":
+            continue
+        qty = abs(pos["quantity"])
+        peak = pos.get("peak_price", pos.get("ltp_at_entry", pos["entry_price"]))
+        if pos["direction"] == "bullish":
+            weekly_unrealized += (peak - pos["entry_price"]) * qty
+        else:
+            weekly_unrealized += (pos["entry_price"] - peak) * qty
+
+    return round(weekly_realized + weekly_unrealized, 2)
+
+
 def _trading_days_between(start_date: str, end_date: str) -> int:
     """Count trading days (weekdays) between two dates, inclusive of both."""
     start = datetime.strptime(start_date, "%Y-%m-%d")
@@ -1728,6 +1948,23 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
         _telegram_send(f"<b>Risk Guardrail</b>\n{dl_reason}")
         return 0
 
+    # --- Smart Monitor: circuit breaker (3% daily realized loss) ---
+    try:
+        from smart_monitor import check_circuit_breaker, _load_state, _save_state
+        sm_state = _load_state()
+        if check_circuit_breaker(portfolio, sm_state):
+            _save_state(sm_state)
+            msg = (f"<b>⚡ Circuit Breaker Active</b>\n"
+                   f"Daily realized loss: ₹{sm_state['daily_realized_loss']:,.0f} "
+                   f"(>{config.DAILY_LOSS_CIRCUIT_BREAKER_PCT}% of capital)\n"
+                   f"No new entries until tomorrow.")
+            logger.warning("CIRCUIT BREAKER: blocking new entries")
+            _telegram_send(msg)
+            return 0
+        _save_state(sm_state)
+    except Exception as e:
+        logger.debug("Smart monitor circuit breaker check failed: %s", e)
+
     size_mult = rm.get_size_multiplier()
     risk_state = rm.get_risk_state()
 
@@ -1739,6 +1976,18 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
     nifty_candles = fetch_daily_candles(smart_api, NIFTY_TOKEN, days=50)
     vix_ltp = get_ltp(smart_api, "India VIX", VIX_TOKEN)
     time.sleep(config.API_DELAY)
+
+    # Fallback: fetch VIX from yfinance if SmartAPI token is stale
+    if vix_ltp is None:
+        try:
+            import yfinance as yf
+            vix_ticker = yf.Ticker("^INDIAVIX")
+            vix_hist = vix_ticker.history(period="1d")
+            if not vix_hist.empty:
+                vix_ltp = float(vix_hist["Close"].iloc[-1])
+                logger.info("VIX from yfinance fallback: %.2f", vix_ltp)
+        except Exception as e:
+            logger.warning("VIX yfinance fallback failed: %s", e)
 
     regime_result = None
     iv_percentile = 50  # default
@@ -1762,6 +2011,25 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
         return 0
 
     available_capital = portfolio["available_capital"]
+
+    # V9: PR Sundar's 40% cash reserve — never deploy more than 60% of total capital
+    deployed_capital = TOTAL_CAPITAL - portfolio["available_capital"]
+    max_deployable = TOTAL_CAPITAL * (1 - config.CASH_RESERVE_PCT)
+    if deployed_capital >= max_deployable:
+        logger.info("CASH RESERVE: Already deployed ₹%.0f / ₹%.0f max (%.0f%% reserve enforced). No new positions.",
+                    deployed_capital, max_deployable, config.CASH_RESERVE_PCT * 100)
+        return 0
+    # Cap available capital to stay within reserve
+    available_capital = min(available_capital, round(max_deployable - deployed_capital, 2))
+
+    # V9: Weekly portfolio stop — if weekly realized+unrealized loss > 4%, stop all entries
+    weekly_pnl = _compute_weekly_pnl(portfolio)
+    weekly_pnl_pct = weekly_pnl / TOTAL_CAPITAL * 100
+    if weekly_pnl_pct <= -(config.WEEKLY_PORTFOLIO_SL_PCT * 100):
+        logger.warning("WEEKLY PORTFOLIO SL: Weekly P&L %.1f%% exceeds -%.0f%% limit. No new positions.",
+                       weekly_pnl_pct, config.WEEKLY_PORTFOLIO_SL_PCT * 100)
+        _telegram_send(f"<b>Weekly Portfolio SL Hit</b>\nWeekly P&amp;L: {weekly_pnl_pct:+.1f}% (₹{weekly_pnl:+,.0f})\nNo new entries until next week.")
+        return 0
 
     # Apply size multiplier from risk manager (weekly drawdown)
     if size_mult < 1.0:
@@ -1877,6 +2145,16 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
     # --- V4 Unusual OI (per-stock, applied in allocation loop) ---
     # Will be checked per-candidate below using existing option chain data
 
+    # V8: Max concurrent equity position check
+    open_equity = [p for p in portfolio["positions"]
+                   if p["status"] == "open" and p.get("instrument", "EQ") == "EQ"]
+    if len(open_equity) >= MAX_EQUITY_POSITIONS:
+        logger.info("MAX EQUITY POSITIONS (%d) reached — skipping new equity entries.", MAX_EQUITY_POSITIONS)
+        # Still allow options/spreads, filter out equity-only candidates
+        candidates = [c for c in candidates if c.get("instrument_hint") in ("PUT", "SPREAD", "CONDOR")]
+        if not candidates:
+            return 0
+
     # Filter out stocks already held
     open_symbols = {p["symbol"] for p in portfolio["positions"] if p["status"] == "open"}
     eligible = [c for c in candidates if c["symbol"] not in open_symbols]
@@ -1942,6 +2220,34 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
             logger.info("SKIP %s: volume ratio %.2f < %.1f minimum",
                         symbol, vol_ratio, VOLUME_MIN_RATIO)
             continue
+
+        # V9: PCR contrarian filter (Nitin Murarka)
+        if config.PCR_FILTER_ENABLED and pcr > 0:
+            if direction == "bullish" and pcr < config.PCR_BEARISH_CONTRARIAN:
+                # PCR < 0.7 = too many calls, market likely topping → skip bullish
+                logger.info("SKIP %s: PCR %.2f < %.1f (bearish extreme — skip bullish)", symbol, pcr, config.PCR_BEARISH_CONTRARIAN)
+                continue
+            if direction == "bearish" and pcr > config.PCR_BULLISH_CONTRARIAN:
+                # PCR > 1.3 = too many puts, market likely bottoming → skip bearish
+                logger.info("SKIP %s: PCR %.2f > %.1f (bullish extreme — skip bearish)", symbol, pcr, config.PCR_BULLISH_CONTRARIAN)
+                continue
+
+        # V9: Max pain gravity near expiry
+        if config.MAX_PAIN_FILTER_ENABLED and max_pain > 0 and nifty_candles:
+            nifty_ltp_current = float(nifty_candles[-1][4])
+            distance_from_mp = abs(nifty_ltp_current - max_pain) / nifty_ltp_current * 100
+            if distance_from_mp > config.MAX_PAIN_PROXIMITY_PCT:
+                # Price is far from max pain — near expiry, price tends to gravitate toward it
+                if direction == "bullish" and nifty_ltp_current > max_pain:
+                    # Bullish but price is above max pain — gravity will pull down
+                    c["allocation_multiplier"] = c.get("allocation_multiplier", 1.0) * 0.75
+                    logger.info("%s: Price %.0f > max pain %.0f by %.1f%% — reducing bullish allocation 25%%",
+                               symbol, nifty_ltp_current, max_pain, distance_from_mp)
+                elif direction == "bearish" and nifty_ltp_current < max_pain:
+                    # Bearish but price is below max pain — gravity will pull up
+                    c["allocation_multiplier"] = c.get("allocation_multiplier", 1.0) * 0.75
+                    logger.info("%s: Price %.0f < max pain %.0f by %.1f%% — reducing bearish allocation 25%%",
+                               symbol, nifty_ltp_current, max_pain, distance_from_mp)
 
         # News / earnings filter
         if news is not None:
@@ -2017,7 +2323,44 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
 
     if not quality_filtered:
         logger.info("No candidates after quality filters (RSI/volume/news).")
+        # Send Telegram summary even when no candidates
+        try:
+            from claude_intel import generate_cron_summary
+            skip_reasons = [f"{c['symbol']}({c.get('skip_reason', '?')})" for c in candidates[:3]]
+            summary = generate_cron_summary("open", portfolio, regime=regime, vix=vix_ltp, skipped_reasons=skip_reasons)
+            _telegram_send(summary)
+        except Exception:
+            pass
         return 0
+
+    # --- Claude Intelligence: evaluate candidates before trading ---
+    try:
+        from claude_intel import evaluate_candidates
+        nifty_ltp_current = get_ltp(smart_api, "Nifty 50", NIFTY_TOKEN) if smart_api else None
+        claude_approved = evaluate_candidates(
+            quality_filtered,
+            regime=regime,
+            regime_confidence=regime_result.get("confidence", 0.5),
+            vix=vix_ltp,
+            macro=macro,
+            pcr=pcr,
+            max_pain=max_pain,
+            portfolio=portfolio,
+            nifty_ltp=nifty_ltp_current,
+        )
+        if not claude_approved:
+            logger.info("Claude intel: no candidates approved.")
+            try:
+                from claude_intel import generate_cron_summary
+                summary = generate_cron_summary("open", portfolio, regime=regime, vix=vix_ltp,
+                                                skipped_reasons=["Claude rejected all"])
+                _telegram_send(summary)
+            except Exception:
+                pass
+            return 0
+        quality_filtered = claude_approved
+    except Exception as e:
+        logger.debug("Claude intel unavailable: %s — using rule-based candidates", e)
 
     top = quality_filtered[:TOP_N]
     allocations = compute_allocations(top, available_capital)
@@ -2033,6 +2376,12 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
 
         # V4: Apply allocation_multiplier from Supertrend disagreement
         allocation = round(allocation * alloc.get("allocation_multiplier", 1.0), 2)
+
+        # V10: Apply Claude intelligence allocation adjustment
+        claude_adj = alloc.get("claude_allocation_adj", 1.0)
+        if claude_adj != 1.0:
+            allocation = round(allocation * claude_adj, 2)
+            logger.info("  %s: Claude adj %.1fx → ₹%.0f", symbol, claude_adj, allocation)
 
         # V4: Sector rotation adjustment
         if sector_rotation and sector != "Other":
@@ -2140,6 +2489,87 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
             except Exception:
                 pass  # fail-open if ban check unavailable
 
+        # --- V8: Futures path (high-conviction + OI confirmation) ---
+        # Check if this candidate qualifies for futures trading
+        open_fut = [p for p in portfolio["positions"]
+                    if p["status"] == "open" and p.get("instrument") == "FUT"]
+        fut_eligible = (
+            alloc["score"] >= FUT_MIN_SCORE
+            and len(open_fut) < MAX_FUT_POSITIONS
+            and regime not in ("CASH", "SIDEWAYS", "UNCERTAIN")
+            and vix_ltp is not None and vix_ltp < VIX_HIGH_THRESHOLD
+        )
+
+        # OI confirmation check: require matching buildup pattern
+        if fut_eligible and FUT_OI_CONFIRMATION:
+            cats = alloc.get("categories", [])
+            if direction == "bullish":
+                fut_eligible = "LongBuildUp" in cats or "PercOIGainers" in cats
+            elif direction == "bearish":
+                fut_eligible = "ShortBuildUp" in cats or "PercOILosers" in cats
+
+        # F&O ban check for futures
+        if fut_eligible:
+            try:
+                from fo_ban import is_in_fo_ban
+                if is_in_fo_ban(symbol):
+                    logger.info("SKIP FUT %s: F&O ban active", symbol)
+                    fut_eligible = False
+            except Exception:
+                pass
+
+        if fut_eligible:
+            # Fetch ATR for futures sizing
+            candles = fetch_daily_candles(smart_api, token)
+            time.sleep(config.API_DELAY)
+            atr_for_fut = compute_atr(candles, ATR_PERIOD) if candles else None
+
+            if atr_for_fut and atr_for_fut > 0:
+                fut_alloc = min(allocation, TOTAL_CAPITAL * 0.20)  # max 20% of capital per futures trade
+                fut_pos = _open_futures_position(
+                    smart_api, symbol, token, ltp, fut_alloc, alloc,
+                    atr_for_fut, direction=direction
+                )
+                if fut_pos:
+                    fut_pos["market_regime"] = regime
+                    fut_pos["iv_percentile"] = iv_percentile
+                    if alloc.get("claude_reasoning"):
+                        fut_pos["claude_reasoning"] = alloc["claude_reasoning"]
+                        fut_pos["claude_conviction"] = alloc.get("claude_conviction", "")
+                    position = fut_pos
+                    # Skip equity/options for this symbol since we're in futures
+                    portfolio["positions"].append(position)
+                    portfolio["available_capital"] = round(
+                        portfolio["available_capital"] - position["allocated"], 2)
+                    opened += 1
+                    logger.info("FUT position opened for %s — skipping equity/options path", symbol)
+
+                    # Journal + live execution (same as equity path below)
+                    if config.LIVE_MODE:
+                        try:
+                            from live_execution import execute_live_entry
+                            execute_live_entry(smart_api, position)
+                        except Exception as e:
+                            logger.error("Live FUT entry failed for %s: %s", symbol, e)
+                    try:
+                        from journal import record_entry
+                        record_entry(
+                            symbol=symbol, direction=direction,
+                            instrument="FUT",
+                            entry_price=position["entry_price"],
+                            entry_date=today,
+                            signals={"categories": alloc.get("categories", [])},
+                            regime=regime,
+                            macro_gate=macro.get("hard_gate", "NONE") if macro else "",
+                            supertrend=supertrend_signal,
+                            pcr=pcr,
+                            breadth=breadth.get("signal", "") if breadth else "",
+                            sector_rotation=(sector_rotation.get("top_sector", "") if sector_rotation else ""),
+                        )
+                    except Exception:
+                        pass
+                    continue  # next candidate
+
         if direction == "bearish":
             # --- Bearish path: spread if low IV, else put ---
             if iv_percentile < 70:
@@ -2165,6 +2595,9 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
                     continue
             position["market_regime"] = regime
             position["iv_percentile"] = iv_percentile
+            if alloc.get("claude_reasoning"):
+                position["claude_reasoning"] = alloc["claude_reasoning"]
+                position["claude_conviction"] = alloc.get("claude_conviction", "")
         else:
             # --- Equity buy path ---
             entry_price = apply_slippage(ltp, "EQ", "buy")
@@ -2231,6 +2664,10 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
                 "max_hold_date": max_hold_date,
                 "status": "open",
             }
+            # Store Claude intel from batch eval
+            if alloc.get("claude_reasoning"):
+                position["claude_reasoning"] = alloc["claude_reasoning"]
+                position["claude_conviction"] = alloc.get("claude_conviction", "")
 
             logger.info("OPENED %s BUY x%d @ ₹%.2f (slipped from ₹%.2f, ₹%.0f, score=%.1f)",
                         symbol, quantity, entry_price, ltp, actual_allocated, alloc['score'])
@@ -2293,7 +2730,7 @@ def calc_transaction_costs(instrument: str, side: str, price: float, quantity: i
     """
     Calculate transaction costs for one leg (buy or sell).
 
-    instrument: "EQ" or "OPT"
+    instrument: "EQ", "OPT", or "FUT"
     side: "buy" or "sell"
     Returns: {"brokerage", "stt", "exchange", "stamp_duty", "sebi", "gst", "total"}
     """
@@ -2305,6 +2742,12 @@ def calc_transaction_costs(instrument: str, side: str, price: float, quantity: i
         exchange = turnover * OPT_EXCHANGE_PCT
         stamp_duty = turnover * OPT_STAMP_DUTY_PCT if side == "buy" else 0.0
         sebi = turnover * OPT_SEBI_PCT
+    elif instrument == "FUT":
+        brokerage = min(BROKERAGE_FLAT, turnover * 0.0003)
+        stt = turnover * FUT_STT_PCT if side == "sell" else 0.0
+        exchange = turnover * FUT_EXCHANGE_PCT
+        stamp_duty = turnover * FUT_STAMP_DUTY_PCT if side == "buy" else 0.0
+        sebi = turnover * FUT_SEBI_PCT
     else:
         # Equity delivery: brokerage is min(₹20, 0.03% of turnover)
         brokerage = min(BROKERAGE_FLAT, turnover * 0.0003)
@@ -2437,7 +2880,17 @@ def close_position(portfolio: dict, pos: dict, exit_price: float, reason: str,
                     "manual": "Manual close"}.get(reason, reason)
     _notify("Paper Trade Exit",
             f"{pos['symbol']} {reason_label}: {pnl_pct:+.1f}% (₹{emoji}{pnl:,.0f})")
-    _telegram_notify_exit(pos, reason, pnl, pnl_pct, exit_price, portfolio)
+    # Rich Telegram exit notification with Claude reasoning
+    try:
+        from claude_intel import format_exit_telegram
+        exit_msg = format_exit_telegram(
+            pos, reason, pnl, pnl_pct, exit_price,
+            pos.get("_claude_exit_reasoning", ""),
+            portfolio,
+        )
+        _telegram_send(exit_msg)
+    except Exception:
+        _telegram_notify_exit(pos, reason, pnl, pnl_pct, exit_price, portfolio)
 
     # Live execution bridge: place real exit order if LIVE_MODE is on
     if config.LIVE_MODE and smart_api is not None:
@@ -2464,6 +2917,22 @@ def close_position(portfolio: dict, pos: dict, exit_price: float, reason: str,
         )
     except Exception:
         pass
+
+    # Smart Monitor: Claude post-trade review → extract lesson
+    try:
+        from smart_monitor import record_trade_lesson
+        record_trade_lesson(pos, closed, portfolio)
+    except Exception as e:
+        logger.debug("Trade lesson recording failed: %s", e)
+
+    # Clean up closed symbols from monitor state
+    try:
+        from smart_monitor import cleanup_closed_positions, _load_state, _save_state
+        state = _load_state()
+        cleanup_closed_positions(portfolio, state)
+        _save_state(state)
+    except Exception as e:
+        logger.debug("State cleanup failed: %s", e)
 
     return closed
 
@@ -2513,6 +2982,7 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
     for pos in open_pos:
         symbol = pos["symbol"]
         is_option = pos.get("instrument") == "OPT"
+        is_futures = pos.get("instrument") == "FUT"
         is_spread = pos.get("instrument") == "SPREAD"
 
         if is_spread:
@@ -2539,6 +3009,20 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
                 )
                 exit_price = underlying_ltp  # track underlying for reference
                 pnl_pct = (spread_pnl / pos["allocated"]) * 100 if pos["allocated"] > 0 else 0
+
+                # Claude exit eval for spread
+                try:
+                    from claude_intel import evaluate_exit
+                    should_exit, exit_reasoning = evaluate_exit(
+                        pos, exit_reason, underlying_ltp, spread_pnl, pnl_pct, portfolio)
+                    if not should_exit:
+                        logger.info("CLAUDE HOLD %s spread: overriding %s — %s", symbol, exit_reason, exit_reasoning)
+                        unrealized_pnl += spread_pnl
+                        continue
+                    pos["_claude_exit_reasoning"] = exit_reasoning
+                except Exception as e:
+                    logger.debug("Claude exit eval failed for spread %s: %s", symbol, e)
+
                 logger.info("EXIT %s spread (%s): P&L ₹%.0f (%.1f%%), reason=%s",
                             symbol, pos.get("strategy", ""), spread_pnl, pnl_pct, exit_reason)
                 close_position(portfolio, pos, exit_price, exit_reason, smart_api=smart_api)
@@ -2598,14 +3082,68 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
             condor_pnl = pos["net_credit"] - cost_to_close
             pnl_pct = (condor_pnl / pos["allocated"]) * 100 if pos["allocated"] > 0 else 0
 
+            # V9: Monthly condor SL cap — if monthly loss exceeds cap, force exit
+            if (exit_reason is None and pos.get("strategy") == "monthly_condor"
+                    and condor_pnl < 0):
+                monthly_sl_cap = pos.get("monthly_sl_cap", TOTAL_CAPITAL * 0.04)
+                if abs(condor_pnl) >= monthly_sl_cap:
+                    exit_reason = "monthly_sl_cap"
+                    logger.warning("MONTHLY CONDOR SL CAP: loss ₹%.0f >= cap ₹%.0f", abs(condor_pnl), monthly_sl_cap)
+
             if exit_reason:
-                logger.info("EXIT NIFTY condor: P&L ₹%.0f (%.1f%%), reason=%s",
-                            condor_pnl, pnl_pct, exit_reason)
+                # Claude exit eval for condor
+                try:
+                    from claude_intel import evaluate_exit
+                    should_exit, exit_reasoning = evaluate_exit(
+                        pos, exit_reason, underlying_ltp, condor_pnl, pnl_pct, portfolio, vix=current_vix)
+                    if not should_exit:
+                        logger.info("CLAUDE HOLD %s condor: overriding %s — %s",
+                                    pos.get("index_name", "NIFTY"), exit_reason, exit_reasoning)
+                        unrealized_pnl += condor_pnl
+                        continue
+                    pos["_claude_exit_reasoning"] = exit_reasoning
+                except Exception as e:
+                    logger.debug("Claude exit eval failed for condor: %s", e)
+
+                logger.info("EXIT %s condor: P&L ₹%.0f (%.1f%%), reason=%s",
+                            pos.get("index_name", "NIFTY"), condor_pnl, pnl_pct, exit_reason)
                 close_position(portfolio, pos, underlying_ltp, exit_reason, smart_api=smart_api)
                 exits += 1
             else:
+                # V9: Dynamic hedge tightening (Reyaansh)
+                if config.HEDGE_TIGHTEN_ENABLED:
+                    idx_name = pos.get("index_name", "NIFTY")
+                    closer_pts = (config.HEDGE_TIGHTEN_CLOSER_POINTS_NIFTY
+                                  if idx_name == "NIFTY"
+                                  else config.HEDGE_TIGHTEN_CLOSER_POINTS_BANKNIFTY)
+
+                    # Check call hedge (long call) — has it decayed significantly?
+                    cl_entry = pos["call_long"].get("entry_premium", 0)
+                    if cl_entry > 0 and call_long_prem <= cl_entry * config.HEDGE_TIGHTEN_THRESHOLD_PCT:
+                        # Hedge has decayed to 40% of entry — simulate tightening
+                        old_strike = pos["call_long"].get("strike", 0)
+                        new_strike = old_strike - closer_pts
+                        logger.info("HEDGE TIGHTEN %s call: ₹%.0f → moved %dpt closer (strike %d→%d)",
+                                    idx_name, call_long_prem, closer_pts, old_strike, new_strike)
+                        pos["call_long"]["strike"] = new_strike
+                        pos["call_long"]["entry_premium"] = call_long_prem  # reset entry to current
+                        pos["_hedge_tightened_call"] = True
+
+                    # Check put hedge (long put)
+                    pl_entry = pos["put_long"].get("entry_premium", 0)
+                    if pl_entry > 0 and put_long_prem <= pl_entry * config.HEDGE_TIGHTEN_THRESHOLD_PCT:
+                        old_strike = pos["put_long"].get("strike", 0)
+                        new_strike = old_strike + closer_pts
+                        logger.info("HEDGE TIGHTEN %s put: ₹%.0f → moved %dpt closer (strike %d→%d)",
+                                    idx_name, put_long_prem, closer_pts, old_strike, new_strike)
+                        pos["put_long"]["strike"] = new_strike
+                        pos["put_long"]["entry_premium"] = put_long_prem
+                        pos["_hedge_tightened_put"] = True
+
                 unrealized_pnl += condor_pnl
-                logger.info("NIFTY condor: Nifty ₹%.0f  P&L: ₹%.0f (%.1f%%)  [HOLD]",
+                logger.info("%s condor%s: spot ₹%.0f  P&L: ₹%.0f (%.1f%%)  [HOLD]",
+                            pos.get("index_name", "NIFTY"),
+                            " (monthly)" if pos.get("strategy") == "monthly_condor" else "",
                             underlying_ltp, condor_pnl, pnl_pct)
             continue
 
@@ -2707,6 +3245,19 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
             pnl_pct = (current_premium - entry_premium) / entry_premium * 100 if entry_premium > 0 else 0
 
             if exit_reason:
+                # Claude exit eval for momentum
+                try:
+                    from claude_intel import evaluate_exit
+                    should_exit, exit_reasoning = evaluate_exit(
+                        pos, exit_reason, current_premium, pnl, pnl_pct, portfolio)
+                    if not should_exit:
+                        logger.info("CLAUDE HOLD NIFTY momentum: overriding %s — %s", exit_reason, exit_reasoning)
+                        unrealized_pnl += pnl
+                        continue
+                    pos["_claude_exit_reasoning"] = exit_reasoning
+                except Exception as e:
+                    logger.debug("Claude exit eval failed for momentum: %s", e)
+
                 logger.info("EXIT NIFTY momentum %s: P&L ₹%.0f (%.1f%%), reason=%s",
                             pos.get("direction", ""), pnl, pnl_pct, exit_reason)
                 close_position(portfolio, pos, current_premium, exit_reason, smart_api=smart_api)
@@ -2732,7 +3283,7 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
         ltp = None
         for _attempt in range(2):
             try:
-                if is_option:
+                if is_option or is_futures:
                     ltp = get_ltp_nfo(smart_api, pos.get("contract_symbol", symbol), pos["token"])
                 else:
                     ltp = get_ltp(smart_api, symbol, pos["token"])
@@ -2763,7 +3314,8 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
             gap_pct = abs(ltp - pos["stoploss_price"]) / pos["entry_price"] * 100
             logger.warning("GAP THROUGH SL: %s gapped to ₹%.2f (SL was ₹%.2f, gap=%.1f%%)",
                           symbol, ltp, pos["stoploss_price"], gap_pct)
-            exit_price = apply_slippage(ltp, "EQ", "sell" if pos["direction"] == "bullish" else "buy")
+            gap_instrument = pos.get("instrument", "EQ")
+            exit_price = apply_slippage(ltp, gap_instrument, "sell" if pos["direction"] == "bullish" else "buy")
             pnl_direction = pos["direction"]
             if pnl_direction == "bullish":
                 pnl = round((exit_price - pos["entry_price"]) * abs(pos["quantity"]), 2)
@@ -2771,8 +3323,8 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
                 pnl = round((pos["entry_price"] - exit_price) * abs(pos["quantity"]), 2)
             pnl_pct = calc_pnl_pct(pos["entry_price"], exit_price, pnl_direction)
             logger.warning("FORCE EXIT %s: gap through SL → P&L ₹%.0f (%.1f%%)", symbol, pnl, pnl_pct)
+            pos["_claude_exit_reasoning"] = "SL exit (gap_through_sl) — non-negotiable risk management"
             close_position(portfolio, pos, exit_price, "gap_through_sl", smart_api=smart_api)
-            _telegram_notify_exit(pos, "gap_through_sl", pnl, pnl_pct, exit_price, portfolio)
             exits += 1
             continue
 
@@ -2798,6 +3350,14 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
         # P&L: options use "bullish" direction (bought the put)
         pnl_direction = "bullish" if is_option else pos["direction"]
         pnl_pct = calc_pnl_pct(pos["entry_price"], ltp, pnl_direction)
+
+        # --- Auction window buffer: widen thresholds during 9:15-9:30 / 3:15-3:30 ---
+        auction_atr_buffer = 0.0
+        try:
+            from smart_monitor import get_auction_atr_buffer
+            auction_atr_buffer = get_auction_atr_buffer()
+        except Exception:
+            pass
 
         # --- Determine exit reason ---
         reason = None
@@ -2844,6 +3404,9 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
                             trailing_sl = peak - ATR_TRAILING_MULTIPLIER * atr_at_entry
                         fixed_sl = pos["stoploss_price"]
                         effective_sl = max(trailing_sl, fixed_sl)
+                        # Auction window: widen SL by 0.5x ATR to avoid false exits
+                        if auction_atr_buffer > 0:
+                            effective_sl -= auction_atr_buffer * atr_at_entry
                         if ltp <= effective_sl:
                             reason = "trailing_stop" if trailing_sl > fixed_sl else "stoploss"
                 else:
@@ -2859,6 +3422,9 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
                             trailing_sl = peak + ATR_TRAILING_MULTIPLIER * atr_at_entry
                         fixed_sl = pos["stoploss_price"]
                         effective_sl = min(trailing_sl, fixed_sl)
+                        # Auction window: widen SL by 0.5x ATR to avoid false exits
+                        if auction_atr_buffer > 0:
+                            effective_sl += auction_atr_buffer * atr_at_entry
                         if ltp >= effective_sl:
                             reason = "trailing_stop" if trailing_sl < fixed_sl else "stoploss"
             else:
@@ -2917,6 +3483,28 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
             if reason is None and expired:
                 reason = "expiry"
 
+        # --- Claude Intelligence: evaluate exit decision ---
+        if reason is not None:
+            try:
+                from claude_intel import evaluate_exit
+                # Compute P&L for Claude eval
+                qty_eval = abs(pos["quantity"])
+                if is_option:
+                    pnl_eval = (ltp - pos["entry_price"]) * qty_eval
+                elif pos["direction"] == "bullish":
+                    pnl_eval = (ltp - pos["entry_price"]) * qty_eval
+                else:
+                    pnl_eval = (pos["entry_price"] - ltp) * qty_eval
+                should_exit, exit_reasoning = evaluate_exit(
+                    pos, reason, ltp, pnl_eval, pnl_pct, portfolio)
+                if not should_exit:
+                    logger.info("CLAUDE HOLD %s: overriding %s exit — %s", symbol, reason, exit_reasoning)
+                    reason = None  # reset to trigger HOLD path below
+                else:
+                    pos["_claude_exit_reasoning"] = exit_reasoning
+            except Exception as e:
+                logger.debug("Claude exit eval failed for %s: %s", symbol, e)
+
         if reason is None:
             # HOLD — calculate unrealized rupee P&L
             qty = abs(pos["quantity"])
@@ -2947,19 +3535,36 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
                     else:
                         trail_display = min(peak * (1 + LEGACY_TRAILING_STOP_PCT / 100),
                                             pos.get("stoploss_price", pos["entry_price"] * (1 - STOPLOSS_PCT / 100)))
-                logger.info(f"{symbol}: LTP ₹{ltp:.2f}  P&L: {pnl_pct:+.1f}% (₹{pos_pnl:+,.0f})  Trail: ₹{trail_display:.2f}  Day {day_num}/{max_days}  [HOLD]")
+                instr_tag = f" FUT {pos['direction'].upper()}" if is_futures else ""
+                logger.info(f"{symbol}{instr_tag}: LTP ₹{ltp:.2f}  P&L: {pnl_pct:+.1f}% (₹{pos_pnl:+,.0f})  Trail: ₹{trail_display:.2f}  Day {day_num}/{max_days}  [HOLD]")
             continue
 
-        # --- Partial exit for equity target ---
+        # --- Partial exit for equity/futures target ---
         if reason == "target" and not is_option and not pos.get("partial_exit_done"):
-            partial_qty = abs(pos["quantity"]) // 2
-            if partial_qty >= 1:
-                exit_price = apply_slippage(ltp, "EQ", "sell")
-                close_position(portfolio, pos, exit_price, "partial_target", close_qty=partial_qty, smart_api=smart_api)
-                pos["partial_exit_done"] = True
-                logger.info("%s: PARTIAL EXIT (%d/%d) @ ₹%.2f  [remaining holds]",
-                            symbol, partial_qty, abs(pos["quantity"]) + partial_qty, exit_price)
-                continue
+            if is_futures:
+                # Futures: partial exit in lot-size increments
+                lot_size = pos.get("lot_size", 1)
+                total_lots = pos.get("num_lots", 1)
+                partial_lots = max(1, total_lots // 2)
+                partial_qty = partial_lots * lot_size
+                if partial_lots < total_lots:
+                    exit_side = "buy" if pos["direction"] == "bearish" else "sell"
+                    exit_price = apply_slippage(ltp, "FUT", exit_side)
+                    close_position(portfolio, pos, exit_price, "partial_target", close_qty=partial_qty, smart_api=smart_api)
+                    pos["partial_exit_done"] = True
+                    pos["num_lots"] = total_lots - partial_lots
+                    logger.info("%s FUT: PARTIAL EXIT (%d/%d lots) @ ₹%.2f  [remaining holds]",
+                                symbol, partial_lots, total_lots, exit_price)
+                    continue
+            else:
+                partial_qty = abs(pos["quantity"]) // 2
+                if partial_qty >= 1:
+                    exit_price = apply_slippage(ltp, "EQ", "sell")
+                    close_position(portfolio, pos, exit_price, "partial_target", close_qty=partial_qty, smart_api=smart_api)
+                    pos["partial_exit_done"] = True
+                    logger.info("%s: PARTIAL EXIT (%d/%d) @ ₹%.2f  [remaining holds]",
+                                symbol, partial_qty, abs(pos["quantity"]) + partial_qty, exit_price)
+                    continue
 
         # --- V4: Partial profit booking on options ---
         if is_option and not pos.get("opt_partial_done") and pnl_pct >= config.OPT_PARTIAL_PROFIT_PCT:
@@ -2976,15 +3581,19 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
                                 symbol, int(pos.get("strike", 0)), partial_lots, total_lots, exit_price, pnl_pct)
                     continue
 
-        # Apply slippage on exit
+        # Apply slippage on exit (short futures exit = buy side)
         instrument = pos.get("instrument", "EQ")
-        exit_price = apply_slippage(ltp, instrument, "sell")
+        exit_side = "buy" if (is_futures and pos["direction"] == "bearish") else "sell"
+        exit_price = apply_slippage(ltp, instrument, exit_side)
 
         closed = close_position(portfolio, pos, exit_price, reason, smart_api=smart_api)
         tag = reason.upper().replace("_", " ")
         if is_option:
             logger.info("%s PE%d: EXIT (%s) @ ₹%.2f  P&L: %+.1f%% (₹%+.0f)",
                         symbol, int(pos['strike']), tag, exit_price, closed['pnl_pct'], closed['pnl'])
+        elif is_futures:
+            logger.info("%s FUT %s: EXIT (%s) @ ₹%.2f  P&L: %+.1f%% (₹%+.0f)",
+                        symbol, pos["direction"].upper(), tag, exit_price, closed['pnl_pct'], closed['pnl'])
         else:
             logger.info("%s: EXIT (%s) @ ₹%.2f  P&L: %+.1f%% (₹%+.0f)",
                         symbol, tag, exit_price, closed['pnl_pct'], closed['pnl'])
@@ -2993,7 +3602,7 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
     # V3: Friday afternoon risk reduction — tighten stops for weekend
     if _is_friday_afternoon():
         for pos in [p for p in portfolio["positions"] if p["status"] == "open"]:
-            is_fno = pos.get("instrument") in ("OPT", "SPREAD", "CONDOR", "MOMENTUM", "IV_CRUSH")
+            is_fno = pos.get("instrument") in ("OPT", "FUT", "SPREAD", "CONDOR", "MOMENTUM", "IV_CRUSH")
             if is_fno:
                 # Close marginal F&O positions (less than 1% unrealized gain)
                 # We'd need LTP here but it was already fetched above — log warning for now
@@ -3371,12 +3980,36 @@ def _try_index_strategies(smart_api, portfolio: dict) -> int:
                         condor_data["vix_at_entry"] = vix_ltp
                         condor_data["index_name"] = idx_name
                         allocation = min(condor_data["max_loss"], max_condor_alloc)
+
+                        # Claude entry eval for condor
+                        try:
+                            from claude_intel import evaluate_entry
+                            condor_candidate = {
+                                "symbol": idx_name, "direction": "neutral",
+                                "score": 0, "categories": ["IronCondor"],
+                                "sector": "Index",
+                            }
+                            approved, reasoning, adj = evaluate_entry(
+                                condor_candidate, "CONDOR", regime, vix_ltp,
+                                None, 1.0, idx_ltp, portfolio, nifty_ltp=idx_ltp,
+                                extra_context=f"Credit=₹{condor_data['net_credit']:.0f}, MaxLoss=₹{condor_data['max_loss']:.0f}, VIX={vix_ltp:.1f}")
+                            if not approved:
+                                logger.info("CLAUDE SKIP condor on %s: %s", idx_name, reasoning)
+                                continue
+                            condor_data["claude_reasoning"] = reasoning
+                            condor_data["claude_conviction"] = "medium"
+                        except Exception as e:
+                            logger.debug("Claude entry eval failed for condor: %s", e)
+                            reasoning = ""
+
                         pos = _open_iron_condor(
                             portfolio, condor_data, allocation, regime, iv_percentile,
                             expiry or "",
                         )
                         if pos:
                             pos["index_name"] = idx_name
+                            if condor_data.get("claude_reasoning"):
+                                pos["claude_reasoning"] = condor_data["claude_reasoning"]
                             opened += 1
                             logger.info("OPENED iron condor on %s: credit=₹%.0f, max_loss=₹%.0f",
                                         idx_name, condor_data["net_credit"], condor_data["max_loss"])
@@ -3417,6 +4050,25 @@ def _try_index_strategies(smart_api, portfolio: dict) -> int:
                                 total_cost = premium * lot_size
 
                                 if total_cost <= max_momentum_alloc and premium > 0:
+                                    # Claude entry eval for momentum
+                                    momentum_reasoning = ""
+                                    try:
+                                        from claude_intel import evaluate_entry
+                                        mom_candidate = {
+                                            "symbol": idx_name, "direction": breakout,
+                                            "score": 0, "categories": ["Momentum", "Breakout"],
+                                            "sector": "Index",
+                                        }
+                                        approved, momentum_reasoning, adj = evaluate_entry(
+                                            mom_candidate, "MOMENTUM", regime, vix_ltp,
+                                            None, 1.0, idx_ltp, portfolio, nifty_ltp=idx_ltp,
+                                            extra_context=f"{opt_type} {strike} @ ₹{premium:.2f}, cost=₹{total_cost:.0f}")
+                                        if not approved:
+                                            logger.info("CLAUDE SKIP momentum %s on %s: %s", breakout, idx_name, momentum_reasoning)
+                                            continue
+                                    except Exception as e:
+                                        logger.debug("Claude entry eval failed for momentum: %s", e)
+
                                     option_data = {
                                         "strike": strike,
                                         "premium": premium,
@@ -3431,11 +4083,108 @@ def _try_index_strategies(smart_api, portfolio: dict) -> int:
                                     )
                                     if pos:
                                         pos["index_name"] = idx_name
+                                        if momentum_reasoning:
+                                            pos["claude_reasoning"] = momentum_reasoning
                                         opened += 1
                                         logger.info("OPENED momentum %s on %s: %s %s @ ₹%.2f",
                                                     breakout, idx_name, opt_type, strike, premium)
                     except Exception as e:
                         logger.debug("Momentum attempt on %s failed: %s", idx_name, e)
+
+    # --- V9: Monthly Iron Condor (Reyaansh style) ---
+    if config.MONTHLY_CONDOR_ENABLED:
+        today_date = datetime.now(IST).date()
+        day_of_month = today_date.day
+
+        if config.MONTHLY_CONDOR_ENTRY_DAY_MIN <= day_of_month <= config.MONTHLY_CONDOR_ENTRY_DAY_MAX:
+            # Check if we already have a monthly condor open
+            has_monthly_condor = any(
+                p.get("strategy") == "monthly_condor" and p.get("status") == "open"
+                for p in portfolio["positions"]
+            )
+
+            if not has_monthly_condor:
+                for idx_cfg in INDEX_CONFIGS:
+                    idx_name = idx_cfg["name"]
+                    lot_size = idx_cfg["lot_size"]
+                    hedge_gap = (config.MONTHLY_CONDOR_HEDGE_GAP_NIFTY
+                                 if idx_name == "NIFTY"
+                                 else config.MONTHLY_CONDOR_HEDGE_GAP_BANKNIFTY)
+
+                    try:
+                        vix_now = get_ltp(smart_api, "India VIX", VIX_TOKEN)
+                        time.sleep(config.API_DELAY)
+
+                        # Only enter monthly condor when VIX is in sweet spot (12-20)
+                        if not vix_now or vix_now < 10 or vix_now > 20:
+                            logger.info("SKIP monthly condor %s: VIX %.1f outside [10, 20]", idx_name, vix_now or 0)
+                            continue
+
+                        idx_ltp = get_ltp(smart_api, idx_name, idx_cfg["token"])
+                        time.sleep(config.API_DELAY)
+                        if not idx_ltp:
+                            continue
+
+                        chain = fetch_option_chain(smart_api, idx_name)
+                        time.sleep(config.API_DELAY)
+                        if not chain:
+                            continue
+
+                        # Get monthly expiry (>= 20 DTE)
+                        expiry = get_nearest_expiry(chain, min_dte=20)
+                        if not expiry:
+                            logger.info("SKIP monthly condor %s: no expiry with >= 20 DTE", idx_name)
+                            continue
+
+                        # Select 25-delta strikes
+                        from agent_with_options import select_iron_condor_strikes
+                        max_loss_budget = TOTAL_CAPITAL * config.MONTHLY_CONDOR_MAX_RISK_PCT
+                        condor_data = select_iron_condor_strikes(
+                            chain, spot=idx_ltp, lot_size=lot_size,
+                            max_loss_budget=max_loss_budget,
+                            min_credit_per_lot=config.CONDOR_MIN_CREDIT_PER_LOT,
+                        )
+
+                        if condor_data:
+                            condor_data["spot"] = idx_ltp
+                            condor_data["vix_at_entry"] = vix_now
+                            condor_data["index_name"] = idx_name
+                            allocation = min(condor_data["max_loss"], max_loss_budget)
+
+                            # Claude entry eval for monthly condor
+                            try:
+                                from claude_intel import evaluate_entry
+                                mc_candidate = {
+                                    "symbol": idx_name, "direction": "neutral",
+                                    "score": 0, "categories": ["MonthlyCondor"],
+                                    "sector": "Index",
+                                }
+                                approved, mc_reasoning, _ = evaluate_entry(
+                                    mc_candidate, "CONDOR", "SIDEWAYS", vix_now,
+                                    None, 1.0, idx_ltp, portfolio, nifty_ltp=idx_ltp,
+                                    extra_context=f"Monthly condor. Credit=₹{condor_data['net_credit']:.0f}, MaxLoss=₹{condor_data['max_loss']:.0f}, VIX={vix_now:.1f}")
+                                if not approved:
+                                    logger.info("CLAUDE SKIP monthly condor on %s: %s", idx_name, mc_reasoning)
+                                    continue
+                                condor_data["claude_reasoning"] = mc_reasoning
+                            except Exception as e:
+                                logger.debug("Claude entry eval failed for monthly condor: %s", e)
+
+                            pos = _open_iron_condor(
+                                portfolio, condor_data, allocation, "SIDEWAYS",
+                                vix_to_iv_percentile(vix_now), expiry or "",
+                            )
+                            if pos:
+                                pos["strategy"] = "monthly_condor"
+                                pos["index_name"] = idx_name
+                                pos["monthly_sl_cap"] = round(TOTAL_CAPITAL * config.MONTHLY_CONDOR_MONTHLY_SL_PCT, 2)
+                                if condor_data.get("claude_reasoning"):
+                                    pos["claude_reasoning"] = condor_data["claude_reasoning"]
+                                opened += 1
+                                logger.info("OPENED monthly condor on %s: credit=₹%.0f, max_loss=₹%.0f, expiry=%s",
+                                            idx_name, condor_data["net_credit"], condor_data["max_loss"], expiry)
+                    except Exception as e:
+                        logger.debug("Monthly condor attempt on %s failed: %s", idx_name, e)
 
     # --- V7: IV Crush event strategy (Nifty only) ---
     has_iv_crush = any(
@@ -3744,14 +4493,31 @@ def run_paper_trade(smart_api, mode: str) -> None:
 
         logger.info("\n  Opened %d position(s).", opened)
 
-        # Telegram alert for new entries
+        # Telegram alert for new entries (with Claude reasoning)
         if opened > 0:
             new_positions = [p for p in portfolio["positions"]
                             if p["status"] == "open" and p["symbol"] not in positions_before]
-            _telegram_notify_entry(new_positions)
+            try:
+                from claude_intel import format_entry_telegram
+                for pos in new_positions:
+                    entry_msg = format_entry_telegram(
+                        pos, pos.get("claude_reasoning", ""),
+                        regime=regime, vix=vix_ltp,
+                    )
+                    _telegram_send(entry_msg)
+            except Exception:
+                _telegram_notify_entry(new_positions)
 
         save_portfolio(portfolio)
         print_portfolio_status(portfolio)
+
+        # Telegram cron summary (every run)
+        try:
+            from claude_intel import generate_cron_summary
+            summary = generate_cron_summary("open", portfolio, regime=regime, vix=vix_ltp, opened=opened)
+            _telegram_send(summary)
+        except Exception:
+            pass
 
         # Daily summary after opening
         _telegram_daily_summary(portfolio)
@@ -3759,15 +4525,70 @@ def run_paper_trade(smart_api, mode: str) -> None:
     elif mode == "monitor":
         logger.info("\n=== PAPER TRADE: Monitoring positions ===\n")
 
+        # Smart Monitor: sector correlation check + Nifty session tracking
+        try:
+            from smart_monitor import (check_sector_correlation, should_send_hourly_digest,
+                                       generate_hourly_digest, _load_state, _save_state,
+                                       mark_checked)
+            sm_state = _load_state()
+
+            # Track Nifty at session start (for correlation checks)
+            nifty_ltp_sm = get_ltp(smart_api, "Nifty 50", NIFTY_TOKEN)
+            time.sleep(config.API_DELAY)
+            if nifty_ltp_sm and not sm_state.get("nifty_at_session_start"):
+                sm_state["nifty_at_session_start"] = nifty_ltp_sm
+                # Reset at start of new day
+                today_str = datetime.now(IST).strftime("%Y-%m-%d")
+                if sm_state.get("daily_realized_date") != today_str:
+                    sm_state["nifty_at_session_start"] = nifty_ltp_sm
+
+            # Sector correlation: tighten SLs if Nifty moves >1.5% against correlated positions
+            corr_alerts = check_sector_correlation(portfolio, nifty_ltp_sm, sm_state)
+            if corr_alerts:
+                corr_msg = (f"<b>⚠️ Correlation Alert</b>\n"
+                           f"Nifty moved significantly — tightened SLs on: {', '.join(corr_alerts)}")
+                _telegram_send(corr_msg)
+
+            _save_state(sm_state)
+        except Exception as e:
+            logger.debug("Smart monitor pre-checks failed: %s", e)
+            sm_state = None
+
         exits, unrealized_pnl = monitor_positions(smart_api, portfolio)
         if exits:
             logger.info("\n  %d position(s) closed.", exits)
         save_portfolio(portfolio)
 
+        # Smart Monitor: mark checked positions + hourly digest
+        try:
+            if sm_state is not None:
+                open_syms = [p["symbol"] for p in portfolio["positions"] if p["status"] == "open"]
+                mark_checked(sm_state, open_syms)
+
+                # Hourly digest (10:00-14:00 on the hour)
+                if should_send_hourly_digest(sm_state):
+                    vix_digest = get_ltp(smart_api, "India VIX", VIX_TOKEN)
+                    time.sleep(config.API_DELAY)
+                    digest = generate_hourly_digest(portfolio, vix_digest, regime)
+                    _telegram_send(digest)
+                    sm_state["last_hourly_digest"] = datetime.now(IST).isoformat()
+
+                _save_state(sm_state)
+        except Exception as e:
+            logger.debug("Smart monitor post-checks failed: %s", e)
+
         # Print brief status
         open_count = len([p for p in portfolio["positions"] if p["status"] == "open"])
         realized_pnl = portfolio['stats']['total_pnl']
         logger.info(f"Open: {open_count}  |  Unrealized: ₹{unrealized_pnl:+,.0f}  |  Realized: ₹{realized_pnl:+,.0f}  |  Total: ₹{unrealized_pnl + realized_pnl:+,.0f}")
+
+        # Telegram cron summary (every monitor run)
+        try:
+            from claude_intel import generate_cron_summary
+            summary = generate_cron_summary("monitor", portfolio, exited=exits, unrealized_pnl=unrealized_pnl)
+            _telegram_send(summary)
+        except Exception:
+            pass
 
         # Record expected move data at EOD (after 3:15 PM IST)
         now_ist = datetime.now(IST)
