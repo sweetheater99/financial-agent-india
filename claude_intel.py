@@ -410,6 +410,7 @@ def evaluate_candidates(
     max_pain: float,
     portfolio: dict,
     nifty_ltp: float | None = None,
+    extra_context: str = "",
 ) -> list[dict]:
     """Evaluate multiple candidates in a single Claude call (batch mode).
 
@@ -445,7 +446,7 @@ MARKET:
 - Regime: {regime} (conf: {regime_confidence:.0%}) | VIX: {vix or 'N/A'} | Nifty: {nifty_ltp or 'N/A'}
 - PCR: {pcr:.2f} | Max Pain: {max_pain:.0f}
 - Global: {macro_str or 'N/A'}
-
+{f'- Intel: {extra_context}' if extra_context else ''}
 PORTFOLIO:
 {_build_portfolio_context(portfolio)}
 

@@ -2395,6 +2395,46 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
                 pass
             return 0
 
+    # --- V6: Fetch market intel for Claude context ---
+    market_intel_context = ""
+    if getattr(cfg_module, "V6_CLAUDE_FIRST", False):
+        try:
+            from market_intel import fetch_vwap, format_market_intel_for_claude, get_oi_support_resistance
+            from time_intel import format_time_context_for_claude, compute_gap
+            from datetime import datetime, timezone, timedelta
+
+            IST = timezone(timedelta(hours=5, minutes=30))
+            now_ist = datetime.now(IST)
+
+            # VWAP
+            nifty_vwap = fetch_vwap(smart_api, NIFTY_TOKEN) if smart_api else None
+
+            # Gap detection
+            gap_info = None
+            if nifty_candles and len(nifty_candles) >= 2:
+                prev_close = float(nifty_candles[-2][4])
+                today_open = float(nifty_candles[-1][1])
+                gap_info = compute_gap(prev_close, today_open)
+
+            # OI support/resistance (best-effort)
+            oi_sr = None
+
+            # Time context + market intel
+            nifty_ltp_for_intel = get_ltp(smart_api, "Nifty 50", NIFTY_TOKEN) if smart_api else None
+            time_context = format_time_context_for_claude(
+                now_ist.time(), now_ist.date(), gap=gap_info, vix=vix_ltp,
+                avg_vix=None,
+            )
+            intel_context = format_market_intel_for_claude(
+                nifty_vwap, nifty_ltp_for_intel or 0, None, oi_sr
+            )
+            market_intel_context = f"{intel_context}\n{time_context}".strip()
+            if market_intel_context:
+                logger.info("V6 market intel context: %s", market_intel_context[:200])
+        except Exception as e:
+            logger.debug("V6 market intel fetch failed: %s", e)
+            market_intel_context = ""
+
     # --- Claude Intelligence: evaluate candidates before trading ---
     try:
         from claude_intel import evaluate_candidates
@@ -2409,6 +2449,7 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
             max_pain=max_pain,
             portfolio=portfolio,
             nifty_ltp=nifty_ltp_current,
+            extra_context=market_intel_context,
         )
         if not claude_approved:
             logger.info("Claude intel: no candidates approved.")
