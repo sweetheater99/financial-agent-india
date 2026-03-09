@@ -2435,6 +2435,21 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
             logger.debug("V6 market intel fetch failed: %s", e)
             market_intel_context = ""
 
+    # --- V4 Global Intel Signals: attach to candidates for Claude ---
+    try:
+        from indicators_v4 import compute_pcr_signal, compute_maxpain_signal, compute_fii_momentum
+        nifty_ltp_v4 = float(nifty_candles[-1][4]) if nifty_candles else 0
+        _pcr_signal = round(compute_pcr_signal(pcr), 2)
+        _maxpain_signal = round(compute_maxpain_signal(nifty_ltp_v4, max_pain), 2)
+        _fii_3d = [macro.get("fii_net_crores", 0)] if macro else []
+        _fii_momentum = round(compute_fii_momentum(_fii_3d), 2)
+        for _c in quality_filtered:
+            _c["pcr_signal"] = _pcr_signal
+            _c["maxpain_signal"] = _maxpain_signal
+            _c["fii_momentum"] = _fii_momentum
+    except Exception as _e:
+        logger.debug("V4 global intel signals failed: %s", _e)
+
     # --- Claude Intelligence: evaluate candidates before trading ---
     try:
         from claude_intel import evaluate_candidates

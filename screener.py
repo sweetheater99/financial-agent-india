@@ -479,6 +479,37 @@ def enrich_candidates(smart_api, candidates: list[dict]) -> list[dict]:
                     rsi_str = f"RSI={cand['rsi']:.1f}" if cand['rsi'] is not None else "RSI=N/A"
                     vol_str = f"Vol={cand['volume_ratio']:.2f}x" if cand['volume_ratio'] is not None else "Vol=N/A"
                     print(f"  {symbol}: {len(candles)} candles, {rsi_str}, {vol_str}")
+
+                    # V4 indicators (MFI, OBV divergence, VWAP deviation, ADX)
+                    try:
+                        from indicators_v4 import (
+                            compute_mfi, compute_obv_divergence,
+                            compute_vwap_deviation, compute_adx,
+                        )
+                        import pandas as _pd
+                        _df = _pd.DataFrame(
+                            candles,
+                            columns=["timestamp", "open", "high", "low", "close", "volume"],
+                        )
+                        for col in ("open", "high", "low", "close", "volume"):
+                            _df[col] = _pd.to_numeric(_df[col], errors="coerce")
+
+                        mfi_series = compute_mfi(_df)
+                        cand["mfi"] = round(float(mfi_series.iloc[-1]), 1) if not _pd.isna(mfi_series.iloc[-1]) else None
+
+                        obv_div = compute_obv_divergence(_df)
+                        cand["obv_divergence"] = obv_div.iloc[-1] if obv_div.iloc[-1] != "none" else None
+
+                        vwap_dev = compute_vwap_deviation(_df)
+                        cand["vwap_deviation"] = round(float(vwap_dev.iloc[-1]), 2) if not _pd.isna(vwap_dev.iloc[-1]) else None
+
+                        adx_result = compute_adx(_df)
+                        cand["adx"] = round(float(adx_result["adx"].iloc[-1]), 1) if not _pd.isna(adx_result["adx"].iloc[-1]) else None
+                        cand["di_plus"] = round(float(adx_result["di_plus"].iloc[-1]), 1) if not _pd.isna(adx_result["di_plus"].iloc[-1]) else None
+                        cand["di_minus"] = round(float(adx_result["di_minus"].iloc[-1]), 1) if not _pd.isna(adx_result["di_minus"].iloc[-1]) else None
+                    except Exception as _e:
+                        import logging as _log
+                        _log.getLogger(__name__).debug("V4 indicator enrichment failed for %s: %s", symbol, _e)
                 else:
                     cand["candles"] = None
                     cand["rsi"] = None

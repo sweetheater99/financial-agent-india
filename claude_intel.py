@@ -351,6 +351,13 @@ CANDIDATE:
 - Supertrend: {candidate.get('supertrend_signal', 'N/A')}
 - Price change: {candidate.get('price_change_pct', 'N/A')}%
 - Sector: {candidate.get('sector', 'Other')}
+- MFI: {candidate.get('mfi', 'N/A')}
+- OBV: {candidate.get('obv_divergence', 'N/A')}
+- VWAP dev: {candidate.get('vwap_deviation', 'N/A')} ATR
+- ADX: {candidate.get('adx', 'N/A')} | DI+: {candidate.get('di_plus', 'N/A')} | DI-: {candidate.get('di_minus', 'N/A')}
+- PCR signal: {candidate.get('pcr_signal', 'N/A')}
+- Max Pain signal: {candidate.get('maxpain_signal', 'N/A')}
+- FII momentum: {candidate.get('fii_momentum', 'N/A')}
 {f"- Extra: {extra_context}" if extra_context else ""}
 
 PORTFOLIO:
@@ -437,7 +444,9 @@ def evaluate_candidates(
             f"categories={c.get('categories', [])} "
             f"supertrend={c.get('supertrend_signal', '?')} "
             f"news={c.get('news_sentiment', '?')} "
-            f"sector={c.get('sector', 'Other')}"
+            f"sector={c.get('sector', 'Other')} "
+            f"MFI={c.get('mfi', '?')} OBV={c.get('obv_divergence', '?')} "
+            f"VWAP={c.get('vwap_deviation', '?')} ADX={c.get('adx', '?')}"
         )
 
     prompt = f"""BATCH ENTRY EVALUATION
