@@ -3086,6 +3086,112 @@ def _is_friday_afternoon(weekday: int = None, hour: int = None, minute: int = No
     return weekday == 4 and hour >= 14
 
 
+def _compute_exit_signals(pos: dict, current_ltp: float, pnl_pct: float) -> dict:
+    """V6: Compute all exit signals without triggering any.
+    Returns signal dict for Claude to evaluate."""
+    signals = {}
+    direction = pos.get("direction", "bullish")
+    entry = pos["entry_price"]
+    sl = pos.get("stoploss_price", 0)
+    target = pos.get("target_price", 0)
+    atr = pos.get("atr_at_entry", 0)
+    peak = pos.get("peak_price", entry)
+    is_option = pos.get("instrument") == "OPT"
+
+    # Mechanical SL (non-negotiable)
+    if is_option:
+        sl_fired = current_ltp <= sl if sl > 0 else False
+    elif direction == "bullish":
+        sl_fired = current_ltp <= sl if sl > 0 else False
+    else:
+        sl_fired = current_ltp >= sl if sl > 0 else False
+    signals["mechanical_sl"] = {
+        "fired": sl_fired,
+        "sl_price": sl,
+        "distance_pct": round((current_ltp - sl) / entry * 100, 2) if entry > 0 else 0
+    }
+
+    # Trailing stop
+    if atr > 0 and not is_option:
+        trail_mult = getattr(config, 'TRAILING_SL_ATR_MULT', 2.5)
+        if direction == "bullish":
+            trail_sl = peak - trail_mult * atr
+            trail_fired = current_ltp <= trail_sl
+        else:
+            trail_sl = peak + trail_mult * atr
+            trail_fired = current_ltp >= trail_sl
+        signals["trailing_stop"] = {
+            "fired": trail_fired,
+            "trail_price": round(trail_sl, 2),
+            "distance": round(abs(current_ltp - trail_sl), 2)
+        }
+    elif is_option:
+        peak_prem = pos.get("peak_premium", entry)
+        trailing_pct = getattr(config, 'OPT_TRAILING_STOP_PCT', 30)
+        trail_sl = peak_prem * (1 - trailing_pct / 100)
+        trail_fired = current_ltp <= trail_sl
+        signals["trailing_stop"] = {
+            "fired": trail_fired,
+            "trail_price": round(trail_sl, 2),
+            "distance": round(abs(current_ltp - trail_sl), 2)
+        }
+    else:
+        signals["trailing_stop"] = {"fired": False, "distance": 999}
+
+    # Target
+    if target > 0:
+        if is_option:
+            target_fired = pnl_pct >= getattr(config, 'PUT_TARGET_PCT', 50)
+        elif direction == "bullish":
+            target_fired = current_ltp >= target
+        else:
+            target_fired = current_ltp <= target
+        signals["target"] = {
+            "fired": target_fired,
+            "target_price": target,
+            "distance_pct": round(abs(current_ltp - target) / entry * 100, 2) if entry > 0 else 0
+        }
+    else:
+        signals["target"] = {"fired": False, "distance_pct": 999}
+
+    # Time pressure
+    entry_date = pos.get("entry_date", "")
+    max_hold = pos.get("max_hold_date", "")
+    if entry_date and max_hold:
+        from datetime import datetime as _dt
+        try:
+            days_held = (_dt.now().date() - _dt.strptime(entry_date[:10], "%Y-%m-%d").date()).days
+            max_days = (_dt.strptime(max_hold[:10], "%Y-%m-%d").date() - _dt.strptime(entry_date[:10], "%Y-%m-%d").date()).days
+            pct_elapsed = days_held / max(max_days, 1) * 100
+        except ValueError:
+            days_held, pct_elapsed = 0, 0
+        signals["time_pressure"] = {
+            "fired": pct_elapsed >= 100,
+            "days_held": days_held,
+            "pct_elapsed": round(pct_elapsed, 1)
+        }
+    else:
+        signals["time_pressure"] = {"fired": False, "days_held": 0, "pct_elapsed": 0}
+
+    return signals
+
+
+def _format_signals_for_claude(signals: dict) -> str:
+    """Format exit signals as text for Claude prompt."""
+    lines = []
+    for name, sig in signals.items():
+        if name == "mechanical_sl":
+            continue  # handled separately
+        status = "FIRED" if sig.get("fired") else "not triggered"
+        detail_parts = []
+        for k, v in sig.items():
+            if k == "fired":
+                continue
+            detail_parts.append(f"{k}={v}")
+        lines.append(f"  {name}: {status} ({', '.join(detail_parts)})")
+    return "\n".join(lines)
+
+
 def monitor_positions(smart_api, portfolio: dict) -> tuple:
     """
     Check each open position for exit conditions. Returns number of exits.
@@ -3483,128 +3589,188 @@ def monitor_positions(smart_api, portfolio: dict) -> tuple:
         # --- Determine exit reason ---
         reason = None
 
-        if is_option:
-            # Theta awareness: low DTE + low gain → early exit
-            if dte is not None and dte < OPT_THETA_DTE_THRESHOLD and pnl_pct < OPT_THETA_MIN_GAIN_PCT:
-                if not dte_expired:  # dte_expired (DTE < 2) handled separately
-                    reason = "theta_decay"
+        # --- V6: Compute signals, let Claude decide (EQ/FUT only) ---
+        import config as cfg_module
+        if getattr(cfg_module, "V6_CLAUDE_FIRST", False) and not is_option:
+            # V6 for EQ/FUT: compute signals, mechanical SL fires immediately, rest goes to Claude
+            signals = _compute_exit_signals(pos, ltp, pnl_pct)
 
-            if reason is None:
-                # Option trailing stop
-                trailing_stop_pct = OPT_TRAILING_STOP_PCT
-                trailing_sl = peak * (1 - trailing_stop_pct / 100)
-                fixed_sl = pos["entry_price"] * (1 + PUT_STOPLOSS_PCT / 100)
-                effective_sl = max(trailing_sl, fixed_sl)
-
-                if pnl_pct >= PUT_TARGET_PCT:
-                    reason = "target"
-                elif ltp <= effective_sl:
-                    reason = "trailing_stop" if trailing_sl > fixed_sl else "stoploss"
-                elif dte_expired:
-                    reason = "expiry"
-                elif expired:
-                    reason = "expiry"
-        else:
-            # Equity: ATR-based or percentage-based exits
-            atr_at_entry = pos.get("atr_at_entry")
-
-            if atr_at_entry is not None:
-                # ATR-based: price thresholds + ATR-based trailing stop
-                if pos["direction"] == "bullish":
-                    if ltp >= pos["target_price"]:
-                        reason = "target"
-                    else:
-                        # V3: Enhanced trailing after activation threshold
-                        unrealized_pct = calc_pnl_pct(pos["entry_price"], ltp, "bullish")
-                        if unrealized_pct >= config.TRAILING_SL_ACTIVATION_PCT:
-                            # Tighter trail: 1.5x ATR from high water mark, floored at entry
-                            trailing_sl = peak - config.TRAILING_SL_ATR_MULT * atr_at_entry
-                            trailing_sl = max(trailing_sl, pos["entry_price"])
-                        else:
-                            # Standard trail before activation
-                            trailing_sl = peak - ATR_TRAILING_MULTIPLIER * atr_at_entry
-                        fixed_sl = pos["stoploss_price"]
-                        effective_sl = max(trailing_sl, fixed_sl)
-                        # Auction window: widen SL by 0.5x ATR to avoid false exits
-                        if auction_atr_buffer > 0:
-                            effective_sl -= auction_atr_buffer * atr_at_entry
-                        if ltp <= effective_sl:
-                            reason = "trailing_stop" if trailing_sl > fixed_sl else "stoploss"
-                else:
-                    if ltp <= pos["target_price"]:
-                        reason = "target"
-                    else:
-                        # V3: Enhanced trailing after activation threshold
-                        unrealized_pct = calc_pnl_pct(pos["entry_price"], ltp, "bearish")
-                        if unrealized_pct >= config.TRAILING_SL_ACTIVATION_PCT:
-                            trailing_sl = peak + config.TRAILING_SL_ATR_MULT * atr_at_entry
-                            trailing_sl = min(trailing_sl, pos["entry_price"])
-                        else:
-                            trailing_sl = peak + ATR_TRAILING_MULTIPLIER * atr_at_entry
-                        fixed_sl = pos["stoploss_price"]
-                        effective_sl = min(trailing_sl, fixed_sl)
-                        # Auction window: widen SL by 0.5x ATR to avoid false exits
-                        if auction_atr_buffer > 0:
-                            effective_sl += auction_atr_buffer * atr_at_entry
-                        if ltp >= effective_sl:
-                            reason = "trailing_stop" if trailing_sl < fixed_sl else "stoploss"
+            # Mechanical SL: always fire, never ask Claude
+            if signals["mechanical_sl"]["fired"]:
+                reason = "stoploss"
+                pos["_claude_exit_reasoning"] = "Mechanical SL — non-negotiable"
+                # Fall through to existing exit execution below
             else:
-                # Legacy percentage-based (no ATR data)
-                target_pct = TARGET_PCT
-                stoploss_pct = STOPLOSS_PCT
+                # Check if any signal fired
+                any_fired = any(s.get("fired") for name, s in signals.items() if name != "mechanical_sl")
+                if any_fired:
+                    signal_text = _format_signals_for_claude(signals)
+                    # Get previous assessment
+                    try:
+                        from smart_monitor import get_position_assessment, save_position_assessment, _load_state, _save_state
+                        sm_state = _load_state()
+                        prev = get_position_assessment(sm_state, symbol)
+                        prev_text = f"Previous assessment: [{prev['action']}] {prev['reasoning']}" if prev else ""
+                    except Exception:
+                        prev_text = ""
+                        sm_state = None
 
-                if pos["direction"] == "bullish":
-                    trailing_sl = peak * (1 - LEGACY_TRAILING_STOP_PCT / 100)
-                    fixed_sl = pos.get("stoploss_price", pos["entry_price"] * (1 + stoploss_pct / 100))
+                    try:
+                        from claude_intel import evaluate_exit
+                        qty_eval = abs(pos["quantity"])
+                        pnl_eval = (ltp - pos["entry_price"]) * qty_eval if pos["direction"] == "bullish" else (pos["entry_price"] - ltp) * qty_eval
+                        should_exit, exit_reasoning = evaluate_exit(
+                            pos, signal_text, ltp, pnl_eval, pnl_pct, portfolio,
+                            previous_assessment=prev_text)
+
+                        # Save assessment
+                        try:
+                            fired_signals = [n for n, s in signals.items() if s.get("fired")]
+                            action = "EXIT" if should_exit else "HOLD"
+                            save_position_assessment(sm_state, symbol, action, exit_reasoning, fired_signals)
+                            _save_state(sm_state)
+                        except Exception:
+                            pass
+
+                        if should_exit:
+                            reason = signal_text  # Use signal text as reason
+                            pos["_claude_exit_reasoning"] = exit_reasoning
+                        else:
+                            logger.info("V6 HOLD %s: Claude overrides signals — %s", symbol, exit_reasoning)
+                            reason = None
+                    except Exception as e:
+                        logger.debug("V6 Claude exit eval failed for %s: %s — falling back to rule trigger", symbol, e)
+                        # Fallback: use first fired signal as reason
+                        for name, sig in signals.items():
+                            if sig.get("fired") and name != "mechanical_sl":
+                                reason = name
+                                break
+                else:
+                    reason = None  # No signals, HOLD
+        else:
+            # V5 path OR options (keep existing logic)
+            if is_option:
+                # Theta awareness: low DTE + low gain → early exit
+                if dte is not None and dte < OPT_THETA_DTE_THRESHOLD and pnl_pct < OPT_THETA_MIN_GAIN_PCT:
+                    if not dte_expired:  # dte_expired (DTE < 2) handled separately
+                        reason = "theta_decay"
+
+                if reason is None:
+                    # Option trailing stop
+                    trailing_stop_pct = OPT_TRAILING_STOP_PCT
+                    trailing_sl = peak * (1 - trailing_stop_pct / 100)
+                    fixed_sl = pos["entry_price"] * (1 + PUT_STOPLOSS_PCT / 100)
                     effective_sl = max(trailing_sl, fixed_sl)
 
-                    if pnl_pct >= target_pct:
+                    if pnl_pct >= PUT_TARGET_PCT:
                         reason = "target"
                     elif ltp <= effective_sl:
                         reason = "trailing_stop" if trailing_sl > fixed_sl else "stoploss"
+                    elif dte_expired:
+                        reason = "expiry"
+                    elif expired:
+                        reason = "expiry"
+            else:
+                # Equity: ATR-based or percentage-based exits
+                atr_at_entry = pos.get("atr_at_entry")
+
+                if atr_at_entry is not None:
+                    # ATR-based: price thresholds + ATR-based trailing stop
+                    if pos["direction"] == "bullish":
+                        if ltp >= pos["target_price"]:
+                            reason = "target"
+                        else:
+                            # V3: Enhanced trailing after activation threshold
+                            unrealized_pct = calc_pnl_pct(pos["entry_price"], ltp, "bullish")
+                            if unrealized_pct >= config.TRAILING_SL_ACTIVATION_PCT:
+                                # Tighter trail: 1.5x ATR from high water mark, floored at entry
+                                trailing_sl = peak - config.TRAILING_SL_ATR_MULT * atr_at_entry
+                                trailing_sl = max(trailing_sl, pos["entry_price"])
+                            else:
+                                # Standard trail before activation
+                                trailing_sl = peak - ATR_TRAILING_MULTIPLIER * atr_at_entry
+                            fixed_sl = pos["stoploss_price"]
+                            effective_sl = max(trailing_sl, fixed_sl)
+                            # Auction window: widen SL by 0.5x ATR to avoid false exits
+                            if auction_atr_buffer > 0:
+                                effective_sl -= auction_atr_buffer * atr_at_entry
+                            if ltp <= effective_sl:
+                                reason = "trailing_stop" if trailing_sl > fixed_sl else "stoploss"
+                    else:
+                        if ltp <= pos["target_price"]:
+                            reason = "target"
+                        else:
+                            # V3: Enhanced trailing after activation threshold
+                            unrealized_pct = calc_pnl_pct(pos["entry_price"], ltp, "bearish")
+                            if unrealized_pct >= config.TRAILING_SL_ACTIVATION_PCT:
+                                trailing_sl = peak + config.TRAILING_SL_ATR_MULT * atr_at_entry
+                                trailing_sl = min(trailing_sl, pos["entry_price"])
+                            else:
+                                trailing_sl = peak + ATR_TRAILING_MULTIPLIER * atr_at_entry
+                            fixed_sl = pos["stoploss_price"]
+                            effective_sl = min(trailing_sl, fixed_sl)
+                            # Auction window: widen SL by 0.5x ATR to avoid false exits
+                            if auction_atr_buffer > 0:
+                                effective_sl += auction_atr_buffer * atr_at_entry
+                            if ltp >= effective_sl:
+                                reason = "trailing_stop" if trailing_sl < fixed_sl else "stoploss"
                 else:
-                    trailing_sl = peak * (1 + LEGACY_TRAILING_STOP_PCT / 100)
-                    fixed_sl = pos.get("stoploss_price", pos["entry_price"] * (1 - stoploss_pct / 100))
-                    effective_sl = min(trailing_sl, fixed_sl)
+                    # Legacy percentage-based (no ATR data)
+                    target_pct = TARGET_PCT
+                    stoploss_pct = STOPLOSS_PCT
 
-                    if pnl_pct >= target_pct:
-                        reason = "target"
-                    elif ltp >= effective_sl:
-                        reason = "trailing_stop" if trailing_sl < fixed_sl else "stoploss"
+                    if pos["direction"] == "bullish":
+                        trailing_sl = peak * (1 - LEGACY_TRAILING_STOP_PCT / 100)
+                        fixed_sl = pos.get("stoploss_price", pos["entry_price"] * (1 + stoploss_pct / 100))
+                        effective_sl = max(trailing_sl, fixed_sl)
 
-            # V4: Time-based SL tightening — as max_hold approaches, tighten stops
-            if reason is None and config.TIME_SL_ENABLED and not is_option:
-                atr_time = pos.get("atr_at_entry")
-                if atr_time is not None:
-                    day_num_t = _trading_days_between(pos["entry_date"], today)
-                    max_days_t = _trading_days_between(pos["entry_date"], pos["max_hold_date"])
-                    if max_days_t > 0:
-                        progress = day_num_t / max_days_t
-                        if progress >= 0.75:
-                            # At 75%+ of hold period: tighten to breakeven or 0.5x ATR
-                            if pos["direction"] == "bullish":
-                                time_sl = max(pos["entry_price"], peak - config.TIME_SL_THREE_QUARTER_MULT * atr_time)
-                                if ltp <= time_sl and time_sl > pos.get("stoploss_price", 0):
-                                    reason = "time_tightened_sl"
-                            else:
-                                time_sl = min(pos["entry_price"], peak + config.TIME_SL_THREE_QUARTER_MULT * atr_time)
-                                if ltp >= time_sl and time_sl < pos.get("stoploss_price", float("inf")):
-                                    reason = "time_tightened_sl"
-                        elif progress >= 0.5:
-                            # At 50-75%: tighten to 0.75x ATR
-                            if pos["direction"] == "bullish":
-                                time_sl = peak - config.TIME_SL_HALF_LIFE_MULT * atr_time
-                                if ltp <= time_sl and time_sl > pos.get("stoploss_price", 0):
-                                    reason = "time_tightened_sl"
-                            else:
-                                time_sl = peak + config.TIME_SL_HALF_LIFE_MULT * atr_time
-                                if ltp >= time_sl and time_sl < pos.get("stoploss_price", float("inf")):
-                                    reason = "time_tightened_sl"
+                        if pnl_pct >= target_pct:
+                            reason = "target"
+                        elif ltp <= effective_sl:
+                            reason = "trailing_stop" if trailing_sl > fixed_sl else "stoploss"
+                    else:
+                        trailing_sl = peak * (1 + LEGACY_TRAILING_STOP_PCT / 100)
+                        fixed_sl = pos.get("stoploss_price", pos["entry_price"] * (1 - stoploss_pct / 100))
+                        effective_sl = min(trailing_sl, fixed_sl)
 
-            if reason is None and expired:
-                reason = "expiry"
+                        if pnl_pct >= target_pct:
+                            reason = "target"
+                        elif ltp >= effective_sl:
+                            reason = "trailing_stop" if trailing_sl < fixed_sl else "stoploss"
 
-        # --- Claude Intelligence: evaluate exit decision ---
+                # V4: Time-based SL tightening — as max_hold approaches, tighten stops
+                if reason is None and config.TIME_SL_ENABLED and not is_option:
+                    atr_time = pos.get("atr_at_entry")
+                    if atr_time is not None:
+                        day_num_t = _trading_days_between(pos["entry_date"], today)
+                        max_days_t = _trading_days_between(pos["entry_date"], pos["max_hold_date"])
+                        if max_days_t > 0:
+                            progress = day_num_t / max_days_t
+                            if progress >= 0.75:
+                                # At 75%+ of hold period: tighten to breakeven or 0.5x ATR
+                                if pos["direction"] == "bullish":
+                                    time_sl = max(pos["entry_price"], peak - config.TIME_SL_THREE_QUARTER_MULT * atr_time)
+                                    if ltp <= time_sl and time_sl > pos.get("stoploss_price", 0):
+                                        reason = "time_tightened_sl"
+                                else:
+                                    time_sl = min(pos["entry_price"], peak + config.TIME_SL_THREE_QUARTER_MULT * atr_time)
+                                    if ltp >= time_sl and time_sl < pos.get("stoploss_price", float("inf")):
+                                        reason = "time_tightened_sl"
+                            elif progress >= 0.5:
+                                # At 50-75%: tighten to 0.75x ATR
+                                if pos["direction"] == "bullish":
+                                    time_sl = peak - config.TIME_SL_HALF_LIFE_MULT * atr_time
+                                    if ltp <= time_sl and time_sl > pos.get("stoploss_price", 0):
+                                        reason = "time_tightened_sl"
+                                else:
+                                    time_sl = peak + config.TIME_SL_HALF_LIFE_MULT * atr_time
+                                    if ltp >= time_sl and time_sl < pos.get("stoploss_price", float("inf")):
+                                        reason = "time_tightened_sl"
+
+                if reason is None and expired:
+                    reason = "expiry"
+
+        # --- Claude Intelligence: evaluate exit decision (V5 path) ---
         if reason is not None:
             try:
                 from claude_intel import evaluate_exit
