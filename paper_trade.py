@@ -168,7 +168,7 @@ OPT_THETA_MIN_GAIN_PCT = 10.0   # minimum gain to hold through theta
 
 # --- Market Regime ---
 NIFTY_TOKEN = "99926000"         # Nifty 50 index token
-VIX_TOKEN = "26017"              # India VIX token
+VIX_TOKEN = "99926017"           # India VIX token
 NIFTY_SMA_PERIOD = 20
 VIX_HIGH_THRESHOLD = 25.0        # reduce sizes above this
 VIX_BEARISH_THRESHOLD = 20.0     # skip opens above this AND Nifty < SMA
