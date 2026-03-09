@@ -289,11 +289,11 @@ def evaluate_entry(
     portfolio: dict,
     nifty_ltp: float | None = None,
     extra_context: str = "",
-) -> tuple[bool, str, float]:
+) -> tuple[bool, str, float, dict]:
     """Evaluate a single candidate for entry.
 
-    Returns (approved, reasoning, allocation_multiplier).
-    If Claude is unavailable, returns (True, "", 1.0) — fail-open.
+    Returns (approved, reasoning, allocation_multiplier, entry_thesis).
+    If Claude is unavailable, returns (True, "", 1.0, {}) — fail-open.
     """
     symbol = candidate.get("symbol", "?")
     direction = candidate.get("direction", "?")
@@ -346,12 +346,12 @@ Should I ENTER this trade? Respond with JSON only:
     result_text = _call_claude(prompt, max_tokens=512)
     if result_text is None:
         logger.debug("Claude entry eval unavailable for %s — auto-approve", symbol)
-        return (True, "", 1.0)
+        return (True, "", 1.0, {})
 
     decision = _parse_json(result_text)
     if not decision:
         logger.warning("Claude entry eval: unparseable response for %s", symbol)
-        return (True, "", 1.0)
+        return (True, "", 1.0, {})
 
     decision = _validate_entry_response(decision)
     _save_decision_log("entry", candidate.get("symbol", "?"), prompt, result_text, decision)
@@ -360,13 +360,23 @@ Should I ENTER this trade? Respond with JSON only:
     conviction = decision["conviction"]
     adj = decision["allocation_adj"]
 
+    # Build entry thesis from Claude's response
+    entry_thesis = {
+        "reasoning": reasoning,
+        "conviction": conviction,
+        "key_conditions": {"regime": regime, "vix": vix, "pcr": pcr},
+        "invalidation": "",
+        "expected_hold": "",
+        "target_scenario": "",
+    }
+
     if action == "SKIP":
         logger.info("CLAUDE SKIP %s (%s): %s", symbol, instrument, reasoning)
-        return (False, reasoning, 0.0)
+        return (False, reasoning, 0.0, entry_thesis)
 
     logger.info("CLAUDE TRADE %s (%s) [%s]: %s (adj: %.1fx)",
                 symbol, instrument, conviction, reasoning, adj)
-    return (True, reasoning, adj)
+    return (True, reasoning, adj, entry_thesis)
 
 
 def evaluate_candidates(
@@ -480,6 +490,7 @@ def evaluate_exit(
     portfolio: dict,
     vix: float | None = None,
     extra_context: str = "",
+    previous_assessment: str = "",
 ) -> tuple[bool, str]:
     """Evaluate whether to proceed with a triggered exit.
 
@@ -518,6 +529,17 @@ def evaluate_exit(
     except Exception:
         pass
 
+    # Build entry thesis context
+    thesis_str = ""
+    thesis = pos.get("entry_thesis", {})
+    if thesis and thesis.get("reasoning"):
+        thesis_str = f"\nENTRY THESIS:\n- \"{thesis['reasoning']}\"\n- Invalidation: \"{thesis.get('invalidation', 'N/A')}\"\n"
+
+    # Build previous assessment context
+    prev_str = ""
+    if previous_assessment:
+        prev_str = f"\nPREVIOUS ASSESSMENT:\n{previous_assessment}\n"
+
     prompt = f"""EXIT DECISION for {symbol} ({instrument}, {direction})
 
 POSITION:
@@ -529,7 +551,7 @@ POSITION:
 
 EXIT TRIGGER: {exit_reason}
 VIX: {vix or 'N/A'}
-{f"Context: {extra_context}" if extra_context else ""}
+{f"Context: {extra_context}" if extra_context else ""}{thesis_str}{prev_str}
 
 PORTFOLIO:
 {_build_portfolio_context(portfolio)}

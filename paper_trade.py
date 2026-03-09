@@ -2563,6 +2563,14 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
                     if alloc.get("claude_reasoning"):
                         fut_pos["claude_reasoning"] = alloc["claude_reasoning"]
                         fut_pos["claude_conviction"] = alloc.get("claude_conviction", "")
+                        fut_pos["entry_thesis"] = {
+                            "reasoning": alloc["claude_reasoning"],
+                            "conviction": alloc.get("claude_conviction", "medium"),
+                            "key_conditions": {"regime": regime, "vix": vix_ltp, "pcr": pcr},
+                            "invalidation": "",
+                            "expected_hold": "",
+                            "target_scenario": "",
+                        }
                     position = fut_pos
                     # Skip equity/options for this symbol since we're in futures
                     portfolio["positions"].append(position)
@@ -2625,6 +2633,14 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
             if alloc.get("claude_reasoning"):
                 position["claude_reasoning"] = alloc["claude_reasoning"]
                 position["claude_conviction"] = alloc.get("claude_conviction", "")
+                position["entry_thesis"] = {
+                    "reasoning": alloc["claude_reasoning"],
+                    "conviction": alloc.get("claude_conviction", "medium"),
+                    "key_conditions": {"regime": regime, "vix": vix_ltp, "pcr": pcr},
+                    "invalidation": "",
+                    "expected_hold": "",
+                    "target_scenario": "",
+                }
         else:
             # --- Equity buy path ---
             entry_price = apply_slippage(ltp, "EQ", "buy")
@@ -2695,6 +2711,15 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
             if alloc.get("claude_reasoning"):
                 position["claude_reasoning"] = alloc["claude_reasoning"]
                 position["claude_conviction"] = alloc.get("claude_conviction", "")
+                # Build entry thesis from batch eval results
+                position["entry_thesis"] = {
+                    "reasoning": alloc["claude_reasoning"],
+                    "conviction": alloc.get("claude_conviction", "medium"),
+                    "key_conditions": {"regime": regime, "vix": vix_ltp, "pcr": pcr},
+                    "invalidation": "",
+                    "expected_hold": "",
+                    "target_scenario": "",
+                }
 
             logger.info("OPENED %s BUY x%d @ ₹%.2f (slipped from ₹%.2f, ₹%.0f, score=%.1f)",
                         symbol, quantity, entry_price, ltp, actual_allocated, alloc['score'])
@@ -4016,7 +4041,7 @@ def _try_index_strategies(smart_api, portfolio: dict) -> int:
                                 "score": 0, "categories": ["IronCondor"],
                                 "sector": "Index",
                             }
-                            approved, reasoning, adj = evaluate_entry(
+                            approved, reasoning, adj, thesis = evaluate_entry(
                                 condor_candidate, "CONDOR", regime, vix_ltp,
                                 None, 1.0, idx_ltp, portfolio, nifty_ltp=idx_ltp,
                                 extra_context=f"Credit=₹{condor_data['net_credit']:.0f}, MaxLoss=₹{condor_data['max_loss']:.0f}, VIX={vix_ltp:.1f}")
@@ -4025,6 +4050,7 @@ def _try_index_strategies(smart_api, portfolio: dict) -> int:
                                 continue
                             condor_data["claude_reasoning"] = reasoning
                             condor_data["claude_conviction"] = "medium"
+                            condor_data["entry_thesis"] = thesis
                         except Exception as e:
                             logger.debug("Claude entry eval failed for condor: %s", e)
                             reasoning = ""
@@ -4037,6 +4063,8 @@ def _try_index_strategies(smart_api, portfolio: dict) -> int:
                             pos["index_name"] = idx_name
                             if condor_data.get("claude_reasoning"):
                                 pos["claude_reasoning"] = condor_data["claude_reasoning"]
+                            if condor_data.get("entry_thesis"):
+                                pos["entry_thesis"] = condor_data["entry_thesis"]
                             opened += 1
                             logger.info("OPENED iron condor on %s: credit=₹%.0f, max_loss=₹%.0f",
                                         idx_name, condor_data["net_credit"], condor_data["max_loss"])
@@ -4086,7 +4114,7 @@ def _try_index_strategies(smart_api, portfolio: dict) -> int:
                                             "score": 0, "categories": ["Momentum", "Breakout"],
                                             "sector": "Index",
                                         }
-                                        approved, momentum_reasoning, adj = evaluate_entry(
+                                        approved, momentum_reasoning, adj, momentum_thesis = evaluate_entry(
                                             mom_candidate, "MOMENTUM", regime, vix_ltp,
                                             None, 1.0, idx_ltp, portfolio, nifty_ltp=idx_ltp,
                                             extra_context=f"{opt_type} {strike} @ ₹{premium:.2f}, cost=₹{total_cost:.0f}")
@@ -4112,6 +4140,8 @@ def _try_index_strategies(smart_api, portfolio: dict) -> int:
                                         pos["index_name"] = idx_name
                                         if momentum_reasoning:
                                             pos["claude_reasoning"] = momentum_reasoning
+                                        if locals().get("momentum_thesis"):
+                                            pos["entry_thesis"] = momentum_thesis
                                         opened += 1
                                         logger.info("OPENED momentum %s on %s: %s %s @ ₹%.2f",
                                                     breakout, idx_name, opt_type, strike, premium)
@@ -4186,7 +4216,7 @@ def _try_index_strategies(smart_api, portfolio: dict) -> int:
                                     "score": 0, "categories": ["MonthlyCondor"],
                                     "sector": "Index",
                                 }
-                                approved, mc_reasoning, _ = evaluate_entry(
+                                approved, mc_reasoning, _, mc_thesis = evaluate_entry(
                                     mc_candidate, "CONDOR", "SIDEWAYS", vix_now,
                                     None, 1.0, idx_ltp, portfolio, nifty_ltp=idx_ltp,
                                     extra_context=f"Monthly condor. Credit=₹{condor_data['net_credit']:.0f}, MaxLoss=₹{condor_data['max_loss']:.0f}, VIX={vix_now:.1f}")
@@ -4194,6 +4224,7 @@ def _try_index_strategies(smart_api, portfolio: dict) -> int:
                                     logger.info("CLAUDE SKIP monthly condor on %s: %s", idx_name, mc_reasoning)
                                     continue
                                 condor_data["claude_reasoning"] = mc_reasoning
+                                condor_data["entry_thesis"] = mc_thesis
                             except Exception as e:
                                 logger.debug("Claude entry eval failed for monthly condor: %s", e)
 
@@ -4207,6 +4238,8 @@ def _try_index_strategies(smart_api, portfolio: dict) -> int:
                                 pos["monthly_sl_cap"] = round(TOTAL_CAPITAL * config.MONTHLY_CONDOR_MONTHLY_SL_PCT, 2)
                                 if condor_data.get("claude_reasoning"):
                                     pos["claude_reasoning"] = condor_data["claude_reasoning"]
+                                if condor_data.get("entry_thesis"):
+                                    pos["entry_thesis"] = condor_data["entry_thesis"]
                                 opened += 1
                                 logger.info("OPENED monthly condor on %s: credit=₹%.0f, max_loss=₹%.0f, expiry=%s",
                                             idx_name, condor_data["net_credit"], condor_data["max_loss"], expiry)

@@ -37,22 +37,28 @@ def _now_ist():
 def _load_state() -> dict:
     """Load monitor state, falling back to .bak if main file is corrupt."""
     bak = STATE_FILE.with_suffix(".json.bak")
+    state = {}
     for path in (STATE_FILE, bak):
         if path.exists():
             try:
-                return json.loads(path.read_text())
+                state = json.loads(path.read_text())
+                break
             except (json.JSONDecodeError, OSError):
                 logger.warning("Corrupt state file: %s — trying next", path)
-    return {
-        "last_check": {},
-        "last_regime_check": "",
-        "last_hourly_digest": "",
-        "circuit_breaker_active": False,
-        "circuit_breaker_date": "",
-        "daily_realized_loss": 0.0,
-        "daily_realized_date": "",
-        "nifty_at_session_start": None,
-    }
+
+    # Ensure all expected keys exist (safe for old state files missing new keys)
+    state.setdefault("last_check", {})
+    state.setdefault("last_regime_check", "")
+    state.setdefault("last_hourly_digest", "")
+    state.setdefault("circuit_breaker_active", False)
+    state.setdefault("circuit_breaker_date", "")
+    state.setdefault("daily_realized_loss", 0.0)
+    state.setdefault("daily_realized_date", "")
+    state.setdefault("nifty_at_session_start", None)
+    state.setdefault("position_assessments", {})
+    state.setdefault("claude_consecutive_failures", 0)
+    state.setdefault("claude_lockdown_active", False)
+    return state
 
 
 def _save_state(state: dict):
@@ -69,6 +75,22 @@ def _save_state(state: dict):
     tmp = STATE_FILE.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(state, indent=2, default=str))
     tmp.replace(STATE_FILE)
+
+
+def save_position_assessment(state: dict, symbol: str, action: str, reasoning: str, signals: list[str]):
+    """Save Claude's assessment for a position."""
+    state.setdefault("position_assessments", {})
+    state["position_assessments"][symbol] = {
+        "timestamp": _now_ist().isoformat(),
+        "action": action,
+        "reasoning": reasoning,
+        "signals_at_assessment": signals,
+    }
+
+
+def get_position_assessment(state: dict, symbol: str) -> dict | None:
+    """Get last Claude assessment for a position."""
+    return state.get("position_assessments", {}).get(symbol)
 
 
 def cleanup_closed_positions(portfolio: dict, state: dict):

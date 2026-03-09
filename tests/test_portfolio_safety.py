@@ -177,7 +177,9 @@ class TestStateSafety:
         bak.write_text(json.dumps(good))
 
         result = smart_monitor._load_state()
-        assert result == good
+        # result is a superset of good (includes defaults for new keys)
+        for key, val in good.items():
+            assert result[key] == val
 
     def test_load_state_returns_defaults_if_both_corrupt(self, state_dir):
         """Both corrupt → return defaults."""
