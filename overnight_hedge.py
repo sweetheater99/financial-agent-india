@@ -8,11 +8,14 @@ Protects naked F&O positions at EOD by applying a cascade of rules:
 5. Moderate/high gain → ask Claude for hedge vs carry decision
 """
 
+import argparse
 import json
 import logging
+import time
 from datetime import datetime, timezone, timedelta
 
 from config import (
+    OVERNIGHT_HEDGE_ENABLED,
     OVERNIGHT_NAKED_INSTRUMENTS,
     OVERNIGHT_MIN_GAIN_FOR_NAKED_CARRY,
     OVERNIGHT_MIN_GAIN_FOR_HEDGE,
@@ -25,6 +28,8 @@ from config import (
 )
 
 logger = logging.getLogger("paper_trade")
+
+IST = timezone(timedelta(hours=5, minutes=30))
 
 
 def is_naked_fno(pos: dict) -> bool:
@@ -248,7 +253,6 @@ def execute_hedge(portfolio: dict, pos: dict, smart_api, hedge_leg: dict, hedge_
     Adds hedge_leg dict with option details, premium, cost, and date.
     Returns True on success.
     """
-    IST = timezone(timedelta(hours=5, minutes=30))
     quantity = hedge_leg.get("quantity", 0)
     pos["hedge_leg"] = {
         "option_type": hedge_leg["option_type"],
@@ -275,7 +279,6 @@ def execute_carry_naked(pos: dict, current_price: float, reasoning: str) -> dict
     Tightens SL and records approval metadata on the position.
     Returns the updated position.
     """
-    IST = timezone(timedelta(hours=5, minutes=30))
     new_sl = tighten_stop_loss(pos, current_price)
     old_sl = pos.get("stoploss_price", 0)
     pos["stoploss_price"] = new_sl
@@ -292,3 +295,354 @@ def execute_carry_naked(pos: dict, current_price: float, reasoning: str) -> dict
         reasoning,
     )
     return pos
+
+
+# ---------------------------------------------------------------------------
+# TELEGRAM FORMATTING
+# ---------------------------------------------------------------------------
+
+def _format_telegram_message(results: list[dict], vix: float, regime: str) -> str:
+    """Format overnight hedge scan results for Telegram (HTML parse_mode)."""
+    if not results:
+        return "<b>Overnight Hedge Scan</b>\n\nNo naked F&O positions found."
+
+    closed = [r for r in results if r["action"] == "close"]
+    hedged = [r for r in results if r["action"] == "hedge"]
+    carried = [r for r in results if r["action"] == "carry_naked"]
+
+    lines = ["<b>Overnight Hedge Scan</b>", ""]
+
+    if closed:
+        lines.append(f"<b>CLOSED ({len(closed)})</b>")
+        for r in closed:
+            gain_str = f"{r.get('gain_pct', 0):.0%}"
+            lines.append(f"  {r['pos_id']} — gain {gain_str} — {r['reason']}")
+        lines.append("")
+
+    if hedged:
+        lines.append(f"<b>HEDGED ({len(hedged)})</b>")
+        for r in hedged:
+            gain_str = f"{r.get('gain_pct', 0):.0%}"
+            desc = r.get("hedge_desc", "")
+            cost = r.get("hedge_cost", 0)
+            cost_pct = r.get("cost_pct", 0)
+            lines.append(f"  {r['pos_id']} — gain {gain_str} — {r['reason']}")
+            if desc:
+                lines.append(f"    hedge: {desc} (cost ₹{cost:.0f}, {cost_pct:.2%})")
+        lines.append("")
+
+    if carried:
+        lines.append(f"<b>CARRY NAKED ({len(carried)})</b>")
+        for r in carried:
+            gain_str = f"{r.get('gain_pct', 0):.0%}"
+            lines.append(f"  {r['pos_id']} — gain {gain_str} — {r['reason']}")
+            if r.get("reasoning"):
+                lines.append(f"    reasoning: {r['reasoning']}")
+        lines.append("")
+
+    lines.append(f"VIX: {vix:.1f} | Regime: {regime}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# MAIN SCAN ORCHESTRATOR
+# ---------------------------------------------------------------------------
+
+def _parse_expiry_days(expiry_str: str) -> int:
+    """Parse expiry string (DDMONYYYY) and return days to expiry."""
+    try:
+        exp_date = datetime.strptime(expiry_str, "%d%b%Y").date()
+        today = datetime.now(IST).date()
+        return (exp_date - today).days
+    except (ValueError, TypeError):
+        return 0  # treat unparseable as expired → will trigger close
+
+
+def run_overnight_hedge_scan(smart_api, dry_run: bool = False) -> list[dict]:
+    """Main orchestrator for overnight hedge protection.
+
+    Scans all naked F&O positions and applies guardrails + Claude decisions.
+    Returns list of result dicts with actions taken.
+    """
+    import config
+    from paper_trade import (
+        load_portfolio,
+        save_portfolio,
+        _telegram_send,
+        get_ltp,
+        get_ltp_nfo,
+        resolve_option_contract,
+    )
+    from claude_intel import evaluate_overnight
+    from regime import classify_regime
+
+    # 1. Check feature flag
+    if not OVERNIGHT_HEDGE_ENABLED:
+        logger.info("Overnight hedge scan disabled")
+        return []
+
+    # 2. Load portfolio and filter naked positions
+    portfolio = load_portfolio()
+    positions = portfolio.get("positions", [])
+    naked = [p for p in positions if is_naked_fno(p)]
+
+    if not naked:
+        logger.info("No naked F&O positions — nothing to scan")
+        return []
+
+    logger.info("Found %d naked F&O position(s) to scan", len(naked))
+
+    # 3. Fetch VIX
+    try:
+        import yfinance as yf
+        vix = yf.Ticker("^INDIAVIX").history(period="1d")["Close"].iloc[-1]
+        logger.info("India VIX: %.2f", vix)
+    except Exception as e:
+        logger.warning("VIX fetch failed, defaulting to 15.0: %s", e)
+        vix = 15.0
+
+    # 4. Fetch regime
+    try:
+        regime_data = classify_regime(smart_api, vix=vix)
+        regime = regime_data.get("regime", "UNKNOWN")
+        logger.info("Market regime: %s", regime)
+    except Exception as e:
+        logger.warning("Regime classification failed, defaulting to UNKNOWN: %s", e)
+        regime = "UNKNOWN"
+
+    results = []
+
+    # 5. Process each naked position
+    for pos in naked:
+        pos_id = pos.get("symbol", "?")
+        instrument = pos.get("instrument", "")
+        direction = pos.get("direction", "bullish")
+        entry_price = pos.get("entry_price", 0)
+        expiry_str = pos.get("expiry", "")
+
+        # 5a. Fetch current price
+        try:
+            nfo_token = pos.get("nfo_token")
+            trading_symbol = pos.get("trading_symbol")
+            if nfo_token and trading_symbol:
+                current_price = get_ltp_nfo(smart_api, trading_symbol, nfo_token)
+            else:
+                current_price = get_ltp(smart_api, pos.get("symbol", ""), pos.get("token", ""))
+            time.sleep(config.API_DELAY)
+        except Exception as e:
+            logger.error("LTP fetch failed for %s: %s", pos_id, e)
+            current_price = None
+
+        if current_price is None:
+            # Fail-safe: close if we can't get price
+            reason = "LTP fetch failed — closing as fail-safe"
+            if not dry_run:
+                execute_close(portfolio, pos, smart_api, entry_price, reason)
+            results.append({
+                "pos_id": pos_id,
+                "action": "close",
+                "reason": reason,
+                "gain_pct": 0,
+            })
+            continue
+
+        # 5b. Calculate gain and days to expiry
+        gain_pct = _calc_gain_pct(entry_price, current_price, direction)
+        days_to_expiry = _parse_expiry_days(expiry_str)
+
+        # 5c. Apply guardrails
+        guardrail = apply_guardrails(pos, current_price, vix, days_to_expiry)
+
+        if guardrail["action"] == "close":
+            # 5d. Guardrail says close
+            if not dry_run:
+                execute_close(portfolio, pos, smart_api, current_price, guardrail["reason"])
+            results.append({
+                "pos_id": pos_id,
+                "action": "close",
+                "reason": guardrail["reason"],
+                "gain_pct": gain_pct,
+            })
+            continue
+
+        # 5e. Guardrail says ask_claude
+        try:
+            claude_raw = evaluate_overnight(pos, current_price, gain_pct, vix, regime)
+            decision = parse_overnight_decision(claude_raw.get("action", None) if isinstance(claude_raw, dict) else claude_raw)
+            # If evaluate_overnight already returns a parsed dict, use it directly
+            if isinstance(claude_raw, dict) and claude_raw.get("action") in ("close", "hedge", "carry_naked"):
+                decision = claude_raw
+            time.sleep(config.API_DELAY)
+        except Exception as e:
+            logger.error("Claude evaluate_overnight failed for %s: %s", pos_id, e)
+            decision = {"action": "hedge", "reasoning": "Claude call failed — defaulting to hedge"}
+
+        # Enforce thresholds
+        decision = enforce_carry_naked_threshold(decision, gain_pct)
+
+        # Block carry_naked if VIX is high
+        if decision.get("action") == "carry_naked" and vix >= OVERNIGHT_VIX_NAKED_BLOCK:
+            decision = {"action": "hedge", "reasoning": f"carry_naked blocked — VIX {vix:.1f} >= {OVERNIGHT_VIX_NAKED_BLOCK}"}
+
+        reasoning = decision.get("reasoning", "")
+
+        # 5f. Execute decision
+        if decision["action"] == "close":
+            if not dry_run:
+                execute_close(portfolio, pos, smart_api, current_price, reasoning)
+            results.append({
+                "pos_id": pos_id,
+                "action": "close",
+                "reason": reasoning,
+                "gain_pct": gain_pct,
+                "reasoning": reasoning,
+            })
+
+        elif decision["action"] == "hedge":
+            # Build hedge leg
+            # Get spot price for hedge strike calculation
+            try:
+                spot_price = get_ltp(smart_api, pos.get("symbol", ""), pos.get("token", ""))
+                time.sleep(config.API_DELAY)
+            except Exception:
+                spot_price = current_price  # fallback to current NFO price
+
+            if spot_price is None:
+                spot_price = current_price
+
+            hedge_leg = build_hedge_leg(pos, spot_price)
+
+            # Resolve option contract
+            try:
+                contract = resolve_option_contract(
+                    smart_api,
+                    hedge_leg["symbol"],
+                    hedge_leg["strike"],
+                    expiry_str,
+                )
+                time.sleep(config.API_DELAY)
+            except Exception as e:
+                logger.error("resolve_option_contract failed for %s: %s", pos_id, e)
+                contract = None
+
+            if contract is None:
+                # Can't find hedge contract — close as fail-safe
+                close_reason = "hedge contract unavailable — closing as fail-safe"
+                if not dry_run:
+                    execute_close(portfolio, pos, smart_api, current_price, close_reason)
+                results.append({
+                    "pos_id": pos_id,
+                    "action": "close",
+                    "reason": close_reason,
+                    "gain_pct": gain_pct,
+                })
+                continue
+
+            # Get hedge premium
+            try:
+                hedge_premium = get_ltp_nfo(
+                    smart_api,
+                    contract["trading_symbol"],
+                    contract["token"],
+                )
+                time.sleep(config.API_DELAY)
+            except Exception as e:
+                logger.error("Hedge premium fetch failed for %s: %s", pos_id, e)
+                hedge_premium = None
+
+            if hedge_premium is None:
+                close_reason = "hedge premium unavailable — closing as fail-safe"
+                if not dry_run:
+                    execute_close(portfolio, pos, smart_api, current_price, close_reason)
+                results.append({
+                    "pos_id": pos_id,
+                    "action": "close",
+                    "reason": close_reason,
+                    "gain_pct": gain_pct,
+                })
+                continue
+
+            # Check cost
+            position_value = abs(entry_price * pos.get("quantity", 1))
+            cost_check = check_hedge_cost(position_value, hedge_premium, hedge_leg["quantity"])
+
+            if not cost_check["affordable"]:
+                close_reason = f"hedge too expensive ({cost_check['cost_pct']:.2%}) — closing"
+                if not dry_run:
+                    execute_close(portfolio, pos, smart_api, current_price, close_reason)
+                results.append({
+                    "pos_id": pos_id,
+                    "action": "close",
+                    "reason": close_reason,
+                    "gain_pct": gain_pct,
+                })
+                continue
+
+            # Execute hedge
+            hedge_desc = f"{hedge_leg['option_type']} {hedge_leg['strike']} @ ₹{hedge_premium:.2f}"
+            if not dry_run:
+                execute_hedge(portfolio, pos, smart_api, hedge_leg, hedge_premium)
+            results.append({
+                "pos_id": pos_id,
+                "action": "hedge",
+                "reason": reasoning,
+                "gain_pct": gain_pct,
+                "hedge_desc": hedge_desc,
+                "hedge_cost": cost_check["cost"],
+                "cost_pct": cost_check["cost_pct"],
+                "reasoning": reasoning,
+            })
+
+        elif decision["action"] == "carry_naked":
+            if not dry_run:
+                execute_carry_naked(pos, current_price, reasoning)
+            results.append({
+                "pos_id": pos_id,
+                "action": "carry_naked",
+                "reason": reasoning,
+                "gain_pct": gain_pct,
+                "reasoning": reasoning,
+            })
+
+    # 6. Save portfolio
+    if not dry_run and results:
+        save_portfolio(portfolio)
+        logger.info("Portfolio saved after overnight hedge scan")
+
+    # 7. Send Telegram message
+    msg = _format_telegram_message(results, vix, regime)
+    if dry_run:
+        logger.info("DRY RUN — Telegram message:\n%s", msg)
+    else:
+        try:
+            _telegram_send(msg)
+        except Exception as e:
+            logger.error("Telegram send failed: %s", e)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# CLI ENTRY POINT
+# ---------------------------------------------------------------------------
+
+def main():
+    """CLI entry point for overnight hedge scan."""
+    parser = argparse.ArgumentParser(description="Overnight hedge scan for naked F&O positions")
+    parser.add_argument("--dry", action="store_true", help="Dry run — no trades, no Telegram")
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+
+    from connect import get_session
+
+    logger.info("Connecting to SmartAPI...")
+    smart_api = get_session()
+    logger.info("Running overnight hedge scan (dry_run=%s)", args.dry)
+
+    results = run_overnight_hedge_scan(smart_api, dry_run=args.dry)
+    logger.info("Overnight hedge scan complete — %d position(s) processed", len(results))
+
+
+if __name__ == "__main__":
+    main()
