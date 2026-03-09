@@ -1935,6 +1935,31 @@ def calc_performance_analytics(closed_trades: list, capital: float) -> dict | No
 
 
 # ---------------------------------------------------------------------------
+# V6 Claude-First: Safety-only pre-filter
+# ---------------------------------------------------------------------------
+
+def _v6_pre_filter_candidates(candidates: list[dict], portfolio: dict) -> list[dict]:
+    """V6: Only filter for safety constraints, NOT market conditions.
+    Claude sees everything else as context and decides."""
+    filtered = []
+    open_symbols = {p["symbol"] for p in portfolio.get("positions", []) if p.get("status") == "open"}
+
+    for c in candidates:
+        symbol = c.get("symbol", "")
+        # Skip: already have position in this symbol
+        if symbol in open_symbols:
+            continue
+        # Skip: sector limit (max 2 per sector)
+        if check_sector_limit(symbol, portfolio.get("positions", [])):
+            continue
+        # Skip: on cooldown (recently stopped out)
+        if check_cooldown(symbol, portfolio.get("closed_trades", []), _today_ist()):
+            continue
+        filtered.append(c)
+    return filtered
+
+
+# ---------------------------------------------------------------------------
 # Open Positions
 # ---------------------------------------------------------------------------
 
@@ -2206,159 +2231,169 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
         logger.info("No candidates after cooldown/sector filters.")
         return 0
 
-    # --- Entry Quality Filters (regime, RSI, volume, news) ---
-    quality_filtered = []
-    for c in filtered:
-        symbol = c["symbol"]
-        direction = c["direction"]
+    # --- Entry Quality Filters ---
+    import config as cfg_module
+    if getattr(cfg_module, "V6_CLAUDE_FIRST", False):
+        # V6: Only safety filters (duplicate, sector, cooldown) — already applied above.
+        # Pass everything to Claude with full context.
+        quality_filtered = _v6_pre_filter_candidates(filtered, portfolio)
+        if not quality_filtered:
+            logger.info("V6: No candidates after safety filters.")
+            return 0
+    else:
+        # --- V5: Entry Quality Filters (regime, RSI, volume, news) ---
+        quality_filtered = []
+        for c in filtered:
+            symbol = c["symbol"]
+            direction = c["direction"]
 
-        # V2 regime filter
-        if regime == "TRENDING_DOWN" and direction == "bullish":
-            logger.info("SKIP %s: bullish entry blocked in TRENDING_DOWN regime", symbol)
-            continue
-        if regime == "TRENDING_UP" and direction == "bearish":
-            logger.info("SKIP %s: bearish entry blocked in TRENDING_UP regime", symbol)
-            continue
-        if regime == "SIDEWAYS" and c.get("instrument_hint") != "SPREAD":
-            # In SIDEWAYS, allow spreads but skip directional equity
-            logger.info("SKIP %s: directional equity blocked in SIDEWAYS regime (spreads only)", symbol)
-            continue
-        if regime == "UNCERTAIN" and direction == "bearish":
-            # UNCERTAIN → conservative, equity only (bullish)
-            logger.info("SKIP %s: bearish entry blocked in UNCERTAIN regime (conservative)", symbol)
-            continue
-        rsi = c.get("rsi")
-        vol_ratio = c.get("volume_ratio")
-        news = c.get("news_sentiment")
-
-        # RSI filter
-        if rsi is not None:
-            if direction == "bullish" and not (RSI_BULLISH_MIN <= rsi <= RSI_BULLISH_MAX):
-                logger.info("SKIP %s: RSI=%.1f outside bullish range [%d,%d]",
-                            symbol, rsi, RSI_BULLISH_MIN, RSI_BULLISH_MAX)
+            # V2 regime filter
+            if regime == "TRENDING_DOWN" and direction == "bullish":
+                logger.info("SKIP %s: bullish entry blocked in TRENDING_DOWN regime", symbol)
                 continue
-            if direction == "bearish" and not (RSI_BEARISH_MIN <= rsi <= RSI_BEARISH_MAX):
-                logger.info("SKIP %s: RSI=%.1f outside bearish range [%d,%d]",
-                            symbol, rsi, RSI_BEARISH_MIN, RSI_BEARISH_MAX)
+            if regime == "TRENDING_UP" and direction == "bearish":
+                logger.info("SKIP %s: bearish entry blocked in TRENDING_UP regime", symbol)
                 continue
-
-        # Volume filter
-        if vol_ratio is not None and vol_ratio < VOLUME_MIN_RATIO:
-            logger.info("SKIP %s: volume ratio %.2f < %.1f minimum",
-                        symbol, vol_ratio, VOLUME_MIN_RATIO)
-            continue
-
-        # V9: PCR contrarian filter (Nitin Murarka)
-        if config.PCR_FILTER_ENABLED and pcr > 0:
-            if direction == "bullish" and pcr < config.PCR_BEARISH_CONTRARIAN:
-                # PCR < 0.7 = too many calls, market likely topping → skip bullish
-                logger.info("SKIP %s: PCR %.2f < %.1f (bearish extreme — skip bullish)", symbol, pcr, config.PCR_BEARISH_CONTRARIAN)
+            if regime == "SIDEWAYS" and c.get("instrument_hint") != "SPREAD":
+                # In SIDEWAYS, allow spreads but skip directional equity
+                logger.info("SKIP %s: directional equity blocked in SIDEWAYS regime (spreads only)", symbol)
                 continue
-            if direction == "bearish" and pcr > config.PCR_BULLISH_CONTRARIAN:
-                # PCR > 1.3 = too many puts, market likely bottoming → skip bearish
-                logger.info("SKIP %s: PCR %.2f > %.1f (bullish extreme — skip bearish)", symbol, pcr, config.PCR_BULLISH_CONTRARIAN)
+            if regime == "UNCERTAIN" and direction == "bearish":
+                # UNCERTAIN → conservative, equity only (bullish)
+                logger.info("SKIP %s: bearish entry blocked in UNCERTAIN regime (conservative)", symbol)
                 continue
+            rsi = c.get("rsi")
+            vol_ratio = c.get("volume_ratio")
+            news = c.get("news_sentiment")
 
-        # V9: Max pain gravity near expiry
-        if config.MAX_PAIN_FILTER_ENABLED and max_pain > 0 and nifty_candles:
-            nifty_ltp_current = float(nifty_candles[-1][4])
-            distance_from_mp = abs(nifty_ltp_current - max_pain) / nifty_ltp_current * 100
-            if distance_from_mp > config.MAX_PAIN_PROXIMITY_PCT:
-                # Price is far from max pain — near expiry, price tends to gravitate toward it
-                if direction == "bullish" and nifty_ltp_current > max_pain:
-                    # Bullish but price is above max pain — gravity will pull down
-                    c["allocation_multiplier"] = c.get("allocation_multiplier", 1.0) * 0.75
-                    logger.info("%s: Price %.0f > max pain %.0f by %.1f%% — reducing bullish allocation 25%%",
-                               symbol, nifty_ltp_current, max_pain, distance_from_mp)
-                elif direction == "bearish" and nifty_ltp_current < max_pain:
-                    # Bearish but price is below max pain — gravity will pull up
-                    c["allocation_multiplier"] = c.get("allocation_multiplier", 1.0) * 0.75
-                    logger.info("%s: Price %.0f < max pain %.0f by %.1f%% — reducing bearish allocation 25%%",
-                               symbol, nifty_ltp_current, max_pain, distance_from_mp)
-
-        # News / earnings filter
-        if news is not None:
-            if SKIP_EARNINGS_SOON and news.get("has_earnings_soon"):
-                logger.info("SKIP %s: earnings event imminent (gap risk)", symbol)
-                continue
-            if SKIP_CONTRADICTING_NEWS:
-                sentiment = news.get("sentiment")
-                if direction == "bullish" and sentiment == "negative":
-                    logger.info("SKIP %s: bullish signal contradicts negative news", symbol)
+            # RSI filter
+            if rsi is not None:
+                if direction == "bullish" and not (RSI_BULLISH_MIN <= rsi <= RSI_BULLISH_MAX):
+                    logger.info("SKIP %s: RSI=%.1f outside bullish range [%d,%d]",
+                                symbol, rsi, RSI_BULLISH_MIN, RSI_BULLISH_MAX)
                     continue
-                if direction == "bearish" and sentiment == "positive":
-                    logger.info("SKIP %s: bearish signal contradicts positive news", symbol)
+                if direction == "bearish" and not (RSI_BEARISH_MIN <= rsi <= RSI_BEARISH_MAX):
+                    logger.info("SKIP %s: RSI=%.1f outside bearish range [%d,%d]",
+                                symbol, rsi, RSI_BEARISH_MIN, RSI_BEARISH_MAX)
                     continue
 
-        # V3: Macro BLOCK_BULLISH gate
-        if macro and macro.get("hard_gate") == "BLOCK_BULLISH" and direction == "bullish":
-            logger.info("SKIP %s: bullish blocked by macro gate (%s)", symbol, macro.get("hard_gate_reason", ""))
-            continue
-
-        # V3: Nasdaq IT crash → block IT sector bullish
-        if macro and macro.get("hard_gate") == "BLOCK_IT_BULLISH" and direction == "bullish":
-            sector = SYMBOL_SECTOR.get(symbol, "")
-            if sector == "IT":
-                logger.info("SKIP %s: IT bullish blocked by Nasdaq crash", symbol)
+            # Volume filter
+            if vol_ratio is not None and vol_ratio < VOLUME_MIN_RATIO:
+                logger.info("SKIP %s: volume ratio %.2f < %.1f minimum",
+                            symbol, vol_ratio, VOLUME_MIN_RATIO)
                 continue
 
-        # V3: Supertrend disagreement → reduce allocation
-        if supertrend_signal != "unknown":
-            if direction == "bullish" and supertrend_signal == "sell":
-                c["allocation_multiplier"] = c.get("allocation_multiplier", 1.0) * (1 - config.SUPERTREND_DISAGREE_REDUCTION)
-                logger.info("%s: Supertrend disagrees (sell vs bullish), reducing allocation 25%%", symbol)
-            elif direction == "bearish" and supertrend_signal == "buy":
-                c["allocation_multiplier"] = c.get("allocation_multiplier", 1.0) * (1 - config.SUPERTREND_DISAGREE_REDUCTION)
-                logger.info("%s: Supertrend disagrees (buy vs bearish), reducing allocation 25%%", symbol)
-
-        # V3: X/Twitter contradiction filter (soft)
-        if x_sentiment and x_sentiment.get("sentiment") == "crisis":
-            logger.warning("X sentiment: CRISIS detected — %s", x_sentiment.get("key_themes", []))
-
-        # YouTube stock intel gate (Mode B) — only as contradiction filter
-        try:
-            from youtube_intel import fetch_stock_intel
-            yt_stock = fetch_stock_intel(symbol)
-            if yt_stock and yt_stock.get("sentiment"):
-                if (direction == "bullish" and yt_stock["sentiment"] == "bearish" and
-                    yt_stock.get("confidence") == "high"):
-                    logger.info("SKIP %s: YouTube strongly bearish (contradicts bullish signal)", symbol)
+            # V9: PCR contrarian filter (Nitin Murarka)
+            if config.PCR_FILTER_ENABLED and pcr > 0:
+                if direction == "bullish" and pcr < config.PCR_BEARISH_CONTRARIAN:
+                    # PCR < 0.7 = too many calls, market likely topping → skip bullish
+                    logger.info("SKIP %s: PCR %.2f < %.1f (bearish extreme — skip bullish)", symbol, pcr, config.PCR_BEARISH_CONTRARIAN)
                     continue
-                if (direction == "bearish" and yt_stock["sentiment"] == "bullish" and
-                    yt_stock.get("confidence") == "high"):
-                    logger.info("SKIP %s: YouTube strongly bullish (contradicts bearish signal)", symbol)
+                if direction == "bearish" and pcr > config.PCR_BULLISH_CONTRARIAN:
+                    # PCR > 1.3 = too many puts, market likely bottoming → skip bearish
+                    logger.info("SKIP %s: PCR %.2f > %.1f (bullish extreme — skip bearish)", symbol, pcr, config.PCR_BULLISH_CONTRARIAN)
                     continue
-        except Exception:
-            pass  # YouTube intel is optional
 
-        # Earnings blackout check
-        if is_near_earnings(symbol, today):
-            logger.info("SKIP %s: earnings within 48 hours (blackout)", symbol)
-            continue
+            # V9: Max pain gravity near expiry
+            if config.MAX_PAIN_FILTER_ENABLED and max_pain > 0 and nifty_candles:
+                nifty_ltp_current = float(nifty_candles[-1][4])
+                distance_from_mp = abs(nifty_ltp_current - max_pain) / nifty_ltp_current * 100
+                if distance_from_mp > config.MAX_PAIN_PROXIMITY_PCT:
+                    # Price is far from max pain — near expiry, price tends to gravitate toward it
+                    if direction == "bullish" and nifty_ltp_current > max_pain:
+                        # Bullish but price is above max pain — gravity will pull down
+                        c["allocation_multiplier"] = c.get("allocation_multiplier", 1.0) * 0.75
+                        logger.info("%s: Price %.0f > max pain %.0f by %.1f%% — reducing bullish allocation 25%%",
+                                   symbol, nifty_ltp_current, max_pain, distance_from_mp)
+                    elif direction == "bearish" and nifty_ltp_current < max_pain:
+                        # Bearish but price is below max pain — gravity will pull up
+                        c["allocation_multiplier"] = c.get("allocation_multiplier", 1.0) * 0.75
+                        logger.info("%s: Price %.0f < max pain %.0f by %.1f%% — reducing bearish allocation 25%%",
+                                   symbol, nifty_ltp_current, max_pain, distance_from_mp)
 
-        # Multi-timeframe confirmation
-        try:
-            from multi_timeframe import check_multi_timeframe
-            aligned, mtf_reason, mtf_confidence = check_multi_timeframe(symbol, direction)
-            if not aligned:
-                logger.info("SKIP %s: weekly trend disagrees (%s)", symbol, mtf_reason)
+            # News / earnings filter
+            if news is not None:
+                if SKIP_EARNINGS_SOON and news.get("has_earnings_soon"):
+                    logger.info("SKIP %s: earnings event imminent (gap risk)", symbol)
+                    continue
+                if SKIP_CONTRADICTING_NEWS:
+                    sentiment = news.get("sentiment")
+                    if direction == "bullish" and sentiment == "negative":
+                        logger.info("SKIP %s: bullish signal contradicts negative news", symbol)
+                        continue
+                    if direction == "bearish" and sentiment == "positive":
+                        logger.info("SKIP %s: bearish signal contradicts positive news", symbol)
+                        continue
+
+            # V3: Macro BLOCK_BULLISH gate
+            if macro and macro.get("hard_gate") == "BLOCK_BULLISH" and direction == "bullish":
+                logger.info("SKIP %s: bullish blocked by macro gate (%s)", symbol, macro.get("hard_gate_reason", ""))
                 continue
-        except Exception:
-            pass  # optional signal, don't block on failure
 
-        quality_filtered.append(c)
+            # V3: Nasdaq IT crash → block IT sector bullish
+            if macro and macro.get("hard_gate") == "BLOCK_IT_BULLISH" and direction == "bullish":
+                sector = SYMBOL_SECTOR.get(symbol, "")
+                if sector == "IT":
+                    logger.info("SKIP %s: IT bullish blocked by Nasdaq crash", symbol)
+                    continue
 
-    if not quality_filtered:
-        logger.info("No candidates after quality filters (RSI/volume/news).")
-        # Send Telegram summary even when no candidates
-        try:
-            from claude_intel import generate_cron_summary
-            skip_reasons = [f"{c['symbol']}({c.get('skip_reason', '?')})" for c in candidates[:3]]
-            summary = generate_cron_summary("open", portfolio, regime=regime, vix=vix_ltp, skipped_reasons=skip_reasons)
-            _telegram_send(summary)
-        except Exception:
-            pass
-        return 0
+            # V3: Supertrend disagreement → reduce allocation
+            if supertrend_signal != "unknown":
+                if direction == "bullish" and supertrend_signal == "sell":
+                    c["allocation_multiplier"] = c.get("allocation_multiplier", 1.0) * (1 - config.SUPERTREND_DISAGREE_REDUCTION)
+                    logger.info("%s: Supertrend disagrees (sell vs bullish), reducing allocation 25%%", symbol)
+                elif direction == "bearish" and supertrend_signal == "buy":
+                    c["allocation_multiplier"] = c.get("allocation_multiplier", 1.0) * (1 - config.SUPERTREND_DISAGREE_REDUCTION)
+                    logger.info("%s: Supertrend disagrees (buy vs bearish), reducing allocation 25%%", symbol)
+
+            # V3: X/Twitter contradiction filter (soft)
+            if x_sentiment and x_sentiment.get("sentiment") == "crisis":
+                logger.warning("X sentiment: CRISIS detected — %s", x_sentiment.get("key_themes", []))
+
+            # YouTube stock intel gate (Mode B) — only as contradiction filter
+            try:
+                from youtube_intel import fetch_stock_intel
+                yt_stock = fetch_stock_intel(symbol)
+                if yt_stock and yt_stock.get("sentiment"):
+                    if (direction == "bullish" and yt_stock["sentiment"] == "bearish" and
+                        yt_stock.get("confidence") == "high"):
+                        logger.info("SKIP %s: YouTube strongly bearish (contradicts bullish signal)", symbol)
+                        continue
+                    if (direction == "bearish" and yt_stock["sentiment"] == "bullish" and
+                        yt_stock.get("confidence") == "high"):
+                        logger.info("SKIP %s: YouTube strongly bullish (contradicts bearish signal)", symbol)
+                        continue
+            except Exception:
+                pass  # YouTube intel is optional
+
+            # Earnings blackout check
+            if is_near_earnings(symbol, today):
+                logger.info("SKIP %s: earnings within 48 hours (blackout)", symbol)
+                continue
+
+            # Multi-timeframe confirmation
+            try:
+                from multi_timeframe import check_multi_timeframe
+                aligned, mtf_reason, mtf_confidence = check_multi_timeframe(symbol, direction)
+                if not aligned:
+                    logger.info("SKIP %s: weekly trend disagrees (%s)", symbol, mtf_reason)
+                    continue
+            except Exception:
+                pass  # optional signal, don't block on failure
+
+            quality_filtered.append(c)
+
+        if not quality_filtered:
+            logger.info("No candidates after quality filters (RSI/volume/news).")
+            # Send Telegram summary even when no candidates
+            try:
+                from claude_intel import generate_cron_summary
+                skip_reasons = [f"{c['symbol']}({c.get('skip_reason', '?')})" for c in candidates[:3]]
+                summary = generate_cron_summary("open", portfolio, regime=regime, vix=vix_ltp, skipped_reasons=skip_reasons)
+                _telegram_send(summary)
+            except Exception:
+                pass
+            return 0
 
     # --- Claude Intelligence: evaluate candidates before trading ---
     try:
@@ -2401,66 +2436,100 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
         sector = SYMBOL_SECTOR.get(symbol, "Other")
         allocation = alloc["allocation"]
 
-        # V4: Apply allocation_multiplier from Supertrend disagreement
-        allocation = round(allocation * alloc.get("allocation_multiplier", 1.0), 2)
-
-        # V10: Apply Claude intelligence allocation adjustment
-        claude_adj = alloc.get("claude_allocation_adj", 1.0)
-        if claude_adj != 1.0:
+        if getattr(cfg_module, "V6_CLAUDE_FIRST", False):
+            # V6: Claude's allocation_adj is the ONLY modifier
+            claude_adj = alloc.get("claude_allocation_adj", 1.0)
             allocation = round(allocation * claude_adj, 2)
-            logger.info("  %s: Claude adj %.1fx → ₹%.0f", symbol, claude_adj, allocation)
+            if claude_adj != 1.0:
+                logger.info("  %s: Claude adj %.1fx → ₹%.0f", symbol, claude_adj, allocation)
+            # Safety cap only
+            allocation = min(allocation, portfolio["capital"] * config.MAX_STRATEGY_ALLOC_PCT)
 
-        # V4: Sector rotation adjustment
-        if sector_rotation and sector != "Other":
-            if sector in sector_rotation.get("strengthening", []):
-                allocation = round(allocation * (1 + config.SECTOR_ROTATION_BOOST), 2)
-                logger.info("  %s: sector %s strengthening → +%.0f%% allocation", symbol, sector, config.SECTOR_ROTATION_BOOST * 100)
-            elif sector in sector_rotation.get("weakening", []):
-                allocation = round(allocation * (1 - config.SECTOR_ROTATION_CUT), 2)
-                logger.info("  %s: sector %s weakening → -%.0f%% allocation", symbol, sector, config.SECTOR_ROTATION_CUT * 100)
-        open_pos_for_rm = [
-            {"strategy": p.get("instrument", "EQ"), "sector": SYMBOL_SECTOR.get(p["symbol"], "Other"),
-             "max_loss": p.get("allocated", 0)}
-            for p in portfolio["positions"] if p["status"] == "open"
-        ]
-        allowed, rm_reason = rm.can_open_position(open_pos_for_rm, new_sector=sector, new_max_loss=allocation)
-        if not allowed:
-            logger.info("SKIP %s: %s", symbol, rm_reason)
-            continue
+            # Still check risk manager (safety)
+            open_pos_for_rm = [
+                {"strategy": p.get("instrument", "EQ"), "sector": SYMBOL_SECTOR.get(p["symbol"], "Other"),
+                 "max_loss": p.get("allocated", 0)}
+                for p in portfolio["positions"] if p["status"] == "open"
+            ]
+            allowed, rm_reason = rm.can_open_position(open_pos_for_rm, new_sector=sector, new_max_loss=allocation)
+            if not allowed:
+                logger.info("SKIP %s: %s", symbol, rm_reason)
+                continue
 
-        # --- Risk Guardrails: per-candidate checks ---
-        # Correlation guard (sector + direction concentration)
-        corr_blocked, corr_reason, corr_mult = check_correlation_guard(
-            portfolio, symbol, direction, SYMBOL_SECTOR)
-        if corr_blocked:
-            logger.info("SKIP %s: [Correlation] %s", symbol, corr_reason)
-            continue
-        if corr_mult < 1.0:
-            allocation = round(allocation * corr_mult, 2)
-            logger.info("  %s: %s", symbol, corr_reason)
+            # Still check correlation BLOCK (not multiplier)
+            corr_blocked, corr_reason, _ = check_correlation_guard(
+                portfolio, symbol, direction, SYMBOL_SECTOR)
+            if corr_blocked:
+                logger.info("SKIP %s: [Correlation] %s", symbol, corr_reason)
+                continue
 
-        # Apply drawdown allocation multiplier from portfolio-level check
-        if dd_mult < 1.0:
-            allocation = round(allocation * dd_mult, 2)
+            # Still check portfolio heat BLOCK
+            heat_blocked, heat_reason = check_portfolio_heat(portfolio, allocation, None)
+            if heat_blocked:
+                logger.info("SKIP %s: [Heat] %s", symbol, heat_reason)
+                continue
+        else:
+            # V5: existing allocation cascade
+            # V4: Apply allocation_multiplier from Supertrend disagreement
+            allocation = round(allocation * alloc.get("allocation_multiplier", 1.0), 2)
 
-        # Portfolio heat check
-        entry_est = allocation  # rough estimate before we know exact entry
-        risk_pct = None  # will use default 3%
-        heat_blocked, heat_reason = check_portfolio_heat(portfolio, allocation, risk_pct)
-        if heat_blocked:
-            logger.info("SKIP %s: [Heat] %s", symbol, heat_reason)
-            _telegram_send(f"<b>Risk Guardrail</b>\nSkipped {symbol}: {heat_reason}")
-            continue
+            # V10: Apply Claude intelligence allocation adjustment
+            claude_adj = alloc.get("claude_allocation_adj", 1.0)
+            if claude_adj != 1.0:
+                allocation = round(allocation * claude_adj, 2)
+                logger.info("  %s: Claude adj %.1fx → ₹%.0f", symbol, claude_adj, allocation)
 
-        # Event calendar check
-        evt_blocked, evt_reason, evt_mult = check_event_calendar(symbol)
-        if evt_blocked:
-            logger.info("SKIP %s: [Event] %s", symbol, evt_reason)
-            _telegram_send(f"<b>Risk Guardrail</b>\nSkipped {symbol}: {evt_reason}")
-            continue
-        if evt_mult < 1.0:
-            allocation = round(allocation * evt_mult, 2)
-            logger.info("  %s: %s", symbol, evt_reason)
+            # V4: Sector rotation adjustment
+            if sector_rotation and sector != "Other":
+                if sector in sector_rotation.get("strengthening", []):
+                    allocation = round(allocation * (1 + config.SECTOR_ROTATION_BOOST), 2)
+                    logger.info("  %s: sector %s strengthening → +%.0f%% allocation", symbol, sector, config.SECTOR_ROTATION_BOOST * 100)
+                elif sector in sector_rotation.get("weakening", []):
+                    allocation = round(allocation * (1 - config.SECTOR_ROTATION_CUT), 2)
+                    logger.info("  %s: sector %s weakening → -%.0f%% allocation", symbol, sector, config.SECTOR_ROTATION_CUT * 100)
+            open_pos_for_rm = [
+                {"strategy": p.get("instrument", "EQ"), "sector": SYMBOL_SECTOR.get(p["symbol"], "Other"),
+                 "max_loss": p.get("allocated", 0)}
+                for p in portfolio["positions"] if p["status"] == "open"
+            ]
+            allowed, rm_reason = rm.can_open_position(open_pos_for_rm, new_sector=sector, new_max_loss=allocation)
+            if not allowed:
+                logger.info("SKIP %s: %s", symbol, rm_reason)
+                continue
+
+            # --- Risk Guardrails: per-candidate checks ---
+            # Correlation guard (sector + direction concentration)
+            corr_blocked, corr_reason, corr_mult = check_correlation_guard(
+                portfolio, symbol, direction, SYMBOL_SECTOR)
+            if corr_blocked:
+                logger.info("SKIP %s: [Correlation] %s", symbol, corr_reason)
+                continue
+            if corr_mult < 1.0:
+                allocation = round(allocation * corr_mult, 2)
+                logger.info("  %s: %s", symbol, corr_reason)
+
+            # Apply drawdown allocation multiplier from portfolio-level check
+            if dd_mult < 1.0:
+                allocation = round(allocation * dd_mult, 2)
+
+            # Portfolio heat check
+            entry_est = allocation  # rough estimate before we know exact entry
+            risk_pct = None  # will use default 3%
+            heat_blocked, heat_reason = check_portfolio_heat(portfolio, allocation, risk_pct)
+            if heat_blocked:
+                logger.info("SKIP %s: [Heat] %s", symbol, heat_reason)
+                _telegram_send(f"<b>Risk Guardrail</b>\nSkipped {symbol}: {heat_reason}")
+                continue
+
+            # Event calendar check
+            evt_blocked, evt_reason, evt_mult = check_event_calendar(symbol)
+            if evt_blocked:
+                logger.info("SKIP %s: [Event] %s", symbol, evt_reason)
+                _telegram_send(f"<b>Risk Guardrail</b>\nSkipped {symbol}: {evt_reason}")
+                continue
+            if evt_mult < 1.0:
+                allocation = round(allocation * evt_mult, 2)
+                logger.info("  %s: %s", symbol, evt_reason)
 
         # Resolve equity token + LTP (needed for both paths)
         resolved = resolve_token(smart_api, symbol)
