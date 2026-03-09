@@ -265,8 +265,8 @@ def _notify(title: str, message: str) -> None:
         pass
 
 
-def _telegram_send(text: str) -> None:
-    """Send a message via Telegram bot. Fails silently."""
+def _send_single_telegram(text: str) -> None:
+    """Send a single message via Telegram bot. Fails silently."""
     import os
     import urllib.request
     import urllib.parse
@@ -290,6 +290,33 @@ def _telegram_send(text: str) -> None:
         urllib.request.urlopen(req, timeout=10)
     except Exception:
         pass
+
+
+def _telegram_send(text: str, **kwargs) -> None:
+    """Send a message via Telegram, splitting if over 4000 chars."""
+    if len(text) <= 4000:
+        _send_single_telegram(text, **kwargs)
+        return
+
+    # Split into chunks at newline boundaries
+    chunks: list[str] = []
+    remaining = text
+    while remaining:
+        if len(remaining) <= 4000:
+            chunks.append(remaining)
+            break
+        # Find last newline before the 4000-char limit
+        split_at = remaining.rfind("\n", 0, 4000)
+        if split_at <= 0:
+            # No newline found — hard split at 4000
+            split_at = 4000
+        chunks.append(remaining[:split_at])
+        remaining = remaining[split_at:].lstrip("\n")
+
+    total = len(chunks)
+    for i, chunk in enumerate(chunks, 1):
+        header = f"({i}/{total}) " if total > 1 else ""
+        _send_single_telegram(header + chunk, **kwargs)
 
 
 def _telegram_notify_entry(positions_opened: list[dict]) -> None:
