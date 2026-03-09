@@ -212,12 +212,17 @@ def tighten_stop_loss(pos: dict, current_price: float) -> float:
     """Tighten stop-loss by reducing the gap between current price and SL.
 
     Reduces the gap by OVERNIGHT_STOP_TIGHTEN_PCT (default 20%).
+    Handles both bullish (SL below price) and bearish (SL above price).
     Returns new stop-loss price rounded to 2 decimal places.
     """
     current_sl = pos.get("stoploss_price", 0)
-    gap = current_price - current_sl
+    gap = abs(current_price - current_sl)
     new_gap = gap * (1 - OVERNIGHT_STOP_TIGHTEN_PCT)
-    new_sl = round(current_price - new_gap, 2)
+    direction = pos.get("direction", "bullish")
+    if direction == "bearish":
+        new_sl = round(current_price + new_gap, 2)
+    else:
+        new_sl = round(current_price - new_gap, 2)
     return new_sl
 
 
