@@ -71,9 +71,13 @@ def apply_guardrails(pos: dict, current_price: float, vix: float, days_to_expiry
     entry_price = pos.get("entry_price", 0)
     gain_pct = _calc_gain_pct(entry_price, current_price, direction)
 
-    # 1. Position in loss → close
+    # 1. Position in significant loss → close (tolerate small dips up to -10%)
+    if gain_pct < -0.10:
+        return {"action": "close", "reason": f"loss {gain_pct:.0%} exceeds -10% tolerance — no overnight carry"}
+
+    # 1b. Small loss → let Claude decide
     if gain_pct < 0:
-        return {"action": "close", "reason": "position in loss — no overnight carry"}
+        return {"action": "ask_claude", "reason": f"small loss ({gain_pct:.1%}) — letting Claude decide overnight carry"}
 
     # 2. Near expiry → close
     if days_to_expiry <= OVERNIGHT_EXPIRY_CLOSE_DAYS:
