@@ -31,6 +31,17 @@ CLAUDE_MODEL = "claude-sonnet-4-20250514"
 CLAUDE_MODEL_LIGHT = "claude-haiku-4-5-20251001"  # cheap model for classification/formatting
 API_DELAY = 1.5  # seconds between SmartAPI calls to avoid rate-limiting
 
+# ── Zerodha Kite Connect ─────────────────────────────────────────────────
+KITE_API_KEY = os.getenv("KITE_API_KEY")
+KITE_API_SECRET = os.getenv("KITE_API_SECRET")
+KITE_ACCESS_TOKEN_FILE = os.path.join(os.path.dirname(__file__), "data", ".kite_access_token")
+
+# Data source: "angelone" (default) or "kite"
+DATA_SOURCE = os.getenv("DATA_SOURCE", "kite")
+
+# Kite rate limit — 3 req/sec for historical, 1 req/sec for quotes
+KITE_API_DELAY = 0.35  # seconds between Kite calls
+
 # Whether claude CLI is available (for Max subscription users)
 CLAUDE_CLI_AVAILABLE = shutil.which("claude") is not None
 
@@ -178,7 +189,7 @@ def is_market_open(_now=None) -> tuple[bool, str]:
 NSE_HOLIDAYS_2026 = {
     date(2026, 1, 26),   # Republic Day
     date(2026, 2, 26),   # Maha Shivaratri
-    date(2026, 3, 10),   # Holi
+    date(2026, 3, 3),    # Holi
     date(2026, 3, 30),   # Id-Ul-Fitr
     date(2026, 4, 2),    # Ram Navami
     date(2026, 4, 3),    # Good Friday

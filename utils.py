@@ -29,6 +29,15 @@ def parse_claude_json(raw_text: str) -> dict:
 
 def resolve_equity_token(smart_api, symbol: str) -> str | None:
     """Resolve a stock symbol to its NSE equity token via searchScrip."""
+    import os
+    if os.getenv("DATA_SOURCE", "kite") == "kite":
+        try:
+            from kite_data import resolve_equity_token_kite
+            token = resolve_equity_token_kite(symbol)
+            if token is not None:
+                return str(token)
+        except Exception:
+            pass
     try:
         resp = smart_api.searchScrip("NSE", symbol)
         if resp and resp.get("data"):

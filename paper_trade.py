@@ -613,6 +613,15 @@ def get_ltp(smart_api, symbol: str, token: str) -> float | None:
 
     Raises SessionExpiredError if the API session has expired.
     """
+    # Try Kite first if configured
+    if config.DATA_SOURCE == "kite":
+        try:
+            from kite_data import get_ltp_kite
+            ltp = get_ltp_kite(symbol)
+            if ltp is not None:
+                return ltp
+        except Exception as e:
+            logger.debug("Kite LTP fallback for %s: %s", symbol, e)
     try:
         resp = smart_api.ltpData("NSE", symbol, token)
         if _is_session_error(resp):
@@ -649,6 +658,14 @@ def get_ltp_nfo(smart_api, symbol: str, token: str) -> float | None:
 
     Raises SessionExpiredError if the API session has expired.
     """
+    if config.DATA_SOURCE == "kite":
+        try:
+            from kite_data import get_ltp_kite
+            ltp = get_ltp_kite(symbol, exchange="NFO")
+            if ltp is not None:
+                return ltp
+        except Exception as e:
+            logger.debug("Kite NFO LTP fallback for %s: %s", symbol, e)
     try:
         resp = smart_api.ltpData("NFO", symbol, token)
         if _is_session_error(resp):
@@ -920,7 +937,7 @@ def _open_put_position(smart_api, symbol: str, eq_token: str, spot_price: float,
     time.sleep(config.API_DELAY)
     if not option_chain:
         logger.info("  %s: option chain fetch failed, retrying...", symbol)
-        smart_api = refresh_session()
+        refresh_session(smart_api)
         time.sleep(config.API_DELAY)
         option_chain = fetch_option_chain(smart_api, symbol, eq_token)
         time.sleep(config.API_DELAY)
@@ -1729,8 +1746,16 @@ def compute_allocations(candidates: list[dict], available_capital: float) -> lis
 # compute_atr is re-exported via `from indicators import compute_atr` above
 # ---------------------------------------------------------------------------
 
-def fetch_daily_candles(smart_api, token: str, days: int = 25) -> list | None:
+def fetch_daily_candles(smart_api, token: str, days: int = 25, symbol: str = None) -> list | None:
     """Fetch daily candles via getCandleData. Returns raw candle list or None."""
+    if config.DATA_SOURCE == "kite" and symbol:
+        try:
+            from kite_data import fetch_candles_kite
+            candles = fetch_candles_kite(symbol, interval="ONE_DAY", days=days)
+            if candles:
+                return candles
+        except Exception as e:
+            logger.debug("Kite candle fallback for %s: %s", symbol, e)
     try:
         from_date = (datetime.now(IST) - timedelta(days=days + 10)).strftime("%Y-%m-%d %H:%M")
         to_date = datetime.now(IST).strftime("%Y-%m-%d %H:%M")
@@ -1749,8 +1774,16 @@ def fetch_daily_candles(smart_api, token: str, days: int = 25) -> list | None:
     return None
 
 
-def fetch_intraday_candles(smart_api, token: str) -> list | None:
+def fetch_intraday_candles(smart_api, token: str, symbol: str = None) -> list | None:
     """Fetch FIVE_MINUTE candles for today's session."""
+    if config.DATA_SOURCE == "kite" and symbol:
+        try:
+            from kite_data import fetch_candles_kite
+            candles = fetch_candles_kite(symbol, interval="FIVE_MINUTE", days=1)
+            if candles:
+                return candles
+        except Exception as e:
+            logger.debug("Kite intraday fallback for %s: %s", symbol, e)
     try:
         today = datetime.now(IST).strftime("%Y-%m-%d")
         params = {

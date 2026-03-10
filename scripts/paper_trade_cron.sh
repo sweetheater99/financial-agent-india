@@ -55,9 +55,9 @@ fi
 
 # --- Holiday check: skip NSE holidays ---
 IS_HOLIDAY=$(python3 -c "
-from config import NSE_HOLIDAYS
-year = int('${TODAY_DATE}'[:4])
-holidays = [str(d) for d in NSE_HOLIDAYS.get(year, [])]
+from config import NSE_HOLIDAYS_2026
+from datetime import date
+holidays = [str(d) for d in NSE_HOLIDAYS_2026]
 print('yes' if '${TODAY_DATE}' in holidays else 'no')
 " 2>/dev/null || echo "no")
 
@@ -66,6 +66,23 @@ if [ "$IS_HOLIDAY" = "yes" ]; then
     echo "[SKIP] NSE holiday ($TODAY_DATE)" >> "$LOG"
     echo "" >> "$LOG"
     exit 0
+fi
+
+# --- Kite token check (if DATA_SOURCE=kite) ---
+if [ "${DATA_SOURCE:-angelone}" = "kite" ]; then
+    KITE_OK=$(python3 -c "
+from kite_data import get_kite
+try:
+    get_kite()
+    print('yes')
+except:
+    print('no')
+" 2>/dev/null || echo "no")
+
+    if [ "$KITE_OK" = "no" ]; then
+        echo "[WARN] Kite access token expired — falling back to AngelOne for data" >> "$LOG"
+        export DATA_SOURCE=angelone
+    fi
 fi
 
 echo "--- $(TZ=Asia/Kolkata date) ---" >> "$LOG"

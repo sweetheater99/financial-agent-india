@@ -82,6 +82,16 @@ def fetch_option_chain(smart_api, symbol: str, token: str, exchange: str = "NFO"
 
     Returns the raw option chain response, or None on failure.
     """
+    if config.DATA_SOURCE == "kite":
+        try:
+            from kite_data import fetch_option_chain_kite
+            chain = fetch_option_chain_kite(symbol)
+            if chain:
+                return chain
+        except Exception as e:
+            import logging
+            logging.getLogger("paper_trade").debug("Kite option chain fallback for %s: %s", symbol, e)
+
     print(f"Fetching option chain for {symbol}...")
 
     is_open, market_status = config.is_market_open()
