@@ -768,10 +768,45 @@ def select_call_strike(option_chain: list, spot_price: float) -> dict | None:
 def resolve_option_contract(smart_api, symbol: str, strike: float, expiry: str,
                             option_type: str = "PE") -> dict | None:
     """
-    Resolve a CE or PE option contract via searchScrip.
+    Resolve a CE or PE option contract via Kite instruments (primary) or searchScrip (fallback).
 
     Returns {trading_symbol, token, lot_size} or None.
     """
+    # --- Kite path: resolve from instrument cache ---
+    if config.DATA_SOURCE == "kite":
+        try:
+            from kite_data import get_kite, _load_instruments, _instruments_cache
+            kite = get_kite()
+            _load_instruments(kite)
+            nfo = _instruments_cache.get("NFO", {})
+            strike_int = int(strike)
+            today_str = str(date.today())
+
+            # Find all matching contracts (symbol + type + strike), pick nearest expiry >= today
+            candidates = []
+            for key, inst in nfo.items():
+                if (inst.get("symbol", "").upper() == symbol.upper()
+                        and inst.get("instrument_type") == option_type
+                        and int(inst.get("strike", 0)) == strike_int
+                        and inst.get("expiry", "") >= today_str):
+                    candidates.append(inst)
+
+            if candidates:
+                # Pick nearest expiry
+                candidates.sort(key=lambda x: x["expiry"])
+                inst = candidates[0]
+                logger.info("Kite: resolved %s %s %s → %s (expiry %s)",
+                            symbol, option_type, strike, inst["tradingsymbol"], inst["expiry"])
+                return {
+                    "trading_symbol": inst["tradingsymbol"],
+                    "token": str(inst["token"]),
+                    "lot_size": int(inst.get("lot_size", 1)),
+                }
+            logger.warning("Kite: no NFO match for %s %s strike=%s", symbol, option_type, strike)
+        except Exception as e:
+            logger.warning("Kite option resolve failed for %s: %s", symbol, e)
+
+    # --- AngelOne fallback ---
     strike_str = str(int(strike)) if strike == int(strike) else str(strike)
     prefix = "C" if option_type == "CE" else "P"
     query = f"{symbol}{expiry}{prefix}{strike_str}"
@@ -800,17 +835,40 @@ def resolve_option_contract(smart_api, symbol: str, strike: float, expiry: str,
 
 
 def resolve_futures_contract(smart_api, symbol: str) -> dict | None:
-    """Resolve a stock futures contract via searchScrip.
+    """Resolve a stock futures contract via Kite instruments (primary) or searchScrip (fallback).
 
     Searches for the nearest month futures contract.
     Returns {trading_symbol, token, lot_size, expiry} or None.
     """
-    # Search for FUT contracts
+    # --- Kite path ---
+    if config.DATA_SOURCE == "kite":
+        try:
+            from kite_data import get_kite, _load_instruments, _instruments_cache
+            kite = get_kite()
+            _load_instruments(kite)
+            nfo = _instruments_cache.get("NFO", {})
+            fut_matches = []
+            for key, inst in nfo.items():
+                if (inst.get("symbol", "").upper() == symbol.upper()
+                        and inst.get("instrument_type") == "FUT"):
+                    fut_matches.append({
+                        "trading_symbol": inst["tradingsymbol"],
+                        "token": str(inst["token"]),
+                        "lot_size": int(inst.get("lot_size", 1)),
+                        "expiry": inst.get("expiry", ""),
+                    })
+            if fut_matches:
+                fut_matches.sort(key=lambda x: x["expiry"])
+                return fut_matches[0]
+            logger.warning("Kite: no FUT match for %s", symbol)
+        except Exception as e:
+            logger.warning("Kite futures resolve failed for %s: %s", symbol, e)
+
+    # --- AngelOne fallback ---
     query = f"{symbol}FUT"
     try:
         resp = smart_api.searchScrip("NFO", query)
         if resp and resp.get("data"):
-            # Filter for FUT contracts, pick nearest expiry
             fut_matches = []
             for match in resp["data"]:
                 tsym = match.get("tradingsymbol", "")
@@ -822,7 +880,6 @@ def resolve_futures_contract(smart_api, symbol: str) -> dict | None:
                         "expiry": match.get("expiry", ""),
                     })
             if fut_matches:
-                # Sort by expiry, pick nearest
                 fut_matches.sort(key=lambda x: x["expiry"])
                 return fut_matches[0]
     except Exception as e:
@@ -2197,7 +2254,7 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
         logger.info("Risk guardrail: drawdown reduction → allocation multiplier %.2f", dd_mult)
 
     # --- V2 Market Regime Detection ---
-    nifty_candles = fetch_daily_candles(smart_api, NIFTY_TOKEN, days=50)
+    nifty_candles = fetch_daily_candles(smart_api, NIFTY_TOKEN, days=50, symbol="Nifty 50")
     vix_ltp = get_ltp(smart_api, "India VIX", VIX_TOKEN)
     time.sleep(config.API_DELAY)
 
@@ -2227,6 +2284,10 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
         logger.info("Regime: UNCERTAIN (data unavailable)")
 
     regime = regime_result["regime"]
+
+    # Store for outer scope (telegram notifications)
+    portfolio["_last_regime"] = regime
+    portfolio["_last_vix"] = vix_ltp
 
     # CASH regime → skip all new positions
     if regime == "CASH":
@@ -2565,7 +2626,7 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
             try:
                 from claude_intel import generate_cron_summary
                 skip_reasons = [f"{c['symbol']}({c.get('skip_reason', '?')})" for c in candidates[:3]]
-                summary = generate_cron_summary("open", portfolio, regime=regime, vix=vix_ltp, skipped_reasons=skip_reasons)
+                summary = generate_cron_summary("open", portfolio, regime=portfolio.get("_last_regime", "UNKNOWN"), vix=portfolio.get("_last_vix"), skipped_reasons=skip_reasons)
                 _telegram_send(summary)
             except Exception:
                 pass
@@ -2912,12 +2973,31 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
 
             if claude_strategy == "BEAR_SPREAD" or (not claude_strategy and iv_percentile < 70):
                 # Try bear spread first (cheaper in low IV)
+                spread_pos = None
                 try:
-                    spread_pos = _open_spread_position(
-                        portfolio, symbol, direction, None, allocation,
-                        regime, iv_percentile, ""
-                    )
-                except Exception:
+                    from agent_with_options import select_spread_strikes, fetch_option_chain
+                    option_chain = fetch_option_chain(smart_api, symbol, token)
+                    if option_chain:
+                        atr = ltp * 0.02
+                        lot_size = 1
+                        if config.DATA_SOURCE == "kite":
+                            from kite_data import get_kite, _load_instruments, _instruments_cache
+                            kite = get_kite()
+                            _load_instruments(kite)
+                            nfo = _instruments_cache.get("NFO", {})
+                            for k, v in nfo.items():
+                                if v.get("symbol", "").upper() == symbol.upper() and v.get("instrument_type") == "FUT":
+                                    lot_size = v.get("lot_size", 1)
+                                    break
+                        spread_data = select_spread_strikes(option_chain, ltp, "bearish", atr, allocation, lot_size)
+                        if spread_data:
+                            expiry = get_nearest_expiry(min_dte=MIN_DTE_TO_OPEN)
+                            spread_pos = _open_spread_position(
+                                portfolio, symbol, "bearish", spread_data, allocation,
+                                regime, iv_percentile, expiry or ""
+                            )
+                except Exception as e:
+                    logger.debug("Bear spread attempt failed for %s: %s", symbol, e)
                     spread_pos = None
 
                 if spread_pos is not None:
@@ -2950,12 +3030,32 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
 
             if claude_strategy == "BULL_SPREAD" or (not claude_strategy and iv_percentile < 70):
                 # Try bull call spread first (cheaper in low IV)
+                spread_pos = None
                 try:
-                    spread_pos = _open_spread_position(
-                        portfolio, symbol, "bullish", None, allocation,
-                        regime, iv_percentile, ""
-                    )
-                except Exception:
+                    from agent_with_options import select_spread_strikes, fetch_option_chain
+                    option_chain = fetch_option_chain(smart_api, symbol, token)
+                    if option_chain:
+                        atr = ltp * 0.02  # approximate ATR as 2% of price
+                        lot_size = 1  # will be resolved from contract
+                        # Get lot size from Kite instruments if available
+                        if config.DATA_SOURCE == "kite":
+                            from kite_data import get_kite, _load_instruments, _instruments_cache
+                            kite = get_kite()
+                            _load_instruments(kite)
+                            nfo = _instruments_cache.get("NFO", {})
+                            for k, v in nfo.items():
+                                if v.get("symbol", "").upper() == symbol.upper() and v.get("instrument_type") == "FUT":
+                                    lot_size = v.get("lot_size", 1)
+                                    break
+                        spread_data = select_spread_strikes(option_chain, ltp, "bullish", atr, allocation, lot_size)
+                        if spread_data:
+                            expiry = get_nearest_expiry(min_dte=MIN_DTE_TO_OPEN)
+                            spread_pos = _open_spread_position(
+                                portfolio, symbol, "bullish", spread_data, allocation,
+                                regime, iv_percentile, expiry or ""
+                            )
+                except Exception as e:
+                    logger.debug("Bull spread attempt failed for %s: %s", symbol, e)
                     spread_pos = None
 
                 if spread_pos is not None:
@@ -5038,7 +5138,8 @@ def run_paper_trade(smart_api, mode: str) -> None:
                 for pos in new_positions:
                     entry_msg = format_entry_telegram(
                         pos, pos.get("claude_reasoning", ""),
-                        regime=regime, vix=vix_ltp,
+                        regime=portfolio.get("_last_regime", "UNKNOWN"),
+                        vix=portfolio.get("_last_vix"),
                     )
                     _telegram_send(entry_msg)
             except Exception:
@@ -5050,7 +5151,7 @@ def run_paper_trade(smart_api, mode: str) -> None:
         # Telegram cron summary (every run)
         try:
             from claude_intel import generate_cron_summary
-            summary = generate_cron_summary("open", portfolio, regime=regime, vix=vix_ltp, opened=opened)
+            summary = generate_cron_summary("open", portfolio, regime=portfolio.get("_last_regime", "UNKNOWN"), vix=portfolio.get("_last_vix"), opened=opened)
             _telegram_send(summary)
         except Exception:
             pass

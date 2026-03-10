@@ -136,6 +136,12 @@ def resolve_token(symbol: str, exchange: str = "NSE") -> Optional[int]:
     if symbol in exch:
         return exch[symbol]["token"]
 
+    # Case-insensitive match (e.g., "Nifty 50" → "NIFTY 50")
+    symbol_upper = symbol.upper()
+    for key, val in exch.items():
+        if key.upper() == symbol_upper:
+            return val["token"]
+
     # Try common suffixes for NSE equities
     if exchange == "NSE":
         for suffix in ["-EQ", "-BE"]:

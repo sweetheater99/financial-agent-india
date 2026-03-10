@@ -534,14 +534,14 @@ def run_overnight_hedge_scan(smart_api, dry_run: bool = False) -> list[dict]:
         entry_price = pos.get("entry_price", 0)
         expiry_str = pos.get("expiry", "")
 
-        # 5a. Fetch current price
+        # 5a. Fetch current price (use contract_symbol for options/futures)
         try:
-            nfo_token = pos.get("nfo_token")
-            trading_symbol = pos.get("trading_symbol")
-            if nfo_token and trading_symbol:
-                current_price = get_ltp_nfo(smart_api, trading_symbol, nfo_token)
+            contract_sym = pos.get("contract_symbol", "")
+            token = pos.get("token", "")
+            if instrument in ("OPT", "FUT") and contract_sym:
+                current_price = get_ltp_nfo(smart_api, contract_sym, token)
             else:
-                current_price = get_ltp(smart_api, pos.get("symbol", ""), pos.get("token", ""))
+                current_price = get_ltp(smart_api, pos.get("symbol", ""), token)
             time.sleep(config.API_DELAY)
         except Exception as e:
             logger.error("LTP fetch failed for %s: %s", pos_id, e)

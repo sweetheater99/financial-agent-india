@@ -424,7 +424,7 @@ Strategy guidelines:
 - VIX>22 or high IV: prefer buying options (CALL/PUT) — spreads underperform
 - VIX<22 or low IV: prefer spreads — cheaper, defined risk
 - FUTURES: only for highest conviction with OI confirmation (LongBuildUp/ShortBuildUp)
-- Score<4: almost always SKIP unless exceptional setup
+- Score<3: SKIP. Score 3-4: moderate, trade if setup aligns. Score>4: strong.
 
 Consider: signal alignment, FII flow, VIX, sector overlap, score quality.
 
