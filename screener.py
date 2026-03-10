@@ -462,17 +462,28 @@ def enrich_candidates(smart_api, candidates: list[dict]) -> list[dict]:
             if token:
                 cand["equity_token"] = token
                 # Fetch ~25 trading days of candles (40 calendar days)
-                to_date = datetime.now()
-                from_date = to_date - timedelta(days=40)
-                candle_resp = smart_api.getCandleData({
-                    "exchange": "NSE",
-                    "symboltoken": token,
-                    "interval": "ONE_DAY",
-                    "fromdate": from_date.strftime("%Y-%m-%d 09:15"),
-                    "todate": to_date.strftime("%Y-%m-%d 15:30"),
-                })
-                if candle_resp and candle_resp.get("data"):
-                    candles = candle_resp["data"]
+                candles = None
+                import config as _cfg
+                if _cfg.DATA_SOURCE == "kite":
+                    try:
+                        from kite_data import fetch_candles_kite
+                        candles = fetch_candles_kite(symbol, interval="ONE_DAY", days=40)
+                    except Exception as _ke:
+                        import logging as _log
+                        _log.getLogger(__name__).debug("Kite candle fallback in screener for %s: %s", symbol, _ke)
+                if candles is None:
+                    to_date = datetime.now()
+                    from_date = to_date - timedelta(days=40)
+                    candle_resp = smart_api.getCandleData({
+                        "exchange": "NSE",
+                        "symboltoken": token,
+                        "interval": "ONE_DAY",
+                        "fromdate": from_date.strftime("%Y-%m-%d 09:15"),
+                        "todate": to_date.strftime("%Y-%m-%d 15:30"),
+                    })
+                    if candle_resp and candle_resp.get("data"):
+                        candles = candle_resp["data"]
+                if candles:
                     cand["candles"] = candles
                     cand["rsi"] = compute_rsi(candles, RSI_PERIOD)
                     cand["volume_ratio"] = compute_volume_ratio(candles, VOLUME_LOOKBACK)

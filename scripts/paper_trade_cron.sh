@@ -111,18 +111,12 @@ if [ "$HOUR" -eq 9 ] && [ "$MIN" -ge 8 ] && [ "$MIN" -le 12 ]; then
     python paper_trade.py briefing >> "$LOG" 2>&1
 fi
 
-# --- 9:15-9:45 AM: Open mode ---
-if [ "$HOUR" -eq 9 ] && [ "$MIN" -ge 15 ] && [ "$MIN" -le 45 ]; then
+# --- 9:15 AM onwards: Scan for new F&O positions every tick ---
+if [ "$TIME_MINS" -ge 555 ] && [ "$TIME_MINS" -le 930 ]; then
     MODE="open"
-    echo "[OPEN] Running screener + opening positions" >> "$LOG"
+    echo "[OPEN] Scanning for F&O opportunities" >> "$LOG"
     python paper_trade.py open >> "$LOG" 2>&1
     EXIT_CODE=$?
-fi
-
-# --- 12:40-12:50 PM: Afternoon re-entry pass ---
-if [ "$HOUR" -eq 12 ] && [ "$MIN" -ge 40 ] && [ "$MIN" -le 50 ]; then
-    echo "[AFTERNOON] Re-entry screening pass" >> "$LOG"
-    python paper_trade.py open >> "$LOG" 2>&1
 fi
 
 # --- Every run: Smart monitor ---

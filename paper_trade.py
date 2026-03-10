@@ -732,22 +732,56 @@ def select_put_strike(option_chain: list, spot_price: float) -> dict | None:
     return candidates[0]
 
 
-def resolve_option_contract(smart_api, symbol: str, strike: float, expiry: str) -> dict | None:
+def select_call_strike(option_chain: list, spot_price: float) -> dict | None:
     """
-    Resolve a PE option contract via searchScrip.
+    Pick ATM or 1-strike-OTM call from the option chain.
+
+    Selects the strike >= spot_price closest to spot, filtering out zero-LTP strikes.
+    Returns dict with strike details or None.
+    """
+    candidates = []
+    for row in option_chain:
+        strike = row.get("strikePrice", 0)
+        ce = row.get("CE") or {}
+        ce_ltp = ce.get("lastTradedPrice", 0) or 0
+        if strike <= 0 or ce_ltp <= 0 or strike < spot_price:
+            continue
+        candidates.append({
+            "strike": strike,
+            "ce_ltp": float(ce_ltp),
+            "ce_delta": float(ce.get("delta", 0) or 0),
+            "ce_theta": float(ce.get("theta", 0) or 0),
+            "ce_iv": float(ce.get("impliedVolatility", 0) or 0),
+            "ce_oi": int(ce.get("openInterest", 0) or 0),
+            "ce_gamma": float(ce.get("gamma", 0) or 0),
+            "ce_vega": float(ce.get("vega", 0) or 0),
+        })
+
+    if not candidates:
+        return None
+
+    # Closest strike to spot (ATM or 1-strike OTM call)
+    candidates.sort(key=lambda c: c["strike"] - spot_price)
+    return candidates[0]
+
+
+def resolve_option_contract(smart_api, symbol: str, strike: float, expiry: str,
+                            option_type: str = "PE") -> dict | None:
+    """
+    Resolve a CE or PE option contract via searchScrip.
 
     Returns {trading_symbol, token, lot_size} or None.
     """
-    # Build query like "PERSISTENT 27FEB2026 PE 5400"
     strike_str = str(int(strike)) if strike == int(strike) else str(strike)
-    query = f"{symbol}{expiry}P{strike_str}"
+    prefix = "C" if option_type == "CE" else "P"
+    query = f"{symbol}{expiry}{prefix}{strike_str}"
 
     try:
         resp = smart_api.searchScrip("NFO", query)
         if resp and resp.get("data"):
             for match in resp["data"]:
                 tsym = match.get("tradingsymbol", "")
-                if "PE" in tsym.upper() or tsym.upper().endswith(f"P{strike_str}"):
+                if option_type in tsym.upper() or tsym.upper().endswith(f"{prefix}{strike_str}"):
                     return {
                         "trading_symbol": tsym,
                         "token": match["symboltoken"],
@@ -1017,6 +1051,111 @@ def _open_put_position(smart_api, symbol: str, eq_token: str, spot_price: float,
     }
 
     logger.info("OPENED %s PE%d x%dlot (%dqty) @ ₹%.2f (slipped from ₹%.2f, ₹%.0f, score=%.1f, DTE:%d)",
+                symbol, int(strike), num_lots, num_lots * lot_size,
+                entry_premium, raw_premium, actual_allocated, alloc['score'], dte)
+
+    return position
+
+
+def _open_call_position(smart_api, symbol: str, eq_token: str, spot_price: float,
+                        allocation: float, alloc: dict) -> dict | None:
+    """
+    Open a call option position for a bullish candidate.
+
+    Returns position dict or None if skipped.
+    """
+    expiry = get_nearest_expiry(min_dte=MIN_DTE_TO_OPEN)
+    if not expiry:
+        logger.info("SKIP %s: could not determine option expiry with min %dd DTE", symbol, MIN_DTE_TO_OPEN)
+        return None
+
+    dte = days_to_expiry(expiry)
+    logger.info("  %s: using expiry %s (%dd DTE) for CALL", symbol, expiry, dte)
+
+    # Fetch option chain
+    option_chain = fetch_option_chain(smart_api, symbol, eq_token)
+    time.sleep(config.API_DELAY)
+    if not option_chain:
+        logger.info("  %s: option chain fetch failed, retrying...", symbol)
+        refresh_session(smart_api)
+        time.sleep(config.API_DELAY)
+        option_chain = fetch_option_chain(smart_api, symbol, eq_token)
+        time.sleep(config.API_DELAY)
+    if not option_chain:
+        logger.info("SKIP %s: option chain fetch failed after retry", symbol)
+        return None
+
+    # Select strike
+    strike_info = select_call_strike(option_chain, spot_price)
+    if not strike_info:
+        logger.info("SKIP %s: no suitable call strike found", symbol)
+        return None
+
+    strike = strike_info["strike"]
+    premium = strike_info["ce_ltp"]
+
+    # Resolve NFO contract
+    contract = resolve_option_contract(smart_api, symbol, strike, expiry, option_type="CE")
+    time.sleep(config.API_DELAY)
+    if not contract:
+        logger.info("SKIP %s: could not resolve CE contract", symbol)
+        return None
+
+    lot_size = contract["lot_size"]
+    cost_per_lot = premium * lot_size
+    if cost_per_lot <= 0:
+        logger.info("SKIP %s: zero premium cost", symbol)
+        return None
+
+    num_lots = max(1, math.floor(allocation / cost_per_lot))
+    actual_allocated = round(num_lots * cost_per_lot, 2)
+
+    # Verify live premium from NFO
+    live_premium = get_ltp_nfo(smart_api, contract["trading_symbol"], contract["token"])
+    time.sleep(config.API_DELAY)
+    if live_premium and live_premium > 0:
+        premium = live_premium
+        actual_allocated = round(num_lots * premium * lot_size, 2)
+
+    raw_premium = premium
+    entry_premium = apply_slippage(premium, "OPT", "buy")
+    actual_allocated = round(num_lots * entry_premium * lot_size, 2)
+
+    today = _today_ist()
+    max_hold_date = _add_trading_days(today, MAX_HOLD_DAYS)
+
+    position = {
+        "symbol": symbol,
+        "token": contract["token"],
+        "direction": "bullish",
+        "instrument": "OPT",
+        "option_type": "CE",
+        "strike": strike,
+        "expiry": expiry,
+        "contract_symbol": contract["trading_symbol"],
+        "lot_size": lot_size,
+        "num_lots": num_lots,
+        "entry_price": entry_premium,
+        "ltp_at_entry": raw_premium,
+        "quantity": num_lots * lot_size,
+        "allocated": actual_allocated,
+        "underlying_price_at_entry": spot_price,
+        "greeks_at_entry": {
+            "delta": strike_info["ce_delta"],
+            "theta": strike_info["ce_theta"],
+            "iv": strike_info["ce_iv"],
+            "gamma": strike_info["ce_gamma"],
+            "vega": strike_info["ce_vega"],
+        },
+        "peak_premium": raw_premium,
+        "score": alloc["score"],
+        "categories": alloc.get("categories", []),
+        "entry_date": today,
+        "max_hold_date": max_hold_date,
+        "status": "open",
+    }
+
+    logger.info("OPENED %s CE%d x%dlot (%dqty) @ ₹%.2f (slipped from ₹%.2f, ₹%.0f, score=%.1f, DTE:%d)",
                 symbol, int(strike), num_lots, num_lots * lot_size,
                 entry_premium, raw_premium, actual_allocated, alloc['score'], dte)
 
@@ -2769,8 +2908,10 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
 
         if direction == "bearish":
             # --- Bearish path: spread if low IV, else put ---
-            if iv_percentile < 70:
-                # Try spread first (cheaper in low IV)
+            claude_strategy = alloc.get("claude_strategy", "")
+
+            if claude_strategy == "BEAR_SPREAD" or (not claude_strategy and iv_percentile < 70):
+                # Try bear spread first (cheaper in low IV)
                 try:
                     spread_pos = _open_spread_position(
                         portfolio, symbol, direction, None, allocation,
@@ -2803,82 +2944,37 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
                     "expected_hold": "",
                     "target_scenario": "",
                 }
-        else:
-            # --- Equity buy path ---
-            entry_price = apply_slippage(ltp, "EQ", "buy")
-            quantity = math.floor(allocation / entry_price)
-            if quantity < 1:
-                logger.info("SKIP %s: allocation ₹%.0f < 1 share at ₹%.2f", symbol, allocation, entry_price)
-                continue
+        elif direction == "bullish":
+            # --- Bullish F&O path: call spread if low IV, else call option ---
+            claude_strategy = alloc.get("claude_strategy", "")
 
-            actual_allocated = round(quantity * entry_price, 2)
+            if claude_strategy == "BULL_SPREAD" or (not claude_strategy and iv_percentile < 70):
+                # Try bull call spread first (cheaper in low IV)
+                try:
+                    spread_pos = _open_spread_position(
+                        portfolio, symbol, "bullish", None, allocation,
+                        regime, iv_percentile, ""
+                    )
+                except Exception:
+                    spread_pos = None
 
-            # ATR-based exit thresholds
-            atr_at_entry = None
-            candles = fetch_daily_candles(smart_api, token)
-            time.sleep(config.API_DELAY)
-            if candles:
-                atr_at_entry = compute_atr(candles, ATR_PERIOD)
-
-            # V4: Volatility-adjusted position sizing
-            if config.VOL_SIZING_ENABLED and atr_at_entry is not None and ltp > 0:
-                atr_pct = (atr_at_entry / ltp) * 100
-                if atr_pct > 0:
-                    vol_mult = config.VOL_SIZING_BASELINE_ATR_PCT / atr_pct
-                    vol_mult = max(config.VOL_SIZING_MIN_MULT, min(config.VOL_SIZING_MAX_MULT, vol_mult))
-                    old_alloc = allocation
-                    allocation = round(allocation * vol_mult, 2)
-                    logger.info("  %s: ATR%%=%.2f → vol_mult=%.2f (alloc ₹%.0f → ₹%.0f)",
-                                symbol, atr_pct, vol_mult, old_alloc, allocation)
-
-            if atr_at_entry is not None:
-                target_price = round(entry_price + ATR_TARGET_MULTIPLIER * atr_at_entry, 2)
-                stoploss_price = round(entry_price - ATR_STOPLOSS_MULTIPLIER * atr_at_entry, 2)
-                logger.debug("%s ATR=%.2f → target=%.2f, SL=%.2f", symbol, atr_at_entry, target_price, stoploss_price)
+                if spread_pos is not None:
+                    position = spread_pos
+                else:
+                    # Fallback to naked call option
+                    position = _open_call_position(smart_api, symbol, token, ltp, allocation, alloc)
+                    if position is None:
+                        continue
             else:
-                target_price = round(entry_price * (1 + TARGET_PCT / 100), 2)
-                stoploss_price = round(entry_price * (1 + STOPLOSS_PCT / 100), 2)
-
-            max_hold_date = _add_trading_days(today, MAX_HOLD_DAYS)
-
-            # F&O only mode: skip equity entries entirely
-            if config.ALLOC_EQUITY_MAX_V3 <= 0:
-                logger.info("SKIP %s: F&O only mode — no equity entries", symbol)
-                continue
-
-            # Recompute quantity with volatility-adjusted allocation
-            quantity = math.floor(allocation / entry_price)
-            if quantity < 1:
-                logger.info("SKIP %s: vol-adjusted allocation ₹%.0f < 1 share at ₹%.2f", symbol, allocation, entry_price)
-                continue
-            actual_allocated = round(quantity * entry_price, 2)
-
-            position = {
-                "symbol": symbol,
-                "token": token,
-                "direction": direction,
-                "instrument": "EQ",
-                "entry_price": entry_price,
-                "ltp_at_entry": ltp,
-                "quantity": quantity,
-                "allocated": actual_allocated,
-                "score": alloc["score"],
-                "categories": alloc.get("categories", []),
-                "entry_date": today,
-                "target_price": target_price,
-                "stoploss_price": stoploss_price,
-                "atr_at_entry": atr_at_entry,
-                "peak_price": ltp,
-                "market_regime": regime,
-                "iv_percentile": iv_percentile,
-                "max_hold_date": max_hold_date,
-                "status": "open",
-            }
-            # Store Claude intel from batch eval
+                # High IV or Claude said CALL: buy call option
+                position = _open_call_position(smart_api, symbol, token, ltp, allocation, alloc)
+                if position is None:
+                    continue
+            position["market_regime"] = regime
+            position["iv_percentile"] = iv_percentile
             if alloc.get("claude_reasoning"):
                 position["claude_reasoning"] = alloc["claude_reasoning"]
                 position["claude_conviction"] = alloc.get("claude_conviction", "")
-                # Build entry thesis from batch eval results
                 position["entry_thesis"] = {
                     "reasoning": alloc["claude_reasoning"],
                     "conviction": alloc.get("claude_conviction", "medium"),
@@ -2888,8 +2984,12 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
                     "target_scenario": "",
                 }
 
-            logger.info("OPENED %s BUY x%d @ ₹%.2f (slipped from ₹%.2f, ₹%.0f, score=%.1f)",
-                        symbol, quantity, entry_price, ltp, actual_allocated, alloc['score'])
+            logger.info("OPENED %s %s (bullish F&O path)", symbol, position.get("instrument", "OPT"))
+
+        else:
+            # Unknown direction — skip
+            logger.info("SKIP %s: unknown direction '%s'", symbol, direction)
+            continue
 
         portfolio["positions"].append(position)
         portfolio["available_capital"] = round(
@@ -4525,12 +4625,11 @@ def _try_index_strategies(smart_api, portfolio: dict) -> int:
                     except Exception as e:
                         logger.debug("Momentum attempt on %s failed: %s", idx_name, e)
 
-    # --- V9: Monthly Iron Condor (Reyaansh style) ---
+    # --- V9: Iron Condor (DTE-based entry, any day) ---
     if config.MONTHLY_CONDOR_ENABLED:
         today_date = datetime.now(IST).date()
-        day_of_month = today_date.day
 
-        if config.MONTHLY_CONDOR_ENTRY_DAY_MIN <= day_of_month <= config.MONTHLY_CONDOR_ENTRY_DAY_MAX:
+        if True:  # DTE-based entry — checked per-index below
             # Check if we already have a monthly condor open
             has_monthly_condor = any(
                 p.get("strategy") == "monthly_condor" and p.get("status") == "open"

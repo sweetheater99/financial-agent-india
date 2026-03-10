@@ -39,70 +39,20 @@ def _save_decision_log(decision_type: str, symbol: str, prompt: str, response: s
         logger.debug("Decision log save failed: %s", e)
 
 
-SYSTEM_PROMPT = """You are a full-time F&O desk trader for Indian markets (NSE). You receive
-market data and candidates — you decide what to trade.
+SYSTEM_PROMPT = """F&O desk trader, Indian NSE. You decide entries/exits.
 
-ROLE:
-- You make ALL entry and exit decisions
-- You see the full portfolio, not just individual positions
-- You learn from recent trade lessons and daily journal
+SIGNALS: VWAP direction, OI buildup (long/short/unwinding), OI S/R levels, max pain near expiry.
+EXPIRY: No new options after 2PM, close uncertain by 3PM, max pain gravity strongest.
+GAPS: >1% wait 15-30min. Gap+fade=reversal, gap+hold=continuation.
+TIME: 9:15-9:30 settling, 13-14h low vol, 15:15+ no entries. Pre-RBI/budget=IV inflated.
+POSITIONS: Add winners only (+1xATR). Scale out 25/50/25. Max 1 add.
+IV: Events=prefer selling. High VIX vs 20d avg=options expensive. Post-event=IV crush risk.
 
-MARKET MICROSTRUCTURE (use these signals):
-- VWAP: Don't enter against VWAP direction unless exceptional setup
-- OI changes: Long buildup (OI up + price up) confirms bullish;
-  short buildup (OI up + price down) confirms bearish;
-  unwinding/covering are weak signals
-- OI S/R: Max put OI = support, max call OI = resistance. Don't fight these levels.
-- Max pain: Price gravitates to max pain near expiry
+REGIME: UP=bullish, DOWN=bearish, SIDEWAYS=range. Strong signals can override weak regime.
+VIX>22=smaller size. VIX>28=sit out. FII sell>5000cr=bearish. PCR<0.7=contrarian bearish, >1.3=contrarian bullish.
+Friday PM=close marginal F&O. Afternoon(12:45+)=high conviction only, max 2 new.
 
-EXPIRY DAY RULES:
-- Gamma is elevated — ATM options move 2-3x faster
-- No new option positions after 2 PM on expiry
-- Never average OTM options on expiry day
-- Close uncertain option positions before 3 PM
-- Max pain gravity strongest on expiry day
-
-GAP HANDLING:
-- Gap >1%: wait 15-30 min for settlement before new entries
-- Gap + fade = potential reversal; gap + hold = continuation
-- Existing positions: consider partial profit on favorable gap
-
-TIME AWARENESS:
-- 9:15-9:30: prices settling, avoid new entries
-- 1:00-2:00 PM: low volume, reduce conviction on new signals
-- 2:00 PM+ on expiry: no new option entries
-- 3:15-3:30: closing auction, no new entries
-- Before RBI/budget: avoid buying options (IV inflated)
-
-POSITION MANAGEMENT:
-- Add to winners only (never losers), only if +1x ATR from entry
-- Scale out: 25% first target, 50% second, hold 25% for runners
-- Add on pullback to VWAP/support if thesis holds
-- Maximum 1 add per position
-
-IV AWARENESS:
-- Before known events: prefer selling options over buying
-- VIX elevated vs 20-day avg = IV inflated, bought options expensive
-- After event: IV crush makes direction right but trade wrong
-
-GUIDELINES (weigh against signal quality — not hard rules):
-- Regime matters: TRENDING_UP favors bullish, TRENDING_DOWN favors bearish,
-  SIDEWAYS favors range-bound. Strong signals can override weak regime.
-- VIX > 22: elevated risk, favor smaller positions or high-conviction only
-- VIX > 28: crisis, sit out unless exceptional setup
-- Heavy FII selling (>5000cr): bearish pressure, but DII absorption moderates
-- PCR < 0.7: excessive bullish sentiment, contrarian bearish
-- PCR > 1.3: excessive bearish sentiment, contrarian bullish
-- Supertrend disagreement: weakens conviction, doesn't disqualify
-- Friday afternoon: weekend risk for F&O, prefer closing marginal positions
-- Afternoon entries (12:45+): only high conviction, max 2 new positions
-
-HARD CONSTRAINTS (you cannot override):
-- Never recommend allocation > 1.5x base
-- If unsure, SKIP — missed trades cost nothing
-- Never override a stoploss exit
-- Respect position limits (max 8, max 2/sector)
-- Never add to losing positions"""
+HARD: alloc max 1.5x. Unsure=SKIP. Never override SL. Max 8 positions, 2/sector. Never add to losers."""
 
 
 def _call_claude_cli(prompt: str) -> str | None:
@@ -449,7 +399,7 @@ def evaluate_candidates(
             f"VWAP={c.get('vwap_deviation', '?')} ADX={c.get('adx', '?')}"
         )
 
-    prompt = f"""BATCH ENTRY EVALUATION
+    prompt = f"""BATCH ENTRY EVALUATION (F&O ONLY — no equity)
 
 MARKET:
 - Regime: {regime} (conf: {regime_confidence:.0%}) | VIX: {vix or 'N/A'} | Nifty: {nifty_ltp or 'N/A'}
@@ -462,15 +412,24 @@ PORTFOLIO:
 CANDIDATES:
 {chr(10).join(candidate_lines)}
 
-For EACH candidate, decide TRADE or SKIP. Consider:
-- Holistic signal alignment (OI + RSI + volume + news + macro)
-- FII flow direction vs trade direction
-- VIX level vs position sizing
-- Sector overlap with existing positions
-- Score quality (>6 = strong, 4-6 = moderate, <4 = weak)
+For EACH candidate, decide TRADE or SKIP.
+If TRADE, also pick a strategy:
+- CALL: buy call option (bullish directional)
+- PUT: buy put option (bearish directional)
+- BULL_SPREAD: bull call spread (bullish + VIX<22 or low IV)
+- BEAR_SPREAD: bear put spread (bearish + VIX<22 or low IV)
+- FUTURES: stock futures (high conviction, score 6+, strong OI confirmation)
 
-Respond with JSON array only:
-[{{"symbol": "X", "action": "TRADE"/"SKIP", "conviction": "high"/"medium"/"low", "allocation_adj": 0.5-1.5, "reasoning": "2-3 sentences"}}]"""
+Strategy guidelines:
+- VIX>22 or high IV: prefer buying options (CALL/PUT) — spreads underperform
+- VIX<22 or low IV: prefer spreads — cheaper, defined risk
+- FUTURES: only for highest conviction with OI confirmation (LongBuildUp/ShortBuildUp)
+- Score<4: almost always SKIP unless exceptional setup
+
+Consider: signal alignment, FII flow, VIX, sector overlap, score quality.
+
+JSON array only:
+[{{"symbol": "X", "action": "TRADE"/"SKIP", "strategy": "CALL"/"PUT"/"BULL_SPREAD"/"BEAR_SPREAD"/"FUTURES", "conviction": "high"/"medium"/"low", "allocation_adj": 0.5-1.5, "reasoning": "1-2 sentences"}}]"""
 
     result_text = _call_claude(prompt, max_tokens=1024)
     if result_text is None:
@@ -500,8 +459,14 @@ Respond with JSON array only:
         c["claude_conviction"] = decision.get("conviction", "medium")
         c["claude_reasoning"] = decision.get("reasoning", "")
 
-        logger.info("  CLAUDE TRADE %s [%s]: %s (adj: %.1fx)",
+        # Strategy recommendation from Claude
+        strategy = decision.get("strategy", "")
+        valid_strategies = {"CALL", "PUT", "BULL_SPREAD", "BEAR_SPREAD", "FUTURES"}
+        c["claude_strategy"] = strategy if strategy in valid_strategies else ""
+
+        logger.info("  CLAUDE TRADE %s [%s] %s: %s (adj: %.1fx)",
                     c["symbol"], decision.get("conviction", "?"),
+                    c["claude_strategy"] or "auto",
                     decision.get("reasoning", ""), adj)
         approved.append(c)
 
@@ -589,19 +554,11 @@ PORTFOLIO:
 {lessons_str}
 
 The rule-based system wants to EXIT this position because: {exit_reason}
-Should I proceed with the exit or continue holding?
+Should I EXIT or HOLD? Consider: momentum, trend reversal vs pullback, theta decay, VIX risk.
 
-Consider:
-- If target hit, is there momentum for more? Or book profits?
-- If trailing stop, is this a temporary pullback or trend reversal?
-- If time exit, is the thesis still valid?
-- If expiry approaching on options, theta decay risk
-- VIX spike = increased risk, favor exits
+JSON only: {{"action": "EXIT"/"HOLD", "reasoning": "1 sentence"}}"""
 
-Respond with JSON only:
-{{"action": "EXIT" or "HOLD", "reasoning": "2-3 sentences"}}"""
-
-    result_text = _call_claude(prompt, max_tokens=384)
+    result_text = _call_claude(prompt, max_tokens=192)
     if result_text is None:
         # Fail-safe: always honor rule-based exits
         return (True, f"Rule-based exit: {exit_reason}")
@@ -666,20 +623,13 @@ MARKET CONTEXT:
 - Regime: {regime}
 {f"- Additional: {market_context}" if market_context else ""}
 
-ACTIONS (pick exactly one):
-1. "close" — exit the position now to avoid overnight gap risk
-2. "hedge" — buy a protective OTM option to cap downside overnight
-3. "carry_naked" — carry the position unhedged (only if conviction is very high and risk is low)
+Pick: "close" (exit), "hedge" (buy OTM protective), or "carry_naked" (high conviction only).
+VIX>18: prefer hedge/close. carry_naked needs strong trend + low event risk.
 
-RULES:
-- If VIX is elevated (>18), prefer hedge or close over carry_naked
-- carry_naked requires strong trend conviction AND low overnight event risk
-- hedge is the balanced choice when the position has decent gains worth protecting
-
-Respond with ONLY a JSON object: {{"action": "<close|hedge|carry_naked>", "reasoning": "<one sentence>"}}"""
+JSON only: {{"action": "close"/"hedge"/"carry_naked", "reasoning": "1 sentence"}}"""
 
     try:
-        result_text = _call_claude(prompt, max_tokens=256)
+        result_text = _call_claude(prompt, max_tokens=128)
         if not result_text:
             raise ValueError("No response from Claude")
 
