@@ -264,11 +264,11 @@ def get_vix_tier(vix: float) -> dict:
         return VIX_TIERS["crisis"]
 
 
-# Capital allocation limits
-ALLOC_EQUITY_MAX = 0.40
-ALLOC_SPREADS_MAX = 0.30
-ALLOC_IRON_CONDOR_MAX = 0.10
-ALLOC_MOMENTUM_MAX = 0.15
+# Capital allocation limits (F&O only — no equity delivery)
+ALLOC_EQUITY_MAX = 0.00
+ALLOC_SPREADS_MAX = 0.40
+ALLOC_IRON_CONDOR_MAX = 0.15
+ALLOC_MOMENTUM_MAX = 0.20
 ALLOC_CASH_MIN = 0.05
 MAX_CONCURRENT_POSITIONS = 8
 MAX_SAME_SECTOR = 2
@@ -383,16 +383,16 @@ BANKNIFTY_TOKEN = "99926009"
 BANKNIFTY_LOT_SIZE = 30
 BANKNIFTY_VIX_MULTIPLIER = 1.3
 
-# Updated allocations (V3)
-ALLOC_EQUITY_MAX_V3 = 0.35
-ALLOC_SPREADS_MAX_V3 = 0.25
+# Updated allocations (V3 — F&O only)
+ALLOC_EQUITY_MAX_V3 = 0.00
+ALLOC_SPREADS_MAX_V3 = 0.35
 ALLOC_IRON_CONDOR_MAX_V3 = 0.15
-ALLOC_MOMENTUM_MAX_V3 = 0.10
-ALLOC_WEEKLY_THETA_MAX = 0.10
+ALLOC_MOMENTUM_MAX_V3 = 0.15
+ALLOC_WEEKLY_THETA_MAX = 0.15
 ALLOC_CASH_MIN_V3 = 0.05
 
-# V9: PR Sundar portfolio discipline — always keep 40% cash
-CASH_RESERVE_PCT = 0.40             # never deploy more than 60% of capital
+# V9: PR Sundar portfolio discipline — keep 20% cash
+CASH_RESERVE_PCT = 0.20             # never deploy more than 80% of capital
 MAX_STRATEGY_ALLOC_PCT = 0.12       # max 12% of capital per strategy
 WEEKLY_PORTFOLIO_SL_PCT = 0.04      # 4% weekly portfolio SL → stop all new entries
 
