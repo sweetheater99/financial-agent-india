@@ -2197,15 +2197,19 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
     # --- V4 Unusual OI (per-stock, applied in allocation loop) ---
     # Will be checked per-candidate below using existing option chain data
 
-    # V8: Max concurrent equity position check
-    open_equity = [p for p in portfolio["positions"]
-                   if p["status"] == "open" and p.get("instrument", "EQ") == "EQ"]
-    if len(open_equity) >= MAX_EQUITY_POSITIONS:
-        logger.info("MAX EQUITY POSITIONS (%d) reached — skipping new equity entries.", MAX_EQUITY_POSITIONS)
-        # Still allow options/spreads, filter out equity-only candidates
-        candidates = [c for c in candidates if c.get("instrument_hint") in ("PUT", "SPREAD", "CONDOR")]
-        if not candidates:
-            return 0
+    # Hard gate: block equity entries when ALLOC_EQUITY_MAX == 0 (F&O only mode)
+    if config.ALLOC_EQUITY_MAX_V3 <= 0:
+        logger.info("F&O ONLY MODE — equity entries blocked")
+    else:
+        # V8: Max concurrent equity position check
+        open_equity = [p for p in portfolio["positions"]
+                       if p["status"] == "open" and p.get("instrument", "EQ") == "EQ"]
+        if len(open_equity) >= MAX_EQUITY_POSITIONS:
+            logger.info("MAX EQUITY POSITIONS (%d) reached — skipping new equity entries.", MAX_EQUITY_POSITIONS)
+            # Still allow options/spreads, filter out equity-only candidates
+            candidates = [c for c in candidates if c.get("instrument_hint") in ("PUT", "SPREAD", "CONDOR")]
+            if not candidates:
+                return 0
 
     # Filter out stocks already held
     open_symbols = {p["symbol"] for p in portfolio["positions"] if p["status"] == "open"}
@@ -2803,6 +2807,11 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
                 stoploss_price = round(entry_price * (1 + STOPLOSS_PCT / 100), 2)
 
             max_hold_date = _add_trading_days(today, MAX_HOLD_DAYS)
+
+            # F&O only mode: skip equity entries entirely
+            if config.ALLOC_EQUITY_MAX_V3 <= 0:
+                logger.info("SKIP %s: F&O only mode — no equity entries", symbol)
+                continue
 
             # Recompute quantity with volatility-adjusted allocation
             quantity = math.floor(allocation / entry_price)
