@@ -77,44 +77,73 @@ def _init_components(paper: bool = False) -> dict:
         "data_dir": data_dir,
     }
 
-    # These imports may fail if Plan 2/3 not yet implemented
-    # Graceful fallback for incremental development
+    capital = CAPITAL["initial"]
+
     try:
         from v7.data_feed import DataFeed
-        components["data_feed"] = DataFeed(paper=paper)
-    except ImportError:
+        data_feed = DataFeed(use_kite=not paper)
+        components["data_feed"] = data_feed
+    except (ImportError, Exception):
+        data_feed = None
+
+    try:
+        from v7.risk_engine import RiskEngine
+        risk_engine = RiskEngine(capital=capital, state_dir=data_dir)
+        components["risk_engine"] = risk_engine
+    except (ImportError, Exception):
+        risk_engine = None
+
+    try:
+        from v7.margin import MarginTracker
+        margin = MarginTracker(capital=capital)
+        components["margin"] = margin
+    except (ImportError, Exception):
+        margin = None
+
+    try:
+        from v7.level_memory import LevelMemory
+        components["level_memory"] = LevelMemory(state_dir=data_dir)
+    except (ImportError, Exception):
         pass
 
     try:
+        from v7.order_manager import OrderManager
+        order_mgr = OrderManager(dry_run=paper)
+        components["order_manager"] = order_mgr
+    except (ImportError, Exception):
+        order_mgr = None
+
+    try:
         from v7.strategist import Strategist
-        components["strategist"] = Strategist(
-            state=state,
-            edge_tracker=edge_tracker,
-            journal=journal,
-            telegram=telegram,
-        )
-    except ImportError:
+        components["strategist"] = Strategist(state_dir=str(data_dir))
+    except (ImportError, Exception):
         pass
 
     try:
         from v7.executor import Executor
         components["executor"] = Executor(
-            state=state,
-            telegram=telegram,
-            edge_tracker=edge_tracker,
-            paper=paper,
+            state_mgr=state,
+            data_feed=data_feed,
+            risk_engine=risk_engine,
+            order_mgr=order_mgr,
+            margin_tracker=margin,
+            capital=capital,
         )
-    except ImportError:
+    except (ImportError, Exception):
         pass
 
     try:
         from v7.theta_engine import ThetaEngine
+        import v7.strike_selector as strike_sel
         components["theta_engine"] = ThetaEngine(
-            state=state,
-            telegram=telegram,
-            paper=paper,
+            data_feed=data_feed,
+            order_mgr=order_mgr,
+            state_mgr=state,
+            strike_selector=strike_sel,
+            margin_tracker=margin,
+            capital=capital,
         )
-    except ImportError:
+    except (ImportError, Exception):
         pass
 
     return components

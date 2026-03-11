@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-PI_HOST="pi@homepi.local"
+PI_HOST="pi@homepi"
 REMOTE_DIR="~/financial-agent-india"
 
 echo "=== V7 Deployment to Pi ==="
