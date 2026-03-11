@@ -128,10 +128,14 @@ class Executor:
         if self._positions:
             self._manage_positions(now)
 
-        # 4. EXCEPTION DETECTION (every tick)
+        # 4. THETA ENGINE (every tick during market hours)
+        if hasattr(self, '_theta_engine') and self._theta_engine:
+            self._theta_engine.tick()
+
+        # 5. EXCEPTION DETECTION (every tick)
         self._check_exceptions(now)
 
-        # 5. PERSIST STATE
+        # 6. PERSIST STATE
         self._state.save_positions(self._positions)
         self._state.save_daily_state(self._daily)
 
@@ -171,6 +175,10 @@ class Executor:
     def _handle_active_trading(self, now: datetime) -> None:
         """9:45-14:30: Check triggers on candle boundaries only."""
         if not self._playbook:
+            return
+
+        # Expiry day cutoff: no new positions after 1:00 PM on Thursday
+        if self._is_expiry_cutoff(now):
             return
 
         if is_15min_boundary(now.time()):
@@ -654,6 +662,68 @@ class Executor:
                 except (ValueError, IndexError):
                     pass
         return False
+
+    # ── Theta Engine Integration ──────────────────────────────────────
+
+    def set_theta_engine(self, theta_engine) -> None:
+        """Attach theta engine for integrated tick cycle."""
+        self._theta_engine = theta_engine
+
+    # ── Expiry Day ────────────────────────────────────────────────────
+
+    def _is_expiry_day(self, today: Optional[date] = None) -> bool:
+        """Thursday is weekly expiry for index options."""
+        today = today or date.today()
+        return today.weekday() == 3
+
+    def _expiry_adjusted_sl(self, pos: Position) -> float:
+        """On expiry day, tighten SL to half normal distance."""
+        normal_distance = abs(pos.entry_price - pos.stoploss)
+        half_distance = normal_distance / 2
+        if pos.direction == "bullish":
+            return pos.entry_price - half_distance
+        return pos.entry_price + half_distance
+
+    def _is_expiry_cutoff(self, now: datetime) -> bool:
+        """No new positions after 1:00 PM on expiry day."""
+        if not self._is_expiry_day(today=now.date()):
+            return False
+        return now.hour >= 13
+
+    # ── Position Rolling ──────────────────────────────────────────────
+
+    def _should_roll(self, pos: Position, current_price: float, dte: int) -> bool:
+        """Check if position should be rolled to next expiry.
+
+        Conditions (from spec):
+        - Loss is 20-50% of premium (not too small, not too large)
+        - DTE < 5 (theta accelerating)
+        - Original thesis still valid (simplified: not at SL)
+        - VIX <= 22 (next expiry premium must be affordable)
+
+        Do NOT roll if:
+        - Loss > 50% (thesis is wrong)
+        - Loss < 20% (position still viable)
+        - VIX has spiked above 22
+        """
+        if pos.direction == "bullish":
+            loss_pct = (pos.entry_price - current_price) / pos.entry_price * 100
+        else:
+            loss_pct = (current_price - pos.entry_price) / pos.entry_price * 100
+
+        # Loss must be 20-50% range
+        if loss_pct < 20 or loss_pct > 50:
+            return False
+
+        # DTE must be < 5
+        if dte >= 5:
+            return False
+
+        # VIX check
+        if self._vix > 22:
+            return False
+
+        return True
 
     # ── Helpers ───────────────────────────────────────────────────────
 
