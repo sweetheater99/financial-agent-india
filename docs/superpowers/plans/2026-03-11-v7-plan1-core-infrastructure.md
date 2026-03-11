@@ -56,7 +56,7 @@ from datetime import date, time
 from v7.types import (
     DayPhase, DayClassification, Conviction, SetupType,
     Setup, Playbook, Position, TradeResult, CarryRules,
-    RiskBudget, PacingStatus,
+    RiskBudget, PacingStatus, MarketContext, KeyLevels,
 )
 
 
@@ -173,6 +173,35 @@ def test_risk_budget_can_allocate():
     assert rb.can_allocate(4500, 10000, 300_000) is False  # 10000+4500 > 12000
 
 
+def test_risk_budget_can_enter_trade():
+    rb = RiskBudget(
+        max_capital_at_risk_today_pct=4.0,
+        max_trades_today=4,
+        max_per_trade_risk_pct=1.5,
+        survival_mode=False,
+    )
+    # All guards pass
+    assert rb.can_enter_trade(
+        new_risk=4500, current_risk=0, capital=300_000,
+        trades_today=0, consecutive_sl_hits=0, daily_pnl=-1000,
+    ) is True
+    # Max trades hit
+    assert rb.can_enter_trade(
+        new_risk=4500, current_risk=0, capital=300_000,
+        trades_today=4, consecutive_sl_hits=0, daily_pnl=0,
+    ) is False
+    # 3 consecutive SL hits
+    assert rb.can_enter_trade(
+        new_risk=4500, current_risk=0, capital=300_000,
+        trades_today=1, consecutive_sl_hits=3, daily_pnl=0,
+    ) is False
+    # Daily loss > 2%
+    assert rb.can_enter_trade(
+        new_risk=4500, current_risk=0, capital=300_000,
+        trades_today=1, consecutive_sl_hits=0, daily_pnl=-6500,
+    ) is False
+
+
 def test_risk_budget_survival_mode():
     rb = RiskBudget(
         max_capital_at_risk_today_pct=4.0,
@@ -183,6 +212,19 @@ def test_risk_budget_survival_mode():
     # In survival mode, no directional trades allowed
     assert rb.allows_directional() is False
     assert rb.allows_theta() is True
+
+
+def test_risk_budget_full_stop():
+    rb = RiskBudget(
+        max_capital_at_risk_today_pct=4.0,
+        max_trades_today=4,
+        max_per_trade_risk_pct=1.5,
+        survival_mode=False,
+        pacing_status=PacingStatus.FULL_STOP,
+    )
+    # In full stop, nothing allowed
+    assert rb.allows_directional() is False
+    assert rb.allows_theta() is False
 
 
 def test_playbook_serialization():
@@ -264,7 +306,7 @@ class DayPhase(Enum):
             return cls.ACTIVE_TRADING
         if mins < 915:       # 14:30-15:14
             return cls.WIND_DOWN
-        if mins < 930:       # 15:15-15:29
+        if mins <= 930:       # 15:15-15:30
             return cls.POST_CLOSE
         return cls.OUTSIDE_HOURS
 
@@ -519,13 +561,40 @@ class RiskBudget:
     monthly_target_pct: float = 5.0
 
     def can_allocate(self, new_risk: float, current_risk: float, capital: float) -> bool:
+        """Check concurrent risk budget only."""
         max_risk = capital * (self.max_capital_at_risk_today_pct / 100)
         return (current_risk + new_risk) <= max_risk
 
+    def can_enter_trade(
+        self, new_risk: float, current_risk: float, capital: float,
+        trades_today: int, consecutive_sl_hits: int, daily_pnl: float,
+    ) -> bool:
+        """Comprehensive entry gate — checks ALL daily guards."""
+        # Guard 1: concurrent risk budget
+        if not self.can_allocate(new_risk, current_risk, capital):
+            return False
+        # Guard 2: max trades per day
+        if trades_today >= self.max_trades_today:
+            return False
+        # Guard 3: 3 consecutive SL hits
+        if consecutive_sl_hits >= 3:
+            return False
+        # Guard 4: daily loss > 2% of capital
+        if daily_pnl < -(capital * 0.02):
+            return False
+        # Guard 5: survival or full stop mode
+        if not self.allows_directional():
+            return False
+        return True
+
     def allows_directional(self) -> bool:
+        if self.pacing_status == PacingStatus.FULL_STOP:
+            return False
         return not self.survival_mode
 
     def allows_theta(self) -> bool:
+        if self.pacing_status == PacingStatus.FULL_STOP:
+            return False
         return True  # theta allowed even in survival mode
 
     def risk_pct_for_conviction(self, conviction: Conviction) -> float:
@@ -563,6 +632,78 @@ class RiskBudget:
 
 
 @dataclass
+class MarketContext:
+    """Structured market context for the playbook."""
+    us_close: str = ""             # e.g. "+0.3%"
+    gift_nifty: str = ""           # e.g. "24250 (+0.2%)"
+    vix: float = 0.0
+    fii_dii: str = ""              # e.g. "FII -1200cr, DII +800cr"
+    events_today: list[str] = field(default_factory=list)
+    events_this_week: list[str] = field(default_factory=list)
+    fo_ban_list: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "us_close": self.us_close, "gift_nifty": self.gift_nifty,
+            "vix": self.vix, "fii_dii": self.fii_dii,
+            "events_today": self.events_today,
+            "events_this_week": self.events_this_week,
+            "fo_ban_list": self.fo_ban_list,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> MarketContext:
+        return cls(
+            us_close=d.get("us_close", ""),
+            gift_nifty=d.get("gift_nifty", ""),
+            vix=d.get("vix", 0.0),
+            fii_dii=d.get("fii_dii", ""),
+            events_today=d.get("events_today", []),
+            events_this_week=d.get("events_this_week", []),
+            fo_ban_list=d.get("fo_ban_list", []),
+        )
+
+
+@dataclass
+class KeyLevels:
+    """Key price levels for an instrument."""
+    resistance_1: float = 0.0
+    resistance_2: float = 0.0
+    support_1: float = 0.0
+    support_2: float = 0.0
+    opening_range_high: float | None = None
+    opening_range_low: float | None = None
+    no_trade_zone: tuple[float, float] | None = None  # (low, high) price band
+
+    def to_dict(self) -> dict:
+        return {
+            "resistance_1": self.resistance_1, "resistance_2": self.resistance_2,
+            "support_1": self.support_1, "support_2": self.support_2,
+            "opening_range_high": self.opening_range_high,
+            "opening_range_low": self.opening_range_low,
+            "no_trade_zone": list(self.no_trade_zone) if self.no_trade_zone else None,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> KeyLevels:
+        ntz = d.get("no_trade_zone")
+        return cls(
+            resistance_1=d.get("resistance_1", 0.0),
+            resistance_2=d.get("resistance_2", 0.0),
+            support_1=d.get("support_1", 0.0),
+            support_2=d.get("support_2", 0.0),
+            opening_range_high=d.get("opening_range_high"),
+            opening_range_low=d.get("opening_range_low"),
+            no_trade_zone=tuple(ntz) if ntz else None,
+        )
+
+    def in_no_trade_zone(self, price: float) -> bool:
+        if self.no_trade_zone is None:
+            return False
+        return self.no_trade_zone[0] <= price <= self.no_trade_zone[1]
+
+
+@dataclass
 class Playbook:
     """The daily trading plan generated by the Strategist."""
     date: date
@@ -573,7 +714,8 @@ class Playbook:
     risk_budget: RiskBudget
     no_trade_conditions: list[str]
     carry_rules: CarryRules
-    market_context: dict[str, Any] = field(default_factory=dict)
+    market_context: MarketContext = field(default_factory=MarketContext)
+    key_levels: dict[str, KeyLevels] = field(default_factory=dict)  # symbol -> KeyLevels
     opening_range: dict[str, float] | None = None  # filled after 9:45
     theta_action: str = "hold"  # "hold", "enter", "adjust", "exit"
     theta_details: str = ""
@@ -594,7 +736,8 @@ class Playbook:
             "risk_budget": self.risk_budget.to_dict(),
             "no_trade_conditions": self.no_trade_conditions,
             "carry_rules": self.carry_rules.to_dict(),
-            "market_context": self.market_context,
+            "market_context": self.market_context.to_dict(),
+            "key_levels": {k: v.to_dict() for k, v in self.key_levels.items()},
             "opening_range": self.opening_range,
             "theta_action": self.theta_action,
             "theta_details": self.theta_details,
@@ -602,6 +745,10 @@ class Playbook:
 
     @classmethod
     def from_dict(cls, d: dict) -> Playbook:
+        mc = d.get("market_context", {})
+        market_context = MarketContext.from_dict(mc) if mc else MarketContext()
+        kl = d.get("key_levels", {})
+        key_levels = {k: KeyLevels.from_dict(v) for k, v in kl.items()}
         return cls(
             date=date.fromisoformat(d["date"]),
             day_classification=DayClassification(d["day_classification"]),
@@ -611,7 +758,8 @@ class Playbook:
             risk_budget=RiskBudget.from_dict(d["risk_budget"]),
             no_trade_conditions=d["no_trade_conditions"],
             carry_rules=CarryRules.from_dict(d["carry_rules"]),
-            market_context=d.get("market_context", {}),
+            market_context=market_context,
+            key_levels=key_levels,
             opening_range=d.get("opening_range"),
             theta_action=d.get("theta_action", "hold"),
             theta_details=d.get("theta_details", ""),
@@ -790,6 +938,10 @@ THETA_LIMITS = {
     "survival_delta": 0.15,          # wider wings in survival mode
     "max_risk_pct": 3.0,             # max 3% of capital at risk
 }
+
+# ── State & Recovery ──────────────────────────────────────────────────
+STATE_DIR = "data/v7"                       # all state files live here
+RESTART_COOLDOWN_SECONDS = 300              # 5 min cooldown after Pi restart
 
 # ── Brokerage (Zerodha) ───────────────────────────────────────────────
 BROKERAGE = {
@@ -1028,6 +1180,25 @@ def test_save_and_load_level_memory(state):
     assert loaded["NIFTY"]["levels"][0]["strength"] == 3
 
 
+def test_save_and_load_edge_tracker(state):
+    edge = {
+        "overall_win_rate": 0.55,
+        "by_strategy": {
+            "momentum_breakout": {"trades": 45, "win_rate": 0.58, "avg_rr": 1.8},
+        },
+        "by_instrument": {
+            "NIFTY": {"trades": 35, "net_pnl": 12000},
+        },
+        "by_time": {
+            "9:45-11:00": {"trades": 40, "win_rate": 0.60},
+        },
+    }
+    state.save_edge_tracker(edge)
+    loaded = state.load_edge_tracker()
+    assert loaded["overall_win_rate"] == 0.55
+    assert loaded["by_strategy"]["momentum_breakout"]["trades"] == 45
+
+
 def test_save_and_load_monthly_state(state):
     monthly = {
         "month": "2026-03",
@@ -1225,15 +1396,15 @@ def test_data_feed_init():
 
 
 def test_data_feed_kite_mode():
-    with patch("v7.data_feed.get_kite") as mock_kite:
+    with patch("kite_data.get_kite") as mock_kite:
         mock_kite.return_value = MagicMock()
         feed = DataFeed(use_kite=True, use_angelone=False)
         assert feed.mode == "kite"
 
 
 def test_data_feed_protect_only_on_kite_failure():
-    with patch("v7.data_feed.get_kite", side_effect=Exception("Token expired")):
-        with patch("v7.data_feed.get_session") as mock_angel:
+    with patch("kite_data.get_kite", side_effect=Exception("Token expired")):
+        with patch("connect.get_session") as mock_angel:
             mock_angel.return_value = MagicMock()
             feed = DataFeed(use_kite=True, use_angelone=True)
             assert feed.mode == "protect_only"
@@ -2122,7 +2293,7 @@ def test_phase_transitions():
     assert DayPhase.from_time(time(9, 45)) == DayPhase.ACTIVE_TRADING
     assert DayPhase.from_time(time(14, 30)) == DayPhase.WIND_DOWN
     assert DayPhase.from_time(time(15, 15)) == DayPhase.POST_CLOSE
-    assert DayPhase.from_time(time(15, 30)) == DayPhase.OUTSIDE_HOURS
+    assert DayPhase.from_time(time(15, 30)) == DayPhase.POST_CLOSE
 
 
 def test_risk_budget_concurrent_limit():
