@@ -46,5 +46,5 @@ if [ "$KITE_OK" = "no" ]; then
 fi
 
 echo "[$(TZ=Asia/Kolkata date)] [OPENING-READ] Starting" >> "$LOG"
-python -m v7.main --paper opening-read >> "$LOG" 2>&1
+python -m v7.main opening-read >> "$LOG" 2>&1
 echo "" >> "$LOG"

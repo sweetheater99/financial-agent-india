@@ -70,7 +70,7 @@ if [ "$KITE_OK" = "no" ]; then
 fi
 
 echo "[$(TZ=Asia/Kolkata date)] [PREMARKET] Starting" >> "$LOG"
-python -m v7.main --paper premarket >> "$LOG" 2>&1
+python -m v7.main premarket >> "$LOG" 2>&1
 EXIT_CODE=$?
 
 if [ "$EXIT_CODE" -ne 0 ]; then

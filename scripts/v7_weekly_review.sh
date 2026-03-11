@@ -19,5 +19,5 @@ LOG="data/v7/cron.log"
 mkdir -p data/v7
 
 echo "[$(TZ=Asia/Kolkata date)] [WEEKLY] Starting weekly review" >> "$LOG"
-python -m v7.main --paper weekly >> "$LOG" 2>&1
+python -m v7.main weekly >> "$LOG" 2>&1
 echo "" >> "$LOG"

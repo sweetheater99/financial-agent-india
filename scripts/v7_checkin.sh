@@ -55,5 +55,5 @@ if [ "$KITE_OK" = "no" ]; then
 fi
 
 echo "[$(TZ=Asia/Kolkata date)] [CHECKIN] Check-in #$CHECKIN_NUM starting" >> "$LOG"
-python -m v7.main --paper checkin --num "$CHECKIN_NUM" >> "$LOG" 2>&1
+python -m v7.main checkin --num "$CHECKIN_NUM" >> "$LOG" 2>&1
 echo "" >> "$LOG"
