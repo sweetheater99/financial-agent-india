@@ -1,0 +1,688 @@
+# v7/executor.py
+"""V7 Executor — Mechanical tick cycle engine.
+
+Runs every 3 minutes during market hours. No Claude calls. Pure rule execution.
+Phase-based behavior:
+  - Opening Read (9:15-9:45): only manage carried positions
+  - Active Trading (9:45-14:30): full playbook execution on 15-min candle boundaries
+  - Wind Down (14:30-15:15): close intraday, carry decisions
+  - Post-close (15:15-15:30): final SL placement on carried positions
+
+Spec ref: Component 2 (lines 319-438)
+"""
+from __future__ import annotations
+
+import logging
+from datetime import datetime, date, time
+from typing import Optional
+
+from v7.types import (
+    DayPhase, Setup, SetupType, Position, Playbook, TradeResult,
+    CarryRules, RiskBudget, Conviction,
+)
+
+logger = logging.getLogger("v7.executor")
+
+
+def is_15min_boundary(t: time) -> bool:
+    """Check if time falls on a 15-min candle close boundary (:00, :15, :30, :45)."""
+    return t.minute % 15 == 0
+
+
+# Index symbol aliases — kept here to avoid importing kiteconnect at module level
+_INDEX_ALIASES = {
+    "NIFTY": "NSE:NIFTY 50",
+    "BANKNIFTY": "NSE:NIFTY BANK",
+    "FINNIFTY": "NSE:NIFTY FIN SERVICE",
+    "MIDCPNIFTY": "NSE:NIFTY MID SELECT",
+}
+
+
+class Executor:
+    """Mechanical execution engine. No Claude calls.
+
+    Responsibilities:
+    - Fetch LTP, candles, VIX each tick
+    - Evaluate playbook triggers on 15-min candle boundaries (Active Trading only)
+    - Manage open positions: SL, breakeven, trailing, target
+    - Wind down: close intraday, evaluate carry
+    - Detect exception conditions → delegate to Strategist.handle_exception()
+    """
+
+    def __init__(
+        self,
+        state_mgr,
+        data_feed,
+        risk_engine,
+        order_mgr,
+        margin_tracker,
+        capital: float = 300_000,
+        strategist=None,
+    ):
+        self._state = state_mgr
+        self._data = data_feed
+        self._risk = risk_engine
+        self._orders = order_mgr
+        self._margin = margin_tracker
+        self._capital = capital
+        self._strategist = strategist  # for exception callbacks
+
+        # Runtime state — loaded from persistence at start
+        self._playbook: Optional[Playbook] = None
+        self._positions: list[Position] = []
+        self._daily: dict = {}
+        self._quotes: dict = {}  # latest LTP batch
+        self._vix: float = 0.0
+        self._initialized = False
+
+    def initialize(self) -> None:
+        """Load persisted state. Called once at bot start or after restart."""
+        self._playbook = self._state.load_playbook()
+        self._positions = self._state.load_positions()
+        self._daily = self._state.load_daily_state()
+        self._initialized = True
+
+        # Validate playbook is for today
+        if self._playbook and self._playbook.date != date.today():
+            logger.warning("Playbook is from %s, not today. Entering protect-only mode.",
+                           self._playbook.date)
+            self._playbook = None
+
+        # Verify SL orders on exchange for carried positions
+        for pos in self._positions:
+            if pos.carried and pos.sl_order_id:
+                if not self._orders.is_sl_order_live(pos.sl_order_id):
+                    logger.warning("Carried position %s SL order %s is NOT live! Replacing.",
+                                   pos.instrument, pos.sl_order_id)
+                    # Will be handled in carried position management
+
+        logger.info("Executor initialized: %d positions, playbook=%s",
+                     len(self._positions), "loaded" if self._playbook else "NONE")
+
+    def tick(self) -> None:
+        """Single tick of the executor loop. Called every 3 minutes."""
+        now = datetime.now()
+        phase = DayPhase.from_time(now.time())
+
+        # Outside market hours — exit immediately
+        if phase in (DayPhase.OUTSIDE_HOURS, DayPhase.PRE_MARKET):
+            return
+
+        if not self._initialized:
+            self.initialize()
+
+        # 1. FETCH DATA
+        self._fetch_data(now)
+
+        # 2. Phase-specific behavior
+        if phase == DayPhase.OPENING_READ:
+            self._handle_opening_read(now)
+        elif phase == DayPhase.ACTIVE_TRADING:
+            self._handle_active_trading(now)
+        elif phase == DayPhase.WIND_DOWN:
+            self._handle_wind_down(now)
+        elif phase == DayPhase.POST_CLOSE:
+            self._handle_post_close(now)
+
+        # 3. MANAGE OPEN POSITIONS (every tick, every phase during market hours)
+        if self._positions:
+            self._manage_positions(now)
+
+        # 4. EXCEPTION DETECTION (every tick)
+        self._check_exceptions(now)
+
+        # 5. PERSIST STATE
+        self._state.save_positions(self._positions)
+        self._state.save_daily_state(self._daily)
+
+    # ── Data Fetching ─────────────────────────────────────────────────
+
+    def _fetch_data(self, now: datetime) -> None:
+        """Fetch LTP batch + VIX. Candles fetched on demand."""
+        try:
+            self._quotes = self._data.get_ltp_batch()
+        except Exception as e:
+            logger.error("LTP batch fetch failed: %s", e)
+            self._quotes = {}
+
+        try:
+            self._vix = self._data.get_vix() or 0.0
+        except Exception as e:
+            logger.warning("VIX fetch failed: %s", e)
+
+        # Track VIX 30min ago for exception detection
+        if self._daily.get("vix_30min_ago") is None:
+            self._daily["vix_30min_ago"] = self._vix
+
+        # Track Nifty open
+        if self._daily.get("nifty_open") is None:
+            nifty_ltp = self._quotes.get("NSE:NIFTY 50")
+            if nifty_ltp:
+                self._daily["nifty_open"] = nifty_ltp
+
+    # ── Phase Handlers ────────────────────────────────────────────────
+
+    def _handle_opening_read(self, now: datetime) -> None:
+        """9:15-9:45: Only manage carried positions (gap check). No triggers."""
+        carried = [p for p in self._positions if p.carried]
+        if carried:
+            self._manage_carried_positions_gap(now, carried)
+
+    def _handle_active_trading(self, now: datetime) -> None:
+        """9:45-14:30: Check triggers on candle boundaries only."""
+        if not self._playbook:
+            return
+
+        if is_15min_boundary(now.time()):
+            self._evaluate_triggers(now)
+
+    def _handle_wind_down(self, now: datetime) -> None:
+        """14:30-15:15: Close intraday, carry decisions."""
+        self._wind_down(now)
+
+    def _handle_post_close(self, now: datetime) -> None:
+        """15:15-15:30: Final SL placement on carried positions."""
+        for pos in self._positions:
+            if pos.carried and not pos.sl_order_id:
+                self._place_exchange_sl(pos)
+
+    # ── Trigger Evaluation ────────────────────────────────────────────
+
+    def _evaluate_triggers(self, now: datetime) -> None:
+        """Check all playbook setups in priority order. Only on candle boundaries."""
+        if not self._playbook:
+            return
+
+        # Check no-trade conditions
+        if self._check_no_trade_conditions():
+            return
+
+        all_setups = self._playbook.all_setups()
+        for setup in sorted(all_setups, key=lambda s: s.priority):
+            if setup.fired or setup.cancelled:
+                continue
+            self._evaluate_single_trigger(setup, now)
+
+    def _evaluate_single_trigger(self, setup: Setup, now: datetime) -> None:
+        """Evaluate a single setup trigger. Enter if conditions met."""
+        # Get current price for the setup's symbol
+        ltp = self._get_ltp_for_symbol(setup.symbol)
+        if ltp is None:
+            return
+
+        # Check trigger condition
+        triggered = False
+        if setup.type in (SetupType.BREAKOUT_LONG, SetupType.SUPPORT_BOUNCE):
+            triggered = ltp > setup.trigger_level
+        elif setup.type in (SetupType.BREAKOUT_SHORT, SetupType.RESISTANCE_FADE):
+            triggered = ltp < setup.trigger_level
+        elif setup.type in (SetupType.CREDIT_SPREAD_BULL, SetupType.CREDIT_SPREAD_BEAR):
+            triggered = ltp > setup.trigger_level  # simplified
+
+        if not triggered:
+            return
+
+        # Risk budget check
+        risk_amount = self._capital * (setup.max_risk_pct / 100)
+        current_risk = sum(p.risk_amount() for p in self._positions)
+        if not self._playbook.risk_budget.can_enter_trade(
+            new_risk=risk_amount,
+            current_risk=current_risk,
+            capital=self._capital,
+            trades_today=self._daily.get("trades_today", 0),
+            consecutive_sl_hits=self._daily.get("consecutive_sl_hits", 0),
+            daily_pnl=self._daily.get("daily_pnl", 0),
+        ):
+            logger.info("Setup %s triggered but risk budget exhausted", setup.id)
+            return
+
+        # Margin check
+        if not self._risk.check_margin(risk_amount):
+            logger.info("Setup %s triggered but margin insufficient", setup.id)
+            return
+
+        # F&O ban check, brokerage check would go here
+
+        # ENTER
+        logger.info("Setup %s TRIGGERED at %.2f (level=%.2f)", setup.id, ltp, setup.trigger_level)
+        self._enter_position(setup, ltp, now)
+
+    def _enter_position(self, setup: Setup, trigger_ltp: float, now: datetime) -> None:
+        """Execute entry for a triggered setup."""
+        setup.fired = True
+
+        # Strike selection would happen here via StrikeSelector
+        # For now, use the instrument from setup
+        tradingsymbol = setup.instrument
+        exchange = "NFO"
+
+        # Calculate limit price: bid + 0.50 for buy
+        limit_price = trigger_ltp + 0.50
+
+        risk_amount = self._capital * (setup.max_risk_pct / 100)
+        lot_size = 75  # would come from instrument lookup
+        quantity = lot_size
+
+        from v7.order_manager import OrderSide
+        result = self._orders.place_entry_order(
+            tradingsymbol=tradingsymbol,
+            exchange=exchange,
+            side=OrderSide.BUY,
+            quantity=quantity,
+            limit_price=limit_price,
+        )
+
+        if not result.filled:
+            logger.warning("Entry order for %s did not fill", setup.id)
+            return
+
+        # Create position
+        pos = Position(
+            symbol=setup.symbol,
+            instrument=tradingsymbol,
+            direction="bullish" if setup.type in (
+                SetupType.BREAKOUT_LONG, SetupType.SUPPORT_BOUNCE,
+                SetupType.CREDIT_SPREAD_BULL,
+            ) else "bearish",
+            entry_price=result.fill_price,
+            quantity=quantity,
+            lot_size=lot_size,
+            allocated=result.fill_price * quantity,
+            stoploss=setup.stoploss,
+            target=setup.target,
+            entry_date=now.date(),
+            setup_id=setup.id,
+        )
+        self._positions.append(pos)
+        self._daily["trades_today"] = self._daily.get("trades_today", 0) + 1
+
+        logger.info("ENTERED: %s %s @ %.2f, SL=%.2f, TGT=%.2f",
+                     setup.id, tradingsymbol, result.fill_price, setup.stoploss, setup.target)
+
+    # ── Position Management ───────────────────────────────────────────
+
+    def _manage_positions(self, now: datetime) -> None:
+        """Update P&L, check SL/target/trailing for each position."""
+        positions_to_remove = []
+
+        for pos in self._positions:
+            ltp = self._get_ltp_for_instrument(pos.instrument)
+            if ltp is None:
+                continue
+
+            # Update peak price
+            if pos.direction == "bullish":
+                pos.peak_price = max(pos.peak_price, ltp)
+            else:
+                pos.peak_price = min(pos.peak_price, ltp) if pos.peak_price > 0 else ltp
+
+            pnl = pos.unrealized_pnl(ltp)
+
+            # SL hit → EXIT immediately
+            if self._is_sl_hit(pos, ltp):
+                logger.info("SL HIT: %s @ %.2f (SL=%.2f)", pos.instrument, ltp, pos.stoploss)
+                self._exit_position(pos, ltp, "stoploss", now)
+                positions_to_remove.append(pos)
+                self._daily["consecutive_sl_hits"] = self._daily.get("consecutive_sl_hits", 0) + 1
+                continue
+
+            # Target hit → full exit
+            if self._is_target_hit(pos, ltp):
+                logger.info("TARGET HIT: %s @ %.2f (TGT=%.2f)", pos.instrument, ltp, pos.target)
+                self._exit_position(pos, ltp, "target", now)
+                positions_to_remove.append(pos)
+                self._daily["consecutive_sl_hits"] = 0
+                continue
+
+            # 1:1 R:R → move SL to breakeven
+            self._check_breakeven(pos, ltp)
+
+            # Trailing stop: peak - 1.5x ATR
+            trailing_sl = self._compute_trailing_sl(pos, ltp)
+            if trailing_sl is not None and self._is_better_sl(pos, trailing_sl):
+                old_sl = pos.stoploss
+                pos.stoploss = trailing_sl
+                logger.info("TRAILING SL: %s moved %.2f → %.2f", pos.instrument, old_sl, trailing_sl)
+                if pos.sl_order_id:
+                    self._update_exchange_sl(pos)
+
+        for pos in positions_to_remove:
+            self._positions.remove(pos)
+
+    def _is_sl_hit(self, pos: Position, ltp: float) -> bool:
+        if pos.direction == "bullish":
+            return ltp <= pos.stoploss
+        return ltp >= pos.stoploss
+
+    def _is_target_hit(self, pos: Position, ltp: float) -> bool:
+        if pos.direction == "bullish":
+            return ltp >= pos.target
+        return ltp <= pos.target
+
+    def _check_breakeven(self, pos: Position, ltp: float) -> None:
+        """Move SL to breakeven when 1:1 R:R is achieved."""
+        risk = abs(pos.entry_price - pos.stoploss)
+        if pos.direction == "bullish":
+            if ltp >= pos.entry_price + risk and pos.stoploss < pos.entry_price:
+                logger.info("BREAKEVEN: %s SL moved to entry %.2f", pos.instrument, pos.entry_price)
+                pos.stoploss = pos.entry_price
+                if pos.sl_order_id:
+                    self._update_exchange_sl(pos)
+        else:
+            if ltp <= pos.entry_price - risk and pos.stoploss > pos.entry_price:
+                logger.info("BREAKEVEN: %s SL moved to entry %.2f", pos.instrument, pos.entry_price)
+                pos.stoploss = pos.entry_price
+                if pos.sl_order_id:
+                    self._update_exchange_sl(pos)
+
+    def _compute_trailing_sl(self, pos: Position, ltp: float) -> Optional[float]:
+        """Trailing stop = peak_price - 1.5x ATR(5min).
+
+        Returns new SL level or None if ATR not available.
+        """
+        # Fetch 5-min ATR for the instrument
+        try:
+            candles = self._data.get_candles(
+                pos.symbol, interval="FIVE_MINUTE", days=1
+            )
+            if not candles or len(candles) < 14:
+                return None
+
+            # Compute ATR from last 14 candles
+            atr = self._compute_atr(candles[-14:])
+            if atr <= 0:
+                return None
+
+            trailing_distance = 1.5 * atr
+            if pos.direction == "bullish":
+                return pos.peak_price - trailing_distance
+            else:
+                return pos.peak_price + trailing_distance
+        except Exception:
+            return None
+
+    def _compute_atr(self, candles: list) -> float:
+        """Simple ATR from candle data. Candles: [[ts, o, h, l, c, v], ...]"""
+        if len(candles) < 2:
+            return 0.0
+        trs = []
+        for i in range(1, len(candles)):
+            h, l, prev_c = candles[i][2], candles[i][3], candles[i - 1][4]
+            tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
+            trs.append(tr)
+        return sum(trs) / len(trs) if trs else 0.0
+
+    def _is_better_sl(self, pos: Position, new_sl: float) -> bool:
+        """Only move SL in the favorable direction (tighter)."""
+        if pos.direction == "bullish":
+            return new_sl > pos.stoploss
+        return new_sl < pos.stoploss
+
+    def _exit_position(self, pos: Position, ltp: float, reason: str, now: datetime) -> None:
+        """Execute exit order for a position."""
+        from v7.order_manager import OrderSide
+
+        # Cancel exchange SL if active
+        if pos.sl_order_id:
+            self._orders.cancel_order(pos.sl_order_id)
+
+        # Place exit order
+        is_sl_exit = reason == "stoploss"
+        side = OrderSide.SELL if pos.direction == "bullish" else OrderSide.BUY
+        limit_price = ltp - 0.50 if side == OrderSide.SELL else ltp + 0.50
+
+        result = self._orders.place_exit_order(
+            tradingsymbol=pos.instrument,
+            exchange="NFO",
+            side=side,
+            quantity=pos.quantity,
+            limit_price=limit_price,
+            is_sl_exit=is_sl_exit,
+        )
+
+        exit_price = result.fill_price if result.filled else ltp
+        pnl = pos.unrealized_pnl(exit_price)
+        self._daily["daily_pnl"] = self._daily.get("daily_pnl", 0) + pnl
+
+        logger.info("EXITED: %s reason=%s exit=%.2f pnl=%.2f", pos.instrument, reason, exit_price, pnl)
+
+    # ── Carried Position Management ───────────────────────────────────
+
+    def _manage_carried_positions_gap(self, now: datetime, carried: list[Position]) -> None:
+        """Opening read: check gap on carried positions."""
+        for pos in carried:
+            ltp = self._get_ltp_for_instrument(pos.instrument)
+            if ltp is None:
+                continue
+
+            sl_distance = abs(pos.entry_price - pos.stoploss)
+            gap = ltp - pos.peak_price if pos.direction == "bullish" else pos.peak_price - ltp
+
+            if gap < -sl_distance:
+                # Gap against position > SL distance → exit in first 5 min
+                logger.info("CARRIED GAP EXIT: %s gap=%.2f > SL distance=%.2f",
+                             pos.instrument, abs(gap), sl_distance)
+                self._exit_position(pos, ltp, "carry_gap", now)
+                self._positions.remove(pos)
+            elif gap > 0:
+                # Gap in favor → tighten SL to lock gains
+                new_sl = pos.entry_price + (gap * 0.5) if pos.direction == "bullish" \
+                    else pos.entry_price - (gap * 0.5)
+                if self._is_better_sl(pos, new_sl):
+                    pos.stoploss = new_sl
+                    logger.info("CARRIED GAP TIGHTEN: %s new SL=%.2f", pos.instrument, new_sl)
+                    if pos.sl_order_id:
+                        self._update_exchange_sl(pos)
+
+    # ── Wind Down ─────────────────────────────────────────────────────
+
+    def _wind_down(self, now: datetime) -> None:
+        """Close intraday positions, evaluate carry criteria."""
+        if not self._playbook:
+            # No playbook — close everything
+            for pos in list(self._positions):
+                ltp = self._get_ltp_for_instrument(pos.instrument)
+                if ltp:
+                    self._exit_position(pos, ltp, "wind_down", now)
+            self._positions.clear()
+            return
+
+        carry_rules = self._playbook.carry_rules
+        positions_to_close = []
+
+        for pos in self._positions:
+            if pos.carried:
+                continue  # already carried from previous day
+
+            ltp = self._get_ltp_for_instrument(pos.instrument)
+            if ltp is None:
+                positions_to_close.append(pos)
+                continue
+
+            # Check carry criteria
+            if self._meets_carry_criteria(pos, ltp, carry_rules):
+                self._convert_to_carry(pos, ltp, now)
+            else:
+                self._exit_position(pos, ltp, "wind_down", now)
+                positions_to_close.append(pos)
+
+        for pos in positions_to_close:
+            if pos in self._positions:
+                self._positions.remove(pos)
+
+    def _meets_carry_criteria(self, pos: Position, ltp: float, rules: CarryRules) -> bool:
+        """Check if position meets overnight carry criteria.
+
+        Carry criteria (from spec):
+        - Profit > 1.5%
+        - Trend intact (simplified: in profit)
+        - VIX < 20
+        - DTE > 3 days
+        - Not expiry day, not event tomorrow, not VIX > 22
+        """
+        pnl_pct = pos.unrealized_pnl_pct(ltp)
+        if pnl_pct < rules.min_profit_pct:
+            return False
+        if self._vix > rules.max_vix:
+            return False
+        # Check never-carry conditions
+        today = date.today()
+        if today.weekday() == 3:  # Thursday = expiry day
+            return False
+        if "vix_above_22" in rules.never_carry and self._vix > 22:
+            return False
+        return True
+
+    def _convert_to_carry(self, pos: Position, ltp: float, now: datetime) -> None:
+        """Convert intraday position to overnight carry with hedge + exchange SL."""
+        pos.carried = True
+        logger.info("CARRY: %s converting to overnight", pos.instrument)
+
+        # Place protective hedge (buy OTM option opposite side)
+        # This would use StrikeSelector to find a 3-4 strike OTM hedge
+        # For now, log intent
+        logger.info("CARRY: would place protective hedge for %s (max cost ₹500)", pos.instrument)
+
+        # Place exchange-level SL order
+        self._place_exchange_sl(pos, product="NRML")
+
+    def _place_exchange_sl(self, pos: Position, product: str = "NRML") -> None:
+        """Place SL order on exchange for a position."""
+        from v7.order_manager import OrderSide
+
+        side = OrderSide.SELL if pos.direction == "bullish" else OrderSide.BUY
+        trigger = pos.stoploss
+        limit = trigger - 1.0 if side == OrderSide.SELL else trigger + 1.0
+
+        result = self._orders.place_sl_order(
+            tradingsymbol=pos.instrument,
+            exchange="NFO",
+            side=side,
+            quantity=pos.quantity,
+            trigger_price=trigger,
+            limit_price=limit,
+            product=product,
+        )
+
+        if result.order_id:
+            pos.sl_order_id = result.order_id
+            logger.info("Exchange SL placed: %s for %s trigger=%.2f",
+                         result.order_id, pos.instrument, trigger)
+
+    def _update_exchange_sl(self, pos: Position) -> None:
+        """Update exchange SL order to new stoploss level."""
+        if not pos.sl_order_id:
+            return
+        from v7.order_manager import OrderSide
+
+        side = OrderSide.SELL if pos.direction == "bullish" else OrderSide.BUY
+        trigger = pos.stoploss
+        limit = trigger - 1.0 if side == OrderSide.SELL else trigger + 1.0
+
+        result = self._orders.update_sl_order(
+            old_order_id=pos.sl_order_id,
+            tradingsymbol=pos.instrument,
+            exchange="NFO",
+            side=side,
+            quantity=pos.quantity,
+            new_trigger_price=trigger,
+            new_limit_price=limit,
+        )
+
+        if result.order_id:
+            pos.sl_order_id = result.order_id
+
+    # ── Exception Detection ───────────────────────────────────────────
+
+    def _check_exceptions(self, now: datetime) -> None:
+        """Detect exception conditions and delegate to Strategist."""
+        if not self._strategist:
+            return
+
+        exceptions = []
+
+        # VIX jump > 2pts in 30 min
+        vix_30m_ago = self._daily.get("vix_30min_ago", self._vix)
+        if self._vix - vix_30m_ago > 2.0:
+            exceptions.append(f"VIX spike: {vix_30m_ago:.1f} → {self._vix:.1f} in 30min")
+
+        # Nifty > 1.5% from open
+        nifty_open = self._daily.get("nifty_open")
+        nifty_now = self._quotes.get("NSE:NIFTY 50")
+        if nifty_open and nifty_now:
+            nifty_move_pct = abs(nifty_now - nifty_open) / nifty_open * 100
+            if nifty_move_pct > 1.5:
+                exceptions.append(f"Nifty move: {nifty_move_pct:.1f}% from open")
+
+        # Margin > 70%
+        margin_pct = self._margin.current_utilization_pct()
+        if margin_pct > 70:
+            exceptions.append(f"Margin utilization: {margin_pct:.0f}%")
+
+        # 3 consecutive SL hits
+        if self._daily.get("consecutive_sl_hits", 0) >= 3:
+            exceptions.append(f"3 consecutive SL hits today")
+
+        if exceptions:
+            logger.warning("EXCEPTION DETECTED: %s", "; ".join(exceptions))
+            try:
+                self._strategist.handle_exception(
+                    exceptions=exceptions,
+                    positions=self._positions,
+                    daily_state=self._daily,
+                    vix=self._vix,
+                )
+            except Exception as e:
+                logger.error("Exception handler failed: %s", e)
+
+    # ── No-Trade Conditions ───────────────────────────────────────────
+
+    def _check_no_trade_conditions(self) -> bool:
+        """Check if any no-trade condition is active. Returns True to skip."""
+        if not self._playbook or not self._playbook.no_trade_conditions:
+            return False
+
+        for condition in self._playbook.no_trade_conditions:
+            cond_lower = condition.lower()
+            if "vix" in cond_lower:
+                # Parse "VIX > 22" style conditions
+                try:
+                    threshold = float(cond_lower.split(">")[-1].strip())
+                    if self._vix > threshold:
+                        logger.info("No-trade: %s (VIX=%.1f)", condition, self._vix)
+                        return True
+                except (ValueError, IndexError):
+                    pass
+        return False
+
+    # ── Helpers ───────────────────────────────────────────────────────
+
+    def _get_ltp_for_symbol(self, symbol: str) -> Optional[float]:
+        """Get LTP for a symbol from latest quotes."""
+        # Try NSE:SYMBOL format
+        key = f"NSE:{symbol}"
+        if key in self._quotes:
+            return self._quotes[key]
+        # Try index aliases (defined locally, no kiteconnect import needed)
+        alias = _INDEX_ALIASES.get(symbol)
+        if alias and alias in self._quotes:
+            return self._quotes[alias]
+        # Try kite_data.INDEX_ALIASES if available
+        try:
+            from kite_data import INDEX_ALIASES
+            alias = INDEX_ALIASES.get(symbol)
+            if alias and alias in self._quotes:
+                return self._quotes[alias]
+        except ImportError:
+            pass
+        return None
+
+    def _get_ltp_for_instrument(self, instrument: str) -> Optional[float]:
+        """Get LTP for a specific instrument (NFO tradingsymbol)."""
+        key = f"NFO:{instrument}"
+        if key in self._quotes:
+            return self._quotes[key]
+        # Try direct match
+        if instrument in self._quotes:
+            return self._quotes[instrument]
+        return None
