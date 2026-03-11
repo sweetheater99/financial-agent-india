@@ -9,3 +9,15 @@ build/
 .DS_Store
 logs/
 data/
+
+# V7 state files (runtime, not committed)
+data/v7/playbook.json
+data/v7/positions.json
+data/v7/daily_state.json
+data/v7/monthly_state.json
+data/v7/edge_tracker.json
+data/v7/level_memory.json
+data/v7/cron.log
+data/v7/cron.log.old
+data/v7/weekly_review_*.json
+data/v7/monthly_report_*.json
