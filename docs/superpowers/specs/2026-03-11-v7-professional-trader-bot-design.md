@@ -56,7 +56,7 @@ Watchlist rotates on weekly review — drop worst performer, add a liquid name t
 | Trending day | Momentum — ride breakouts | Buy CE/PE directionally |
 | Rangebound day | Mean reversion — fade extremes | Sell credit spreads |
 | Low VIX (14-20) | Theta — collect premium | Iron condors on Nifty |
-| High VIX (>22) | Buy options (premium is cheap relative to movement) | Protective puts, directional buys |
+| High VIX (>22) | Buy options directionally (premiums are expensive, but large moves can justify the cost — only with high conviction setups) | Protective puts, directional buys |
 | Choppy day | No trade | Sit out or theta only |
 
 ---
@@ -322,6 +322,14 @@ The fast loop. Runs every 3 minutes during market hours. No Claude calls. Pure r
 
 ### Tick Cycle (every 3 min, 9:15-3:30)
 
+**Market hours guard:** Every tick checks `is_market_open()` and `is_trading_day()` first. Exits immediately on holidays or outside 9:15-15:30.
+
+**Phase-based behavior:**
+- **9:15-9:45 (Opening Read phase):** ONLY manage carried positions (gap check). Do NOT fire playbook triggers. Wait for opening read.
+- **9:45-14:30 (Active Trading phase):** Full playbook execution.
+- **14:30-15:15 (Wind Down phase):** Close intraday positions, carry decisions.
+- **15:15-15:30 (Post-close):** Final SL placement on carried positions.
+
 ```
 1. FETCH DATA
    - LTP batch quote for all watchlist instruments (1 API call)
@@ -329,14 +337,17 @@ The fast loop. Runs every 3 minutes during market hours. No Claude calls. Pure r
    - OI refresh every 5 min (not every tick)
    - VIX current value
 
-2. CARRIED POSITION CHECK (9:15-9:30 only)
+2. CARRIED POSITION CHECK (9:15-9:45 only)
    - Gap against position > SL distance → exit in first 5 min
    - Gap in favor → tighten SL to lock gains
    - Flat → treat as normal position with updated levels
 
-3. CHECK PLAYBOOK TRIGGERS
+3. CHECK PLAYBOOK TRIGGERS (9:45-14:30 only)
+   Only evaluate when a 15-min candle has actually CLOSED (at :00, :15, :30, :45).
+   On intermediate 3-min ticks, skip trigger checks — only manage open positions.
+
    For each setup (in priority order):
-     - Has 15-min candle closed beyond trigger level?
+     - Has the most recent CLOSED 15-min candle broken the trigger level?
      - Is volume confirming? (> threshold)
      - Is it inside a no-trade zone? → skip
      - Is any no-trade condition active? → skip all
@@ -385,7 +396,7 @@ EXIT:
   - Target: limit order at target price, let it fill passively
 
 BRACKET ORDERS (for overnight carry):
-  - Place real SL order on exchange via Kite bracket order API
+  - Place real SL order on exchange via Kite SL/SL-M order API
   - Bot crash / Pi disconnect = SL still active
   - Non-negotiable for autonomous operation
 ```
@@ -435,12 +446,24 @@ Separate playbook rules override normal operation:
 - Historical: 1-min, 5-min, 15-min candles (3 req/sec limit)
 - Option chain: instruments list + quotes for near-money strikes
 - Margin: margin calculator API for position sizing
-- Orders: bracket orders for exchange-level SL
+- Orders: standalone SL/SL-M orders for exchange-level stop losses (SL/SL-M orders are NOT available for F&O on Kite — use regular `place_order` with `order_type="SL"` or `"SL-M"`)
 
-**Fallback: AngelOne SmartAPI**
-- Used when Kite token is expired (with daily Telegram reminder to refresh)
-- Limited to: LTP quotes, daily candles
-- Not reliable for: option chains, historical intraday data
+**Fallback: AngelOne SmartAPI — PROTECT-ONLY MODE**
+- AngelOne cannot reliably fetch option chains or intraday historical data.
+- If Kite token expires mid-session, the bot enters **protect-only mode**:
+  - No new trades allowed
+  - Existing positions: ensure SL orders are live on exchange
+  - Use AngelOne only for LTP quotes to monitor P&L
+  - Alert on Telegram: "Kite token expired. Protect-only mode. Refresh token."
+- This is NOT a degraded trading fallback. The bot cannot trade without Kite.
+
+**Kite auth failure handling:**
+- If Kite returns auth error during market hours:
+  1. Place SL-M orders on all open positions immediately
+  2. Alert Telegram (critical priority)
+  3. Stop all new trading
+  4. Retry auth every 5 minutes (token may have been refreshed externally)
+  5. If auth restored → resume normal operation
 
 **Rate limit management:**
 - Kite: 3 req/sec historical, 10 req/sec quotes
@@ -451,7 +474,7 @@ Separate playbook rules override normal operation:
 **Stale data handling:**
 - No fresh LTP for 60 seconds → assume connection lost
 - Don't open new positions on stale data
-- Existing positions: bracket SL orders on exchange protect them
+- Existing positions: SL orders already live on exchange protect them
 - Alert on Telegram immediately
 - Retry connection every 30 seconds
 
@@ -884,7 +907,7 @@ All alerts go to Ops Hub → Stocks topic.
 - Theta engine (independent condor strategy)
 - Edge tracker (strategy performance attribution)
 - Multiple timeframe data (currently daily only)
-- Bracket orders for exchange-level SL
+- Exchange-level SL/SL-M orders for crash protection
 - Margin calculator integration
 - F&O ban list check
 - Chop detection
@@ -916,9 +939,122 @@ After 3 months of paper trading:
 
 ---
 
+## Margin Budget & Capital Constraints
+
+At ₹3L capital, the theta engine and directional trades **compete for margin**. They cannot operate with fully independent risk budgets.
+
+**Margin budget split:**
+- **Theta engine**: max 40% of available margin (₹1.2L at 3L capital). One Nifty iron condor uses ~₹60-80K margin.
+- **Directional trades**: remaining 60% (₹1.8L). Enough for 2-3 bought option positions simultaneously.
+- **Buffer**: always keep 30% margin free (₹90K) for MTM fluctuations on open positions.
+
+**Conflict resolution:**
+- If theta engine is active and margin is tight, directional trades get smaller allocation.
+- If a directional trade needs margin urgently (exception scenario), theta engine can be partially closed to free margin.
+- The Risk Engine checks margin BEFORE every entry, not just risk budget.
+
+**At ₹5L capital:** constraints loosen — theta gets its own ₹1.5L budget, directional gets ₹2L, ₹1.5L buffer. Can run 1 condor + 3 directional positions comfortably.
+
+---
+
+## State Persistence & Recovery
+
+All runtime state MUST be persisted to disk. The Pi can reboot mid-day — the bot must recover gracefully.
+
+**State files (all in `data/v7/`):**
+
+| File | Contents | Write frequency |
+|---|---|---|
+| `playbook.json` | Today's playbook from Strategist | After each Strategist call |
+| `positions.json` | All open positions, carried positions | After every trade entry/exit |
+| `daily_state.json` | Daily P&L, trade count, SL hit count, flags | Every tick |
+| `level_memory.json` | Persistent key levels across days | After Strategist/weekly review |
+| `edge_tracker.json` | Strategy performance stats | After every trade close |
+| `monthly_state.json` | MTD P&L, pacing, survival mode flag | After every trade close |
+
+**Recovery on restart:**
+1. Load `positions.json` — verify all SL orders are still live on exchange
+2. Load `playbook.json` — check if it's today's date. If not, enter protect-only mode until next Strategist call.
+3. Load `daily_state.json` — resume daily counters
+4. If restart happens during market hours, do NOT fire triggers for 5 minutes (let data stabilize)
+
+**RiskManager must be file-backed in V7** (V6's `risk_manager.py` is in-memory only — this must change).
+
+---
+
+## Expiry Day Handling
+
+**NSE now has daily expiries for Nifty and BankNifty.** Weekly expiry is Thursday for index options. Stock options expire monthly (last Thursday).
+
+**The theta engine targets weekly Thursday expiry** (7-12 DTE at entry on Monday/Tuesday). This is the most liquid expiry for iron condors.
+
+**Expiry day rules apply to any expiry the bot is trading:**
+- If holding options expiring today:
+  - No new positions after 1:00 PM on that expiry
+  - Only trade ATM ± 1 strike
+  - Tighter SL: half of normal distance
+  - No overnight carry (obviously)
+  - Close theta condor by the day BEFORE expiry if profit < 50%
+
+---
+
+## Claude API Fallback
+
+If Claude API is unreachable at a scheduled call time:
+
+**Pre-market (8:45 AM):**
+- Retry 3 times with 2-min intervals
+- If still unreachable → use previous day's playbook with conservative adjustments:
+  - All risk budgets halved
+  - No new stock setups (index only with yesterday's levels)
+  - Max 2 trades for the day
+- Alert Telegram: "Claude unavailable. Running conservative fallback playbook."
+
+**Check-ins (10:30, 1:00):**
+- Skip the check-in. Continue with current playbook.
+- Not critical — executor runs mechanically anyway.
+
+**Exception calls:**
+- If Claude unreachable during exception → default to conservative action:
+  - VIX spike → close 50% of positions
+  - Flash crash → close all positions
+  - 3 SL hits → stop trading for the day
+
+---
+
+## Strike Selection: Liquidity Filters
+
+Beyond bid-ask spread, enforce minimum liquidity:
+
+```
+Reject strike if:
+  - OI < 500 contracts (illiquid, may not be able to exit)
+  - Volume today < 100 contracts (no participation)
+  - Bid-ask spread > ₹2 (Nifty) / ₹5 (BankNifty) / ₹3 (stocks)
+  - Premium < ₹10 (deep OTM, will decay to zero)
+```
+
+These filters carry forward from V6 config (`SPREAD_MIN_OI`, `SPREAD_MIN_VOLUME`).
+
+---
+
+## Risk Budget Clarification
+
+**`max_capital_at_risk_today` (4%) means concurrent risk, not cumulative entries.**
+
+Example at ₹3L capital (4% = ₹12,000 max concurrent risk):
+- Trade 1: risk ₹4,500. Total at risk: ₹4,500. OK.
+- Trade 2: risk ₹4,500. Total at risk: ₹9,000. OK.
+- Trade 3: risk ₹4,500. Total at risk: ₹13,500. BLOCKED (exceeds 4%).
+- Trade 1 hits target and closes. Total at risk: ₹4,500. Trade 3 can now enter.
+
+This prevents the scenario where 4 max-risk trades are all open simultaneously (which would be 6% concurrent risk).
+
+---
+
 ## Open Questions
 
 1. **Exact watchlist**: The 10 names listed are a starting point. Should be validated against current lot sizes and margin requirements at ₹3-5L.
 2. **Paper vs live timeline**: How long to paper trade before going live?
-3. **Capital allocation split**: What % for directional vs theta? Starting suggestion: 70% directional budget, 30% theta budget.
+3. **Capital allocation split**: Starting at 60% directional / 40% theta margin budget. Adjust based on what's working after first month.
 4. **Kite token automation**: Can we automate the daily Kite OAuth refresh via Playwright to remove the manual step?
