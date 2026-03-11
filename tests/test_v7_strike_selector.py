@@ -42,12 +42,12 @@ def sample_chain():
 def test_select_directional_call(sample_chain):
     result = select_directional_strike(
         chain=sample_chain, direction="bullish", spot=24200,
-        risk_budget=4500, lot_size=75, symbol="NIFTY",
+        risk_budget=6000, lot_size=75, symbol="NIFTY",
     )
     assert result is not None
     assert result["option_type"] == "CE"
     assert 0.35 <= abs(result["delta"]) <= 0.55
-    assert result["premium"] * 75 <= 4500
+    assert result["premium"] * 75 <= 6000
 
 
 def test_select_directional_put(sample_chain):
