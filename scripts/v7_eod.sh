@@ -31,5 +31,5 @@ if [ "$IS_HOLIDAY" = "yes" ]; then
 fi
 
 echo "[$(TZ=Asia/Kolkata date)] [EOD] Starting EOD review + journal" >> "$LOG"
-python -m v7.main eod >> "$LOG" 2>&1
+python -m v7.main eod --paper >> "$LOG" 2>&1
 echo "" >> "$LOG"

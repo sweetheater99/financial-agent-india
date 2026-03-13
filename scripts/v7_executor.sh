@@ -76,7 +76,7 @@ fi
 TICK_START=$(date +%s)
 echo "[$(TZ=Asia/Kolkata date)] [TICK] Starting" >> "$LOG"
 
-python -m v7.main tick >> "$LOG" 2>&1
+python -m v7.main tick --paper >> "$LOG" 2>&1
 EXIT_CODE=$?
 
 TICK_END=$(date +%s)
