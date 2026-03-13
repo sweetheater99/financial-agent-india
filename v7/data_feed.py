@@ -118,8 +118,8 @@ class DataFeed:
     # ── Candles ────────────────────────────────────────────────────
 
     def get_candles(self, symbol: str, interval: str = "5minute",
-                    days: int = 1) -> list:
-        """Fetch OHLCV candles. Only available in Kite mode."""
+                    days: int = 1) -> list[dict]:
+        """Fetch OHLCV candles as list of dicts. Only available in Kite mode."""
         if not self.can_trade():
             raise ProtectOnlyMode("Cannot fetch candles in protect-only mode")
         from kite_data import fetch_candles_kite, resolve_token
@@ -128,15 +128,28 @@ class DataFeed:
         if not wl:
             raise DataFeedError(f"Symbol {symbol} not in watchlist")
         token = resolve_token(symbol)
-        return fetch_candles_kite(symbol, token, "NSE", interval, days)
+        raw = fetch_candles_kite(symbol, token, "NSE", interval, days)
+        if not raw:
+            return []
+        # Convert [ts, open, high, low, close, volume] → dicts
+        return [
+            {"timestamp": r[0], "open": r[1], "high": r[2], "low": r[3], "close": r[4], "volume": r[5]}
+            for r in raw
+        ]
 
     # ── Option Chain ───────────────────────────────────────────────
 
-    def get_option_chain(self, symbol: str, expiry: str) -> list[dict]:
-        """Fetch option chain. Only available in Kite mode."""
+    def get_option_chain(self, symbol: str, expiry: str = None) -> list[dict]:
+        """Fetch option chain. Only available in Kite mode.
+
+        Pass expiry=None or "current" for nearest weekly expiry.
+        """
         if not self.can_trade():
             raise ProtectOnlyMode("Cannot fetch option chain in protect-only mode")
         from kite_data import fetch_option_chain_kite
+        # "current" means auto-detect nearest expiry
+        if expiry in (None, "current", ""):
+            expiry = None
         return fetch_option_chain_kite(symbol, expiry)
 
     # ── VIX ────────────────────────────────────────────────────────
@@ -153,6 +166,14 @@ class DataFeed:
                     return float(data["data"]["ltp"])
             except Exception:
                 pass
+        # yfinance fallback
+        try:
+            import yfinance as yf
+            hist = yf.Ticker("^INDIAVIX").history(period="2d")
+            if len(hist) >= 1:
+                return float(hist.iloc[-1]["Close"])
+        except Exception:
+            pass
         return 0.0
 
     # ── Health Check ───────────────────────────────────────────────

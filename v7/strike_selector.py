@@ -35,6 +35,19 @@ def _get_bid_ask_spread(option_data: dict) -> float:
     return 999.0
 
 
+def _estimate_delta(strike: float, spot: float, option_type: str) -> float:
+    """Estimate delta from moneyness when Greeks aren't available.
+
+    ATM ~ 0.50, each 1% OTM reduces delta by ~0.08.
+    """
+    moneyness = (spot - strike) / spot  # positive = ITM for CE
+    if option_type == "PE":
+        moneyness = -moneyness  # positive = ITM for PE
+    # Rough linear approximation around ATM
+    delta = 0.50 + moneyness * 8.0
+    return max(0.05, min(0.95, delta))
+
+
 def select_directional_strike(
     chain: list[dict], direction: str, spot: float,
     risk_budget: float, lot_size: int, symbol: str,
@@ -52,6 +65,10 @@ def select_directional_strike(
             continue
 
         delta = abs(opt.get("delta", 0))
+        # Kite doesn't provide Greeks — estimate from moneyness
+        if delta == 0:
+            delta = _estimate_delta(entry["strikePrice"], spot, option_type)
+
         premium = opt["ltp"]
         oi = opt.get("oi", 0)
         volume = opt.get("volume", 0)
@@ -72,14 +89,19 @@ def select_directional_strike(
             "oi": oi,
             "volume": volume,
             "bid_ask_spread": spread,
+            "tradingsymbol": opt.get("tradingsymbol", ""),
+            "lot_size": opt.get("lotSize", lot_size),
         })
 
+    # Relaxed fallback if strict filters found nothing
     if not candidates:
         for entry in chain:
             opt = entry.get(option_type)
             if not opt or not opt.get("ltp"):
                 continue
             delta = abs(opt.get("delta", 0))
+            if delta == 0:
+                delta = _estimate_delta(entry["strikePrice"], spot, option_type)
             premium = opt["ltp"]
             if 0.35 <= delta <= 0.55 and min_premium <= premium <= max_premium:
                 oi = opt.get("oi", 0)
@@ -94,6 +116,8 @@ def select_directional_strike(
                         "oi": oi,
                         "volume": volume,
                         "bid_ask_spread": spread,
+                        "tradingsymbol": opt.get("tradingsymbol", ""),
+                        "lot_size": opt.get("lotSize", lot_size),
                     })
 
     if not candidates:

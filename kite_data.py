@@ -125,10 +125,21 @@ def _load_instruments(kite: KiteConnect) -> None:
     _instruments_loaded = True
 
 
+# Map V7 watchlist names → Kite tradingsymbols
+SYMBOL_ALIASES = {
+    "NIFTY": "NIFTY 50",
+    "BANKNIFTY": "NIFTY BANK",
+    "TATAMOTORS": "TMCV",
+}
+
+
 def resolve_token(symbol: str, exchange: str = "NSE") -> Optional[int]:
     """Resolve a symbol to its Kite instrument_token."""
     kite = get_kite()
     _load_instruments(kite)
+
+    # Apply alias mapping
+    symbol = SYMBOL_ALIASES.get(symbol, symbol)
 
     exch = _instruments_cache.get(exchange, {})
 
@@ -230,6 +241,13 @@ KITE_INTERVAL_MAP = {
     "THIRTY_MINUTE": "30minute",
     "ONE_HOUR": "60minute",
     "ONE_DAY": "day",
+    # Also accept Kite-native interval names directly
+    "minute": "minute",
+    "5minute": "5minute",
+    "15minute": "15minute",
+    "30minute": "30minute",
+    "60minute": "60minute",
+    "day": "day",
 }
 
 
@@ -351,12 +369,14 @@ def fetch_option_chain_kite(symbol: str, expiry_str: str = None) -> Optional[lis
         ce_key = strikes[strike_price].get("_ce_key")
         if ce_key and ce_key in all_quotes:
             q = all_quotes[ce_key]
-            entry["CE"] = _quote_to_option_data(q, strikes[strike_price].get("_ce_lot", 1))
+            ce_tsym = ce_key.replace("NFO:", "")
+            entry["CE"] = _quote_to_option_data(q, strikes[strike_price].get("_ce_lot", 1), ce_tsym)
 
         pe_key = strikes[strike_price].get("_pe_key")
         if pe_key and pe_key in all_quotes:
             q = all_quotes[pe_key]
-            entry["PE"] = _quote_to_option_data(q, strikes[strike_price].get("_pe_lot", 1))
+            pe_tsym = pe_key.replace("NFO:", "")
+            entry["PE"] = _quote_to_option_data(q, strikes[strike_price].get("_pe_lot", 1), pe_tsym)
 
         if "CE" in entry or "PE" in entry:
             chain.append(entry)
@@ -365,13 +385,18 @@ def fetch_option_chain_kite(symbol: str, expiry_str: str = None) -> Optional[lis
     return chain
 
 
-def _quote_to_option_data(quote: dict, lot_size: int) -> dict:
-    """Convert a Kite quote to SmartAPI-compatible option data dict."""
+def _quote_to_option_data(quote: dict, lot_size: int, tradingsymbol: str = "") -> dict:
+    """Convert a Kite quote to option data dict.
+
+    Uses field names that V7 StrikeSelector expects (ltp, oi, delta).
+    """
     return {
+        "ltp": quote.get("last_price", 0),
         "lastTradedPrice": quote.get("last_price", 0),
+        "oi": quote.get("oi", 0),
         "openInterest": quote.get("oi", 0),
         "volume": quote.get("volume", 0),
-        "impliedVolatility": 0,  # computed separately if needed
+        "impliedVolatility": 0,
         "delta": 0,
         "gamma": 0,
         "theta": 0,
@@ -379,6 +404,7 @@ def _quote_to_option_data(quote: dict, lot_size: int) -> dict:
         "bidPrice": quote.get("depth", {}).get("buy", [{}])[0].get("price", 0),
         "askPrice": quote.get("depth", {}).get("sell", [{}])[0].get("price", 0),
         "lotSize": lot_size,
+        "tradingsymbol": tradingsymbol,
     }
 
 

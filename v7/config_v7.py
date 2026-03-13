@@ -90,7 +90,7 @@ STRIKE_FILTERS = {
     "max_bid_ask_banknifty": 5.0,
     "max_bid_ask_stock": 3.0,
     "min_premium": 10.0,
-    "directional_delta_range": (0.40, 0.50),
+    "directional_delta_range": (0.25, 0.50),
     "spread_sell_delta": 0.25,
     "hedge_delta": 0.10,
 }

@@ -258,20 +258,69 @@ class Executor:
         self._enter_position(setup, ltp, now)
 
     def _enter_position(self, setup: Setup, trigger_ltp: float, now: datetime) -> None:
-        """Execute entry for a triggered setup."""
+        """Execute entry for a triggered setup.
+
+        1. Fetch option chain for the symbol
+        2. Use StrikeSelector to pick the best strike (~0.45 delta)
+        3. Place order with actual tradingsymbol and option premium
+        """
         setup.fired = True
 
-        # Strike selection would happen here via StrikeSelector
-        # For now, use the instrument from setup
-        tradingsymbol = setup.instrument
-        exchange = "NFO"
-
-        # Calculate limit price: bid + 0.50 for buy
-        limit_price = trigger_ltp + 0.50
+        direction = "bullish" if setup.type in (
+            SetupType.BREAKOUT_LONG, SetupType.SUPPORT_BOUNCE,
+            SetupType.CREDIT_SPREAD_BULL,
+        ) else "bearish"
 
         risk_amount = self._capital * (setup.max_risk_pct / 100)
-        lot_size = 75  # would come from instrument lookup
-        quantity = lot_size
+
+        # Look up lot size from watchlist config
+        from v7.config_v7 import WATCHLIST
+        wl = next((w for w in WATCHLIST if w["symbol"] == setup.symbol), None)
+        lot_size = wl["lot_size"] if wl else 75
+
+        # Fetch option chain and select strike
+        try:
+            chain = self._data.get_option_chain(setup.symbol, "current")
+            if not chain:
+                logger.warning("Setup %s: no option chain for %s — skipping", setup.id, setup.symbol)
+                setup.fired = False
+                return
+        except Exception as e:
+            logger.error("Setup %s: option chain fetch failed: %s", setup.id, e)
+            setup.fired = False
+            return
+
+        from v7.strike_selector import select_directional_strike
+        selected = select_directional_strike(
+            chain=chain,
+            direction=direction,
+            spot=trigger_ltp,
+            risk_budget=risk_amount,
+            lot_size=lot_size,
+            symbol=setup.symbol,
+        )
+
+        if not selected:
+            logger.warning("Setup %s: no suitable strike found for %s — skipping", setup.id, setup.symbol)
+            setup.fired = False
+            return
+
+        tradingsymbol = selected["tradingsymbol"]
+        option_premium = selected["premium"]
+        actual_lot_size = selected.get("lot_size", lot_size)
+        exchange = "NFO"
+
+        if not tradingsymbol:
+            logger.warning("Setup %s: strike selected but no tradingsymbol — skipping", setup.id)
+            setup.fired = False
+            return
+
+        logger.info("Setup %s: selected %s (strike=%s, delta=%.2f, premium=%.2f)",
+                     setup.id, tradingsymbol, selected["strike"], selected["delta"], option_premium)
+
+        # Limit price: option premium + small buffer
+        limit_price = option_premium + 2.0
+        quantity = actual_lot_size
 
         from v7.order_manager import OrderSide
         result = self._orders.place_entry_order(
@@ -290,13 +339,10 @@ class Executor:
         pos = Position(
             symbol=setup.symbol,
             instrument=tradingsymbol,
-            direction="bullish" if setup.type in (
-                SetupType.BREAKOUT_LONG, SetupType.SUPPORT_BOUNCE,
-                SetupType.CREDIT_SPREAD_BULL,
-            ) else "bearish",
+            direction=direction,
             entry_price=result.fill_price,
             quantity=quantity,
-            lot_size=lot_size,
+            lot_size=actual_lot_size,
             allocated=result.fill_price * quantity,
             stoploss=setup.stoploss,
             target=setup.target,
