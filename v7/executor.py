@@ -352,7 +352,8 @@ class Executor:
         )
 
         if not result.filled:
-            logger.warning("Entry order for %s did not fill", setup.id)
+            logger.warning("Entry order for %s did not fill — will retry next boundary", setup.id)
+            setup.fired = False
             return
 
         # Create position
