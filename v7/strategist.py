@@ -48,6 +48,7 @@ Rules:
 - Priority ranking determines execution order
 - Conviction: "high" (2% risk), "medium" (1.5% risk), "low" (0.75% risk)
 - All trigger levels must be numbers, not text
+- Stock plans MUST have trigger, target, stoploss as concrete price numbers (not 0) — if you can't find a good stock setup, return an empty stock_plans array instead of stub entries
 - Respond with ONLY a JSON playbook — no commentary before or after
 
 Instrument universe: NIFTY, BANKNIFTY, RELIANCE, HDFCBANK, ICICIBANK, TCS, TATAMOTORS, BAJFINANCE, SBIN, INFY"""
@@ -104,6 +105,8 @@ def build_premarket_prompt(
     risk_state: dict,
     fo_ban_list: list[str],
     recent_lessons: list[str],
+    computed_levels: dict | None = None,
+    oi_context: dict | None = None,
 ) -> str:
     """Build the pre-market prompt with all inputs."""
     parts = [
@@ -120,13 +123,26 @@ def build_premarket_prompt(
         f"## Key Levels (from memory)\n",
         json.dumps(level_memory, indent=2) if level_memory else "No levels stored yet.",
         "",
+    ]
+
+    if computed_levels:
+        parts.append("## Computed Levels\n")
+        parts.append(json.dumps(computed_levels, indent=2))
+        parts.append("")
+
+    if oi_context:
+        parts.append("## Open Interest Context\n")
+        parts.append(json.dumps(oi_context, indent=2))
+        parts.append("")
+
+    parts.extend([
         f"## Edge Tracker (historical performance)\n",
         json.dumps(edge_tracker, indent=2) if edge_tracker else "No trade history yet.",
         "",
         f"## Risk State\n",
         f"- MTD P&L: {risk_state.get('mtd_pnl_pct', 0):.1f}%",
         f"- Pacing: {risk_state.get('pacing', 'on_track')}",
-    ]
+    ])
 
     if risk_state.get("survival_mode"):
         parts.append("\n**SURVIVAL MODE ACTIVE**: MTD drawdown > 5%. No directional trades allowed. Theta only. Generate a theta-only playbook with wider wings.")
@@ -250,7 +266,21 @@ def _playbook_schema_hint() -> str:
     ],
     "no_trade_zone": "low-high"
   },
-  "stock_plans": [same structure with added "symbol" field, max 3],
+  "stock_plans": [
+    {
+      "id": "X1",
+      "priority": 3,
+      "type": "breakout_long|breakout_short|support_bounce|resistance_fade",
+      "symbol": "RELIANCE",
+      "trigger": "specific condition with PRICE LEVEL number e.g. breaks above 1280",
+      "instrument": "RELIANCE CE|PE",
+      "strike_logic": "delta description",
+      "target": float,
+      "stoploss": float,
+      "max_risk_pct": float,
+      "conviction": "high|medium|low"
+    }
+  ],
   "risk_budget": {
     "max_capital_at_risk_today_pct": 4.0,
     "max_trades_today": 4,
@@ -409,12 +439,15 @@ def parse_playbook_response(raw: str, today: date | None = None) -> Playbook | N
             for s in nifty_plan.get("setups", [])
         ]
 
-        # Stock plans (cap at MAX_STOCK_PLANS)
+        # Stock plans (cap at MAX_STOCK_PLANS, drop stubs with no levels)
         stock_plans_raw = data.get("stock_plans", [])[:MAX_STOCK_PLANS]
-        stock_plans = [
-            _parse_setup(s, symbol=s.get("symbol", "UNKNOWN"))
-            for s in stock_plans_raw
-        ]
+        stock_plans = []
+        for s in stock_plans_raw:
+            # Skip stub entries where Claude didn't provide actual levels
+            if float(s.get("target", 0)) == 0 and float(s.get("stoploss", 0)) == 0:
+                log.warning("Dropping stock plan %s/%s — no target/stoploss", s.get("symbol"), s.get("id"))
+                continue
+            stock_plans.append(_parse_setup(s, symbol=s.get("symbol", "UNKNOWN")))
 
         # Risk budget
         rb_data = data.get("risk_budget", {})
@@ -603,6 +636,8 @@ class Strategist:
         fii_dii: str, events_today: list[str], events_this_week: list[str],
         level_memory: dict, edge_tracker: dict, risk_state: dict,
         fo_ban_list: list[str], recent_lessons: list[str],
+        computed_levels: dict | None = None,
+        oi_context: dict | None = None,
     ) -> Playbook:
         """Generate the pre-market playbook (8:45 AM call).
 
@@ -614,6 +649,7 @@ class Strategist:
             events_this_week=events_this_week, level_memory=level_memory,
             edge_tracker=edge_tracker, risk_state=risk_state,
             fo_ban_list=fo_ban_list, recent_lessons=recent_lessons,
+            computed_levels=computed_levels, oi_context=oi_context,
         )
 
         raw = self._call_claude(prompt, system=STRATEGIST_SYSTEM)
