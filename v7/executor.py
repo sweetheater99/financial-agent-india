@@ -245,6 +245,18 @@ class Executor:
         if not triggered:
             return
 
+        # Skip if price already past target (would enter and exit same tick)
+        if setup.type in (SetupType.BREAKOUT_SHORT, SetupType.RESISTANCE_FADE):
+            if ltp < setup.target:
+                logger.info("Setup %s: price %.2f already past target %.2f — skipping stale trigger",
+                            setup.id, ltp, setup.target)
+                return
+        elif setup.type in (SetupType.BREAKOUT_LONG, SetupType.SUPPORT_BOUNCE):
+            if ltp > setup.target:
+                logger.info("Setup %s: price %.2f already past target %.2f — skipping stale trigger",
+                            setup.id, ltp, setup.target)
+                return
+
         # Risk budget check
         risk_amount = self._capital * (setup.max_risk_pct / 100)
         current_risk = sum(p.risk_amount() for p in self._positions)

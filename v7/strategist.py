@@ -51,7 +51,7 @@ Rules:
 - Stock plans MUST have trigger, target, stoploss as concrete price numbers (not 0) — if you can't find a good stock setup, return an empty stock_plans array instead of stub entries
 - Respond with ONLY a JSON playbook — no commentary before or after
 
-Instrument universe: NIFTY, BANKNIFTY, RELIANCE, HDFCBANK, ICICIBANK, TCS, TATAMOTORS, BAJFINANCE, SBIN, INFY"""
+Instrument universe: NIFTY, BANKNIFTY, RELIANCE, HDFCBANK, ICICIBANK, TCS, TMPV, BAJFINANCE, SBIN, INFY"""
 
 OPENING_READ_SYSTEM = """You are updating the morning playbook after the first 30 minutes of price discovery.
 Review the opening range, gap behavior, volume, and OI shifts.

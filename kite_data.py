@@ -129,7 +129,7 @@ def _load_instruments(kite: KiteConnect) -> None:
 SYMBOL_ALIASES = {
     "NIFTY": "NIFTY 50",
     "BANKNIFTY": "NIFTY BANK",
-    "TATAMOTORS": "TMCV",
+    "TMPV": "TMPV",
 }
 
 

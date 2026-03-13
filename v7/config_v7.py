@@ -15,7 +15,7 @@ WATCHLIST = [
     {"symbol": "HDFCBANK",   "type": "stock", "lot_size": 550, "token": "1333",     "exchange": "NSE"},
     {"symbol": "ICICIBANK",  "type": "stock", "lot_size": 700, "token": "4963",     "exchange": "NSE"},
     {"symbol": "TCS",        "type": "stock", "lot_size": 175, "token": "11536",    "exchange": "NSE"},
-    {"symbol": "TATAMOTORS", "type": "stock", "lot_size": 575, "token": "3456",     "exchange": "NSE"},
+    {"symbol": "TMPV",       "type": "stock", "lot_size": 575, "token": "884737",   "exchange": "NSE"},
     {"symbol": "BAJFINANCE", "type": "stock", "lot_size": 125, "token": "317",      "exchange": "NSE"},
     {"symbol": "SBIN",       "type": "stock", "lot_size": 750, "token": "3045",     "exchange": "NSE"},
     {"symbol": "INFY",       "type": "stock", "lot_size": 300, "token": "1594",     "exchange": "NSE"},
