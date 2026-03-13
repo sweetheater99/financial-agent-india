@@ -130,7 +130,7 @@ class OrderManager:
                 fill_price=fill["price"], fill_quantity=fill["quantity"],
             )
 
-        # Not filled — modify to market
+        # Not filled — try market first, fall back to aggressive limit
         logger.info("Entry order %s not filled after %ds, converting to market", order_id, timeout_seconds)
         try:
             kite.modify_order(
@@ -139,11 +139,28 @@ class OrderManager:
                 order_type="MARKET",
             )
         except Exception as e:
-            logger.error("Failed to modify order %s to market: %s", order_id, e)
-            return OrderResult(order_id=order_id, filled=False, error=str(e))
+            # Zerodha blocks MARKET for stock options — use aggressive limit instead
+            logger.warning("MARKET blocked (%s), trying aggressive limit (+5%%)", e)
+            try:
+                # Get current order price and bump by 5%
+                order_info = kite.order_history(order_id)
+                orig_price = order_info[-1].get("price", 0) if order_info else 0
+                aggressive_price = round(orig_price * 1.05, 1) if orig_price else 0
+                if aggressive_price:
+                    kite.modify_order(
+                        variety="regular",
+                        order_id=order_id,
+                        order_type="LIMIT",
+                        price=aggressive_price,
+                    )
+                else:
+                    return OrderResult(order_id=order_id, filled=False, error=str(e))
+            except Exception as e2:
+                logger.error("Aggressive limit also failed: %s", e2)
+                return OrderResult(order_id=order_id, filled=False, error=str(e2))
 
-        # Brief wait for market fill
-        time.sleep(2)
+        # Brief wait for fill
+        time.sleep(3)
         fill = self.get_fill_info(order_id)
         return OrderResult(
             order_id=order_id, filled=fill["filled"],
@@ -219,10 +236,27 @@ class OrderManager:
                     order_type="MARKET",
                 )
             except Exception as e:
-                logger.error("Failed to modify SL exit to market: %s", e)
-                return OrderResult(order_id=order_id, filled=False, error=str(e))
+                # Zerodha blocks MARKET for stock options — aggressive limit
+                logger.warning("MARKET exit blocked (%s), trying aggressive limit (-10%%)", e)
+                try:
+                    order_info = kite.order_history(order_id)
+                    orig_price = order_info[-1].get("price", 0) if order_info else 0
+                    # Sell at 10% below current price to ensure fill
+                    aggressive_price = round(orig_price * 0.90, 1) if orig_price else 0
+                    if aggressive_price:
+                        kite.modify_order(
+                            variety="regular",
+                            order_id=order_id,
+                            order_type="LIMIT",
+                            price=max(aggressive_price, 0.50),
+                        )
+                    else:
+                        return OrderResult(order_id=order_id, filled=False, error=str(e))
+                except Exception as e2:
+                    logger.error("Aggressive limit exit also failed: %s", e2)
+                    return OrderResult(order_id=order_id, filled=False, error=str(e2))
 
-            time.sleep(2)
+            time.sleep(3)
             fill = self.get_fill_info(order_id)
 
         return OrderResult(
