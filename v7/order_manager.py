@@ -130,40 +130,45 @@ class OrderManager:
                 fill_price=fill["price"], fill_quantity=fill["quantity"],
             )
 
-        # Not filled — try market first, fall back to aggressive limit
-        logger.info("Entry order %s not filled after %ds, converting to market", order_id, timeout_seconds)
+        # Not filled — cancel and re-place as aggressive limit
+        # (Zerodha blocks MARKET for stock options, and modify fails
+        #  after a rejected MARKET attempt — so cancel + fresh order)
+        logger.info("Entry order %s not filled after %ds, cancelling and re-placing", order_id, timeout_seconds)
         try:
-            kite.modify_order(
-                variety="regular",
-                order_id=order_id,
-                order_type="MARKET",
-            )
+            kite.cancel_order(variety="regular", order_id=order_id)
         except Exception as e:
-            # Zerodha blocks MARKET for stock options — use aggressive limit instead
-            logger.warning("MARKET blocked (%s), trying aggressive limit (+5%%)", e)
-            try:
-                # Get current order price and bump by 5%
-                order_info = kite.order_history(order_id)
-                orig_price = order_info[-1].get("price", 0) if order_info else 0
-                aggressive_price = round(orig_price * 1.05, 1) if orig_price else 0
-                if aggressive_price:
-                    kite.modify_order(
-                        variety="regular",
-                        order_id=order_id,
-                        order_type="LIMIT",
-                        price=aggressive_price,
-                    )
-                else:
-                    return OrderResult(order_id=order_id, filled=False, error=str(e))
-            except Exception as e2:
-                logger.error("Aggressive limit also failed: %s", e2)
-                return OrderResult(order_id=order_id, filled=False, error=str(e2))
+            logger.warning("Cancel failed (may already be terminal): %s", e)
 
-        # Brief wait for fill
-        time.sleep(3)
-        fill = self.get_fill_info(order_id)
+        # Place fresh aggressive limit order (+5% above original price)
+        aggressive_price = round(limit_price * 1.05, 1)
+        try:
+            new_order_id = kite.place_order(
+                variety="regular",
+                exchange=exchange,
+                tradingsymbol=tradingsymbol,
+                transaction_type=_SIDE_MAP[side],
+                quantity=quantity,
+                product="MIS",
+                order_type="LIMIT",
+                price=aggressive_price,
+            )
+            new_order_id = str(new_order_id)
+            logger.info("Aggressive limit order placed: %s @ %.2f (+5%%)", new_order_id, aggressive_price)
+        except Exception as e:
+            logger.error("Aggressive limit order failed: %s", e)
+            return OrderResult(order_id=order_id, filled=False, error=str(e))
+
+        # Wait briefly for fill
+        time.sleep(5)
+        fill = self.get_fill_info(new_order_id)
+        if not fill["filled"]:
+            # Last attempt — cancel if still pending
+            try:
+                kite.cancel_order(variety="regular", order_id=new_order_id)
+            except Exception:
+                pass
         return OrderResult(
-            order_id=order_id, filled=fill["filled"],
+            order_id=new_order_id, filled=fill["filled"],
             fill_price=fill["price"], fill_quantity=fill["quantity"],
         )
 
@@ -236,24 +241,28 @@ class OrderManager:
                     order_type="MARKET",
                 )
             except Exception as e:
-                # Zerodha blocks MARKET for stock options — aggressive limit
-                logger.warning("MARKET exit blocked (%s), trying aggressive limit (-10%%)", e)
+                # Zerodha blocks MARKET for stock options — cancel and re-place
+                logger.warning("MARKET exit blocked (%s), cancel + aggressive limit (-10%%)", e)
                 try:
-                    order_info = kite.order_history(order_id)
-                    orig_price = order_info[-1].get("price", 0) if order_info else 0
-                    # Sell at 10% below current price to ensure fill
-                    aggressive_price = round(orig_price * 0.90, 1) if orig_price else 0
-                    if aggressive_price:
-                        kite.modify_order(
-                            variety="regular",
-                            order_id=order_id,
-                            order_type="LIMIT",
-                            price=max(aggressive_price, 0.50),
-                        )
-                    else:
-                        return OrderResult(order_id=order_id, filled=False, error=str(e))
+                    kite.cancel_order(variety="regular", order_id=order_id)
+                except Exception:
+                    pass
+                aggressive_price = max(round(limit_price * 0.90, 1), 0.50)
+                try:
+                    new_oid = kite.place_order(
+                        variety="regular",
+                        exchange=exchange,
+                        tradingsymbol=tradingsymbol,
+                        transaction_type=_SIDE_MAP[side],
+                        quantity=quantity,
+                        product="MIS",
+                        order_type="LIMIT",
+                        price=aggressive_price,
+                    )
+                    order_id = str(new_oid)
+                    logger.info("Aggressive exit order: %s @ %.2f", order_id, aggressive_price)
                 except Exception as e2:
-                    logger.error("Aggressive limit exit also failed: %s", e2)
+                    logger.error("Aggressive exit order failed: %s", e2)
                     return OrderResult(order_id=order_id, filled=False, error=str(e2))
 
             time.sleep(3)
