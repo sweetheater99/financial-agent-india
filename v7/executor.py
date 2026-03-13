@@ -136,6 +136,8 @@ class Executor:
         self._check_exceptions(now)
 
         # 6. PERSIST STATE
+        if self._playbook:
+            self._state.save_playbook(self._playbook)
         self._state.save_positions(self._positions)
         self._state.save_daily_state(self._daily)
 
@@ -255,11 +257,6 @@ class Executor:
             daily_pnl=self._daily.get("daily_pnl", 0),
         ):
             logger.info("Setup %s triggered but risk budget exhausted", setup.id)
-            return
-
-        # Margin check
-        if not self._risk.check_margin(risk_amount):
-            logger.info("Setup %s triggered but margin insufficient", setup.id)
             return
 
         # F&O ban check, brokerage check would go here
@@ -870,6 +867,9 @@ class Executor:
 
     def _get_ltp_for_symbol(self, symbol: str) -> Optional[float]:
         """Get LTP for a symbol from latest quotes."""
+        # Try plain symbol first (get_batch_ltp returns {'NIFTY': 23461.5})
+        if symbol in self._quotes:
+            return self._quotes[symbol]
         # Try NSE:SYMBOL format
         key = f"NSE:{symbol}"
         if key in self._quotes:
