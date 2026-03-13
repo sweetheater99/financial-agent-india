@@ -38,13 +38,14 @@ def _get_bid_ask_spread(option_data: dict) -> float:
 def _estimate_delta(strike: float, spot: float, option_type: str) -> float:
     """Estimate delta from moneyness when Greeks aren't available.
 
-    ATM ~ 0.50, each 1% OTM reduces delta by ~0.08.
+    ATM ~ 0.50, each 1% OTM reduces delta by ~0.04 (weekly options
+    with typical IV of 20-40% decay slower than the naive 0.08).
     """
     moneyness = (spot - strike) / spot  # positive = ITM for CE
     if option_type == "PE":
         moneyness = -moneyness  # positive = ITM for PE
-    # Rough linear approximation around ATM
-    delta = 0.50 + moneyness * 8.0
+    # Moderate linear approximation — 0.04 per 1% OTM
+    delta = 0.50 + moneyness * 4.0
     return max(0.05, min(0.95, delta))
 
 
@@ -93,7 +94,7 @@ def select_directional_strike(
             "lot_size": opt.get("lotSize", lot_size),
         })
 
-    # Relaxed fallback if strict filters found nothing
+    # Relaxed fallback: widen delta range, keep budget constraint
     if not candidates:
         for entry in chain:
             opt = entry.get(option_type)
@@ -103,7 +104,7 @@ def select_directional_strike(
             if delta == 0:
                 delta = _estimate_delta(entry["strikePrice"], spot, option_type)
             premium = opt["ltp"]
-            if 0.35 <= delta <= 0.55 and min_premium <= premium <= max_premium:
+            if 0.15 <= delta <= 0.55 and min_premium <= premium <= max_premium:
                 oi = opt.get("oi", 0)
                 volume = opt.get("volume", 0)
                 spread = _get_bid_ask_spread(opt)
@@ -119,6 +120,30 @@ def select_directional_strike(
                         "tradingsymbol": opt.get("tradingsymbol", ""),
                         "lot_size": opt.get("lotSize", lot_size),
                     })
+
+    # Last resort: widest delta, drop liquidity filter (illiquid stock options)
+    if not candidates:
+        for entry in chain:
+            opt = entry.get(option_type)
+            if not opt or not opt.get("ltp"):
+                continue
+            delta = abs(opt.get("delta", 0))
+            if delta == 0:
+                delta = _estimate_delta(entry["strikePrice"], spot, option_type)
+            premium = opt["ltp"]
+            oi = opt.get("oi", 0)
+            if 0.15 <= delta <= 0.60 and min_premium <= premium <= max_premium and oi >= 100:
+                candidates.append({
+                    "strike": entry["strikePrice"],
+                    "option_type": option_type,
+                    "premium": premium,
+                    "delta": delta,
+                    "oi": oi,
+                    "volume": opt.get("volume", 0),
+                    "bid_ask_spread": _get_bid_ask_spread(opt),
+                    "tradingsymbol": opt.get("tradingsymbol", ""),
+                    "lot_size": opt.get("lotSize", lot_size),
+                })
 
     if not candidates:
         return None
