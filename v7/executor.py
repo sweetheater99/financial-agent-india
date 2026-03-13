@@ -142,7 +142,7 @@ class Executor:
     # ── Data Fetching ─────────────────────────────────────────────────
 
     def _fetch_data(self, now: datetime) -> None:
-        """Fetch LTP batch + VIX. Candles fetched on demand."""
+        """Fetch LTP batch for watchlist + open option positions + VIX."""
         try:
             from v7.config_v7 import WATCHLIST
             symbols = [w["symbol"] for w in WATCHLIST]
@@ -150,6 +150,17 @@ class Executor:
         except Exception as e:
             logger.error("LTP batch fetch failed: %s", e)
             self._quotes = {}
+
+        # Fetch option LTPs for open positions
+        if self._positions and self._data.can_trade():
+            try:
+                option_keys = [f"NFO:{p.instrument}" for p in self._positions if p.instrument]
+                if option_keys:
+                    option_quotes = self._data.kite.quote(option_keys)
+                    for key, q in option_quotes.items():
+                        self._quotes[key] = q.get("last_price", 0)
+            except Exception as e:
+                logger.warning("Option LTP fetch failed: %s", e)
 
         try:
             self._vix = self._data.get_vix() or 0.0
@@ -361,49 +372,68 @@ class Executor:
     # ── Position Management ───────────────────────────────────────────
 
     def _manage_positions(self, now: datetime) -> None:
-        """Update P&L, check SL/target/trailing for each position."""
+        """Update P&L, check SL/target/trailing for each position.
+
+        SL and target are UNDERLYING price levels from the playbook.
+        We check the underlying symbol's price against these levels,
+        then exit the option position at its current premium.
+        """
         positions_to_remove = []
 
         for pos in self._positions:
-            ltp = self._get_ltp_for_instrument(pos.instrument)
-            if ltp is None:
+            # Get underlying price for SL/target evaluation
+            underlying_ltp = self._get_ltp_for_symbol(pos.symbol)
+            # Get option premium for P&L and exit
+            option_ltp = self._get_ltp_for_instrument(pos.instrument)
+
+            if underlying_ltp is None and option_ltp is None:
                 continue
 
-            # Update peak price
-            if pos.direction == "bullish":
-                pos.peak_price = max(pos.peak_price, ltp)
-            else:
-                pos.peak_price = min(pos.peak_price, ltp) if pos.peak_price > 0 else ltp
+            # Track option premium for P&L
+            if option_ltp is not None:
+                pnl = pos.unrealized_pnl(option_ltp)
 
-            pnl = pos.unrealized_pnl(ltp)
+            # Update peak price (track underlying for trailing SL)
+            if underlying_ltp is not None:
+                if pos.direction == "bullish":
+                    pos.peak_price = max(pos.peak_price, underlying_ltp)
+                else:
+                    pos.peak_price = min(pos.peak_price, underlying_ltp) if pos.peak_price > 0 else underlying_ltp
 
-            # SL hit → EXIT immediately
-            if self._is_sl_hit(pos, ltp):
-                logger.info("SL HIT: %s @ %.2f (SL=%.2f)", pos.instrument, ltp, pos.stoploss)
-                self._exit_position(pos, ltp, "stoploss", now)
-                positions_to_remove.append(pos)
-                self._daily["consecutive_sl_hits"] = self._daily.get("consecutive_sl_hits", 0) + 1
-                continue
+            # SL/target checks use UNDERLYING price
+            if underlying_ltp is not None:
+                # SL hit → EXIT immediately
+                if self._is_sl_hit(pos, underlying_ltp):
+                    exit_price = option_ltp if option_ltp is not None else 0
+                    logger.info("SL HIT: %s underlying=%.2f (SL=%.2f), option=%s@%.2f",
+                                pos.instrument, underlying_ltp, pos.stoploss, pos.instrument, exit_price)
+                    self._exit_position(pos, exit_price, "stoploss", now)
+                    positions_to_remove.append(pos)
+                    self._daily["consecutive_sl_hits"] = self._daily.get("consecutive_sl_hits", 0) + 1
+                    continue
 
-            # Target hit → full exit
-            if self._is_target_hit(pos, ltp):
-                logger.info("TARGET HIT: %s @ %.2f (TGT=%.2f)", pos.instrument, ltp, pos.target)
-                self._exit_position(pos, ltp, "target", now)
-                positions_to_remove.append(pos)
-                self._daily["consecutive_sl_hits"] = 0
-                continue
+                # Target hit → full exit
+                if self._is_target_hit(pos, underlying_ltp):
+                    exit_price = option_ltp if option_ltp is not None else 0
+                    logger.info("TARGET HIT: %s underlying=%.2f (TGT=%.2f), option=%s@%.2f",
+                                pos.instrument, underlying_ltp, pos.target, pos.instrument, exit_price)
+                    self._exit_position(pos, exit_price, "target", now)
+                    positions_to_remove.append(pos)
+                    self._daily["consecutive_sl_hits"] = 0
+                    continue
 
-            # 1:1 R:R → move SL to breakeven
-            self._check_breakeven(pos, ltp)
+                # 1:1 R:R → move SL to breakeven (underlying levels)
+                self._check_breakeven(pos, underlying_ltp)
 
-            # Trailing stop: peak - 1.5x ATR
-            trailing_sl = self._compute_trailing_sl(pos, ltp)
-            if trailing_sl is not None and self._is_better_sl(pos, trailing_sl):
-                old_sl = pos.stoploss
-                pos.stoploss = trailing_sl
-                logger.info("TRAILING SL: %s moved %.2f → %.2f", pos.instrument, old_sl, trailing_sl)
-                if pos.sl_order_id:
-                    self._update_exchange_sl(pos)
+                # Trailing stop on underlying
+                trailing_sl = self._compute_trailing_sl(pos, underlying_ltp)
+                if trailing_sl is not None and self._is_better_sl(pos, trailing_sl):
+                    old_sl = pos.stoploss
+                    pos.stoploss = trailing_sl
+                    logger.info("TRAILING SL: %s underlying moved %.2f → %.2f",
+                                pos.instrument, old_sl, trailing_sl)
+                    if pos.sl_order_id:
+                        self._update_exchange_sl(pos)
 
         for pos in positions_to_remove:
             self._positions.remove(pos)
