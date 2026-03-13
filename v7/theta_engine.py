@@ -200,7 +200,7 @@ class ThetaEngine:
 
     def _enter_condor(self, today: date) -> None:
         """Select strikes and enter a 4-leg iron condor."""
-        nifty_ltp = self._data.get_ltp_batch().get("NSE:NIFTY 50")
+        nifty_ltp = self._data.get_batch_ltp(["NIFTY"]).get("NIFTY")
         if nifty_ltp is None:
             logger.warning("Cannot enter condor: no Nifty LTP")
             return
@@ -319,7 +319,8 @@ class ThetaEngine:
         if self._condor is None:
             return None
 
-        prices = self._data.get_ltp_batch()
+        from v7.config_v7 import WATCHLIST
+        prices = self._data.get_batch_ltp([w["symbol"] for w in WATCHLIST])
         profit_pct = self._condor.profit_pct(prices)
         target = self._profit_target_pct()
 

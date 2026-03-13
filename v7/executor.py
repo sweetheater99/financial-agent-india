@@ -144,7 +144,9 @@ class Executor:
     def _fetch_data(self, now: datetime) -> None:
         """Fetch LTP batch + VIX. Candles fetched on demand."""
         try:
-            self._quotes = self._data.get_ltp_batch()
+            from v7.config_v7 import WATCHLIST
+            symbols = [w["symbol"] for w in WATCHLIST]
+            self._quotes = self._data.get_batch_ltp(symbols)
         except Exception as e:
             logger.error("LTP batch fetch failed: %s", e)
             self._quotes = {}
@@ -307,6 +309,9 @@ class Executor:
         logger.info("ENTERED: %s %s @ %.2f, SL=%.2f, TGT=%.2f",
                      setup.id, tradingsymbol, result.fill_price, setup.stoploss, setup.target)
 
+        # Telegram alert with trade reasoning
+        self._send_entry_alert(setup, pos)
+
     # ── Position Management ───────────────────────────────────────────
 
     def _manage_positions(self, now: datetime) -> None:
@@ -453,6 +458,9 @@ class Executor:
         self._daily["daily_pnl"] = self._daily.get("daily_pnl", 0) + pnl
 
         logger.info("EXITED: %s reason=%s exit=%.2f pnl=%.2f", pos.instrument, reason, exit_price, pnl)
+
+        # Telegram alert on exit
+        self._send_exit_alert(pos, exit_price, reason, pnl)
 
     # ── Carried Position Management ───────────────────────────────────
 
@@ -724,6 +732,63 @@ class Executor:
             return False
 
         return True
+
+    # ── Telegram Alerts ────────────────────────────────────────────────
+
+    def _send_entry_alert(self, setup: Setup, pos: Position) -> None:
+        """Send Telegram alert on trade entry with reasoning."""
+        from v7.telegram import AlertLevel
+
+        day_type = self._playbook.day_classification.value if self._playbook else "?"
+        direction = "LONG" if pos.direction == "bullish" else "SHORT"
+        risk_amt = self._capital * (setup.max_risk_pct / 100)
+
+        lines = [
+            f"<b>V7 TRADE ENTRY</b>",
+            "",
+            f"<b>{pos.symbol}</b> {direction} — {setup.type.value}",
+            f"Instrument: {pos.instrument}",
+            f"Entry: {pos.entry_price:,.2f}  |  Qty: {pos.quantity}",
+            f"SL: {pos.stoploss:,.2f}  |  Target: {pos.target:,.2f}",
+            f"Risk: Rs.{risk_amt:,.0f} ({setup.max_risk_pct:.1f}%)",
+            f"Conviction: {setup.conviction.value}",
+            "",
+            f"<b>Why:</b> {setup.trigger_condition}",
+            f"Day type: {day_type}  |  VIX: {self._vix:.1f}",
+            f"Setup: {setup.id}  |  Open positions: {len(self._positions)}",
+        ]
+
+        try:
+            from v7.telegram import TelegramAlerter
+            tg = TelegramAlerter()
+            tg.send("\n".join(lines), AlertLevel.HIGH)
+        except Exception as e:
+            logger.warning("Entry Telegram alert failed: %s", e)
+
+    def _send_exit_alert(self, pos: Position, exit_price: float, reason: str, pnl: float) -> None:
+        """Send Telegram alert on trade exit."""
+        from v7.telegram import AlertLevel
+
+        direction = "LONG" if pos.direction == "bullish" else "SHORT"
+        pnl_label = "WIN" if pnl > 0 else "LOSS"
+        daily_pnl = self._daily.get("daily_pnl", 0)
+
+        lines = [
+            f"<b>V7 EXIT [{pnl_label}]</b>",
+            "",
+            f"<b>{pos.symbol}</b> {direction}",
+            f"Entry: {pos.entry_price:,.2f} → Exit: {exit_price:,.2f}",
+            f"P&amp;L: Rs.{pnl:+,.0f}",
+            f"Reason: {reason}",
+            f"Day P&amp;L: Rs.{daily_pnl:+,.0f}  |  Open: {len(self._positions)}",
+        ]
+
+        try:
+            from v7.telegram import TelegramAlerter
+            tg = TelegramAlerter()
+            tg.send("\n".join(lines), AlertLevel.HIGH)
+        except Exception as e:
+            logger.warning("Exit Telegram alert failed: %s", e)
 
     # ── Helpers ───────────────────────────────────────────────────────
 
