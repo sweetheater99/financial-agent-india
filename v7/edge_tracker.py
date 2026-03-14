@@ -13,9 +13,23 @@ toward what actually works.
 from __future__ import annotations
 
 import json
+import math
+import time
+from datetime import datetime
 from pathlib import Path
 
 from v7.types import TradeResult
+
+DECAY_LAMBDA = math.log(2) / (14 * 86400)  # 14-day half-life
+
+
+def _decayed_weight(timestamp_str: str) -> float:
+    """Exponential decay weight. Recent trades matter more."""
+    try:
+        age = time.time() - datetime.fromisoformat(timestamp_str).timestamp()
+        return math.exp(-DECAY_LAMBDA * max(0, age))
+    except (ValueError, TypeError):
+        return 0.5
 
 
 class EdgeTracker:
@@ -61,12 +75,30 @@ class EdgeTracker:
         self._trades.append(entry)
         self._save()
 
+    def _weighted_overall(self, trades: list[dict]) -> dict:
+        total_w = 0.0
+        win_w = 0.0
+        pnl_w = 0.0
+        w_sum = 0.0
+        for t in trades:
+            w = _decayed_weight(t.get("exit_date", ""))
+            total_w += w
+            if t["is_win"]:
+                win_w += w
+            pnl_w += w * t["pnl"]
+            w_sum += w
+        return {
+            "weighted_win_rate": win_w / total_w if total_w else 0.0,
+            "weighted_avg_pnl": pnl_w / w_sum if w_sum else 0.0,
+        }
+
     def get_stats(self) -> dict:
         """Compute aggregated stats across all dimensions."""
         trades = self._trades
         if not trades:
             return {
-                "overall": {"trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0, "net_pnl": 0.0},
+                "overall": {"trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0, "net_pnl": 0.0,
+                            "weighted_win_rate": 0.0, "weighted_avg_pnl": 0.0},
                 "by_strategy": {},
                 "by_instrument": {},
                 "by_time": {},
@@ -75,6 +107,7 @@ class EdgeTracker:
 
         wins = [t for t in trades if t["is_win"]]
         losses = [t for t in trades if not t["is_win"]]
+        weighted = self._weighted_overall(trades)
 
         return {
             "overall": {
@@ -83,6 +116,7 @@ class EdgeTracker:
                 "losses": len(losses),
                 "win_rate": len(wins) / len(trades) if trades else 0.0,
                 "net_pnl": sum(t["pnl"] for t in trades),
+                **weighted,
             },
             "by_strategy": self._group_stats(trades, "strategy"),
             "by_instrument": self._instrument_stats(trades),
@@ -91,7 +125,7 @@ class EdgeTracker:
         }
 
     def _group_stats(self, trades: list[dict], key: str) -> dict:
-        """Compute win rate, avg R:R, net P&L per group."""
+        """Compute win rate, avg R:R, net P&L per group (with weighted stats)."""
         groups: dict[str, list[dict]] = {}
         for t in trades:
             g = t.get(key, "unknown")
@@ -103,6 +137,7 @@ class EdgeTracker:
             losses = [t for t in group if not t["is_win"]]
             avg_win = sum(t["pnl_pct"] for t in wins) / len(wins) if wins else 0.0
             avg_loss = abs(sum(t["pnl_pct"] for t in losses) / len(losses)) if losses else 1.0
+            weighted = self._weighted_overall(group)
             result[name] = {
                 "trades": len(group),
                 "wins": len(wins),
@@ -110,11 +145,12 @@ class EdgeTracker:
                 "win_rate": len(wins) / len(group) if group else 0.0,
                 "avg_rr": avg_win / avg_loss if avg_loss > 0 else 0.0,
                 "net_pnl": sum(t["pnl"] for t in group),
+                **weighted,
             }
         return result
 
     def _instrument_stats(self, trades: list[dict]) -> dict:
-        """Per-instrument stats: trades, net P&L."""
+        """Per-instrument stats: trades, net P&L (with weighted stats)."""
         groups: dict[str, list[dict]] = {}
         for t in trades:
             groups.setdefault(t["symbol"], []).append(t)
@@ -122,11 +158,13 @@ class EdgeTracker:
         result = {}
         for name, group in groups.items():
             wins = [t for t in group if t["is_win"]]
+            weighted = self._weighted_overall(group)
             result[name] = {
                 "trades": len(group),
                 "wins": len(wins),
                 "win_rate": len(wins) / len(group) if group else 0.0,
                 "net_pnl": sum(t["pnl"] for t in group),
+                **weighted,
             }
         return result
 
@@ -148,31 +186,32 @@ class EdgeTracker:
         lines = []
         o = stats["overall"]
         lines.append(
-            f"Overall: {o['trades']} trades, {o['win_rate']:.0%} win rate, "
-            f"net P&L: {o['net_pnl']:+,.0f}"
+            f"Overall: {o['trades']} trades, {o['weighted_win_rate']:.0%} win rate "
+            f"(weighted, 14d half-life), net P&L: {o['net_pnl']:+,.0f}, "
+            f"weighted avg P&L: {o['weighted_avg_pnl']:+,.0f}"
         )
 
         if stats["by_strategy"]:
-            lines.append("By strategy:")
+            lines.append("By strategy (weighted, 14d half-life):")
             for name, s in stats["by_strategy"].items():
                 lines.append(
-                    f"  {name}: {s['trades']} trades, {s['win_rate']:.0%} WR, "
+                    f"  {name}: {s['trades']} trades, {s['weighted_win_rate']:.0%} WR, "
                     f"avg R:R {s['avg_rr']:.1f}, net {s['net_pnl']:+,.0f}"
                 )
 
         if stats["by_instrument"]:
-            lines.append("By instrument:")
+            lines.append("By instrument (weighted, 14d half-life):")
             for name, s in stats["by_instrument"].items():
                 lines.append(
-                    f"  {name}: {s['trades']} trades, {s['win_rate']:.0%} WR, "
+                    f"  {name}: {s['trades']} trades, {s['weighted_win_rate']:.0%} WR, "
                     f"net {s['net_pnl']:+,.0f}"
                 )
 
         if stats["by_time"]:
-            lines.append("By time:")
+            lines.append("By time (weighted, 14d half-life):")
             for name, s in stats["by_time"].items():
                 lines.append(
-                    f"  {name}: {s['trades']} trades, {s['win_rate']:.0%} WR"
+                    f"  {name}: {s['trades']} trades, {s['weighted_win_rate']:.0%} WR"
                 )
 
         kills = self.kill_candidates()

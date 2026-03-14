@@ -11,9 +11,13 @@ Backed by data/v7/level_memory.json via StateManager.
 from __future__ import annotations
 
 import json
+import math
+import time
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
+
+DECAY_LAMBDA = math.log(2) / (14 * 86400)  # 14-day half-life
 
 
 @dataclass
@@ -188,13 +192,30 @@ class LevelMemory:
             return {}
         return self._data[symbol].get("oi_walls", {})
 
+    @staticmethod
+    def _effective_strength(level: Level) -> float:
+        try:
+            age = time.time() - datetime.fromisoformat(level.last_tested).timestamp()
+        except (ValueError, TypeError):
+            age = 14 * 86400
+        return level.strength * math.exp(-DECAY_LAMBDA * max(0, age))
+
     def to_strategist_context(self, symbols: list[str]) -> dict:
         ctx = {}
         for sym in symbols:
             if sym not in self._data:
                 continue
+            levels = [Level.from_dict(d) for d in self._data[sym]["levels"]]
+            decayed = []
+            for lv in levels:
+                eff = self._effective_strength(lv)
+                if eff >= 0.5:
+                    d = lv.to_dict()
+                    d["effective_strength"] = round(eff, 2)
+                    decayed.append(d)
+            decayed.sort(key=lambda d: d["effective_strength"], reverse=True)
             ctx[sym] = {
-                "levels": [Level.from_dict(d).to_dict() for d in self._data[sym]["levels"]],
+                "levels": decayed,
                 "oi_walls": self._data[sym].get("oi_walls", {}),
             }
         return ctx

@@ -6,7 +6,10 @@ Handles load, save, reset, and stale-data detection.
 """
 from __future__ import annotations
 
+import fcntl
 import json
+import os
+import uuid
 from datetime import date
 from pathlib import Path
 
@@ -23,17 +26,40 @@ class StateManager:
     def _path(self, name: str) -> Path:
         return self.dir / name
 
-    def _read_json(self, name: str) -> dict | list | None:
+    def _atomic_write(self, path: Path, data: dict | list) -> None:
+        tmp = path.with_suffix(f".tmp.{uuid.uuid4().hex[:8]}")
+        f = None
+        try:
+            f = open(tmp, "w")
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            json.dump(data, f, indent=2, default=str)
+            f.flush()
+            os.fsync(f.fileno())
+            os.replace(str(tmp), str(path))
+        finally:
+            if f is not None:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                f.close()
+
+    def _locked_read(self, name: str) -> dict | list | None:
         path = self._path(name)
         if not path.exists():
             return None
-        with open(path) as f:
+        f = None
+        try:
+            f = open(path)
+            fcntl.flock(f.fileno(), fcntl.LOCK_SH)
             return json.load(f)
+        finally:
+            if f is not None:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                f.close()
+
+    def _read_json(self, name: str) -> dict | list | None:
+        return self._locked_read(name)
 
     def _write_json(self, name: str, data: dict | list) -> None:
-        path = self._path(name)
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2, default=str)
+        self._atomic_write(self._path(name), data)
 
     # ── Playbook ───────────────────────────────────────────────────
 
