@@ -26,12 +26,13 @@ _ROOT = _HERE.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from datetime import datetime, timedelta
+
 import pandas as pd
 
 CACHE_PATH = _ROOT / "data" / "backtest_cache.parquet"
 NIFTY_TICKER = "^NSEI"
 VIX_TICKER = "^INDIAVIX"
-DOWNLOAD_PERIOD = "2y6mo"   # ~2.5 years; yfinance accepts this form
 DOWNLOAD_INTERVAL = "1d"
 
 
@@ -87,10 +88,14 @@ def refresh_cache() -> pd.DataFrame:
     except ImportError:
         raise RuntimeError("yfinance not installed — run: pip install yfinance")
 
-    print(f"[cache_data] Downloading {NIFTY_TICKER} ({DOWNLOAD_PERIOD}) ...")
+    end_date = datetime.now().strftime("%Y-%m-%d")
+    start_date = (datetime.now() - timedelta(days=365 * 2 + 210)).strftime("%Y-%m-%d")
+
+    print(f"[cache_data] Downloading {NIFTY_TICKER} ({start_date} to {end_date}) ...")
     nifty_raw = yf.download(
         NIFTY_TICKER,
-        period=DOWNLOAD_PERIOD,
+        start=start_date,
+        end=end_date,
         interval=DOWNLOAD_INTERVAL,
         auto_adjust=True,
         progress=False,
@@ -98,10 +103,11 @@ def refresh_cache() -> pd.DataFrame:
     if nifty_raw.empty:
         raise ValueError(f"No data returned for {NIFTY_TICKER}")
 
-    print(f"[cache_data] Downloading {VIX_TICKER} ({DOWNLOAD_PERIOD}) ...")
+    print(f"[cache_data] Downloading {VIX_TICKER} ({start_date} to {end_date}) ...")
     vix_raw = yf.download(
         VIX_TICKER,
-        period=DOWNLOAD_PERIOD,
+        start=start_date,
+        end=end_date,
         interval=DOWNLOAD_INTERVAL,
         auto_adjust=True,
         progress=False,
