@@ -30,7 +30,7 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 
-CACHE_PATH = _ROOT / "data" / "backtest_cache.parquet"
+CACHE_PATH = _ROOT / "data" / "backtest_cache.csv"
 NIFTY_TICKER = "^NSEI"
 VIX_TICKER = "^INDIAVIX"
 DOWNLOAD_INTERVAL = "1d"
@@ -146,7 +146,7 @@ def refresh_cache() -> pd.DataFrame:
 
     # Save
     CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    merged.to_parquet(CACHE_PATH)
+    merged.to_csv(CACHE_PATH)
 
     rows = len(merged)
     start = merged.index[0].date()

@@ -46,7 +46,7 @@ from fo_strategies import (
 # Constants
 # ---------------------------------------------------------------------------
 RESULTS_TSV = _HERE / "results.tsv"
-CACHE_PATH = _ROOT / "data" / "backtest_cache.parquet"
+CACHE_PATH = _ROOT / "data" / "backtest_cache.csv"
 CAPITAL = 1_000_000
 HOLDOUT_MONTHS = 6
 NIGHTLY_DIFF_CAP = 150  # cumulative KEPT diff lines per night
@@ -175,7 +175,7 @@ def load_cached_data() -> tuple[pd.DataFrame, pd.DataFrame]:
             "to generate it. This requires Kite Connect auth (kite_auth.py)."
         )
 
-    df = pd.read_parquet(CACHE_PATH)
+    df = pd.read_csv(CACHE_PATH, index_col=0, parse_dates=True)
 
     # Ensure datetime index
     if not isinstance(df.index, pd.DatetimeIndex):
