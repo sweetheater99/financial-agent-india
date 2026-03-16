@@ -1,86 +1,101 @@
 """
-Kite Connect OAuth login helper.
+Kite Connect OAuth login helper — headless TOTP-based.
 
 Run daily before market hours to get a fresh access token.
-Opens browser for Zerodha login, catches redirect, saves token.
+Uses requests + pyotp for fully automated login (no browser needed).
 
 Usage:
-    python kite_auth.py              # opens browser
-    python kite_auth.py --token XYZ  # manual token paste
+    python kite_auth.py              # headless TOTP login
+    python kite_auth.py --token XYZ  # manual request_token paste
 """
 
 import argparse
 import json
 import sys
-import webbrowser
-import threading
-from flask import Flask, request
 
+import pyotp
+import requests
 from kiteconnect import KiteConnect
+
 import config
 from kite_data import save_access_token
 
-app = Flask(__name__)
-_request_token = None
-_server_done = threading.Event()
 
+def login_headless() -> str:
+    """Automated headless login using TOTP — no browser needed."""
+    session = requests.Session()
 
-@app.route("/")
-def callback():
-    """Catch the OAuth redirect and extract request_token."""
-    global _request_token
-    _request_token = request.args.get("request_token")
-    status = request.args.get("status")
-
-    if status == "success" and _request_token:
-        _server_done.set()
-        return "<h2>Login successful! You can close this tab.</h2>"
-    else:
-        return f"<h2>Login failed: {request.args}</h2>", 400
-
-
-def login_with_browser():
-    """Open browser for Zerodha login, wait for redirect."""
-    global _request_token
-
-    kite = KiteConnect(api_key=config.KITE_API_KEY)
-    login_url = kite.login_url()
-
-    print(f"Opening browser for Zerodha login...")
-    print(f"URL: {login_url}")
-
-    # Start Flask server to catch redirect
-    server = threading.Thread(
-        target=lambda: app.run(host="127.0.0.1", port=5555, use_reloader=False),
-        daemon=True,
+    # Step 1: POST user_id + password to Kite login
+    print("Logging in...")
+    resp = session.post(
+        "https://kite.zerodha.com/api/login",
+        data={
+            "user_id": config.KITE_USER_ID,
+            "password": config.KITE_PASSWORD,
+        },
     )
-    server.start()
+    resp.raise_for_status()
+    data = resp.json()
 
-    webbrowser.open(login_url)
+    if data.get("status") != "success":
+        raise RuntimeError(f"Login failed: {data}")
 
-    print("Waiting for login redirect (timeout: 120s)...")
-    if not _server_done.wait(timeout=120):
-        print("Timeout waiting for login. Use --token flag to paste manually.")
-        sys.exit(1)
+    request_id = data["data"]["request_id"]
 
-    return exchange_token(kite, _request_token)
+    # Step 2: Submit TOTP
+    print("Submitting TOTP...")
+    totp = pyotp.TOTP(config.KITE_TOTP_SECRET)
+    resp = session.post(
+        "https://kite.zerodha.com/api/twofa",
+        data={
+            "user_id": config.KITE_USER_ID,
+            "request_id": request_id,
+            "twofa_value": totp.now(),
+            "twofa_type": "totp",
+        },
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    if data.get("status") != "success":
+        raise RuntimeError(f"TOTP failed: {data}")
+
+    # Step 3: Follow redirect chain to get request_token
+    print("Got request_token, exchanging for access_token...")
+    kite = KiteConnect(api_key=config.KITE_API_KEY)
+
+    # First redirect: login URL → /connect/finish
+    resp = session.get(kite.login_url(), allow_redirects=False)
+    redirect_url = resp.headers.get("Location", "")
+
+    # Follow up to 5 redirects manually to find request_token
+    for _ in range(5):
+        if "request_token=" in redirect_url:
+            break
+        if resp.status_code not in (301, 302, 303, 307):
+            break
+        resp = session.get(redirect_url, allow_redirects=False)
+        redirect_url = resp.headers.get("Location", redirect_url)
+
+    if "request_token=" not in redirect_url:
+        raise RuntimeError(
+            f"No request_token in redirect chain. Last URL: {redirect_url[:200]}"
+        )
+
+    from urllib.parse import urlparse, parse_qs
+    params = parse_qs(urlparse(redirect_url).query)
+    request_token = params["request_token"][0]
+
+    return exchange_token(kite, request_token)
 
 
 def exchange_token(kite: KiteConnect, request_token: str) -> str:
     """Exchange request_token for access_token."""
-    print(f"Exchanging request token...")
     data = kite.generate_session(request_token, api_secret=config.KITE_API_SECRET)
     access_token = data["access_token"]
-
     save_access_token(access_token)
-    print(f"Access token saved. Valid until tomorrow.")
+    print("Access token saved. Valid until tomorrow.")
     return access_token
-
-
-def login_with_manual_token(request_token: str):
-    """Exchange a manually pasted request_token."""
-    kite = KiteConnect(api_key=config.KITE_API_KEY)
-    return exchange_token(kite, request_token)
 
 
 def main():
@@ -89,9 +104,10 @@ def main():
     args = parser.parse_args()
 
     if args.token:
-        login_with_manual_token(args.token)
+        kite = KiteConnect(api_key=config.KITE_API_KEY)
+        exchange_token(kite, args.token)
     else:
-        login_with_browser()
+        login_headless()
 
     # Verify token works
     kite = KiteConnect(api_key=config.KITE_API_KEY)

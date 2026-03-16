@@ -131,7 +131,7 @@ def _validate_price_deviation(expected_price: float, ltp: float) -> tuple[bool, 
 def _determine_exchange(position: dict) -> str:
     """Return the correct exchange for the position."""
     instrument = position.get("instrument", "EQ")
-    if instrument in ("OPT", "SPREAD", "MOMENTUM", "CONDOR"):
+    if instrument in ("OPT", "FUT", "SPREAD", "MOMENTUM", "CONDOR"):
         return "NFO"
     return "NSE"
 
@@ -139,7 +139,7 @@ def _determine_exchange(position: dict) -> str:
 def _determine_product_type(position: dict) -> str:
     """Return the correct product type for the position."""
     instrument = position.get("instrument", "EQ")
-    if instrument in ("OPT", "SPREAD", "MOMENTUM", "CONDOR"):
+    if instrument in ("OPT", "FUT", "SPREAD", "MOMENTUM", "CONDOR"):
         return "CARRYFORWARD"  # F&O carry forward
     return "DELIVERY"  # CNC for equity
 
@@ -157,7 +157,9 @@ def _get_trading_symbol(position: dict) -> str:
         if symbol.endswith("-EQ"):
             return symbol
         return f"{symbol}-EQ"
-    # For options, the position should have trading_symbol set
+    # For futures: use contract_symbol; for options: use trading_symbol
+    if instrument == "FUT":
+        return position.get("contract_symbol", position.get("symbol", ""))
     return position.get("trading_symbol", position.get("symbol", ""))
 
 

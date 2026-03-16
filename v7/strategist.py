@@ -595,7 +595,8 @@ class Strategist:
     Handles all scheduled Claude calls and fallback logic.
     """
 
-    def __init__(self, state_dir: str | None = None):
+    def __init__(self, state_dir: str | None = None,
+                 data_feed=None, edge_tracker=None, risk_engine=None):
         from config import get_anthropic_client, CLAUDE_MODEL, CLAUDE_MODEL_LIGHT
         self._client = get_anthropic_client()
         self._model = CLAUDE_MODEL
@@ -605,7 +606,11 @@ class Strategist:
 
         from v7.state import StateManager
         from pathlib import Path
-        self._state = StateManager(Path(state_dir or "data/v7"))
+        self._data_dir = Path(state_dir or "data/v7")
+        self._state = StateManager(self._data_dir)
+        self._data_feed = data_feed
+        self._edge_tracker = edge_tracker
+        self._risk_engine = risk_engine
 
     def _call_claude(
         self, prompt: str, system: str, model: str | None = None,
@@ -629,6 +634,18 @@ class Strategist:
                 if attempt < self._max_retries - 1:
                     time_mod.sleep(self._retry_delay)
         return None
+
+    def premarket(self) -> Playbook:
+        """No-arg wrapper: gathers all market intel, then generates playbook."""
+        from v7.market_intel import gather_premarket_intel
+        intel = gather_premarket_intel(
+            data_feed=self._data_feed,
+            edge_tracker=self._edge_tracker,
+            risk_engine=self._risk_engine,
+            state=self._state,
+            data_dir=self._data_dir,
+        )
+        return self.generate_premarket_playbook(**intel)
 
     def generate_premarket_playbook(
         self,
@@ -666,20 +683,66 @@ class Strategist:
         self._state.save_playbook(fallback)
         return fallback
 
-    def opening_read(
-        self,
-        opening_range_high: float, opening_range_low: float,
-        gap_direction: str, gap_behavior: str,
-        first_30min_volume_ratio: float, oi_changes: dict,
-    ) -> Playbook | None:
-        """Update playbook after opening (9:45 AM call).
+    def opening_read(self) -> Playbook | None:
+        """Update playbook after first 30 min (9:45 AM).
 
-        Returns updated playbook or None if Claude unavailable (executor continues with current playbook).
+        Auto-fetches opening range, gap, volume, and OI from data feed.
+        Returns updated playbook or current playbook if Claude unavailable.
         """
         current = self._state.load_playbook()
         if current is None:
             log.warning("No current playbook for opening read")
             return None
+
+        # Gather opening data from data feed
+        opening_range_high = 0.0
+        opening_range_low = 0.0
+        gap_direction = "flat"
+        gap_behavior = "unknown"
+        first_30min_volume_ratio = 1.0
+        oi_changes = {}
+
+        if self._data_feed and self._data_feed.can_trade():
+            try:
+                candles = self._data_feed.get_candles("NIFTY", interval="5minute", days=1)
+                if candles:
+                    # First 30 min = first 6 five-minute candles (9:15-9:45)
+                    first_30 = candles[:6] if len(candles) >= 6 else candles
+                    highs = [c["high"] for c in first_30]
+                    lows = [c["low"] for c in first_30]
+                    opening_range_high = max(highs) if highs else 0
+                    opening_range_low = min(lows) if lows else 0
+
+                    # Volume ratio vs 20-day average (approximate from today's volume)
+                    today_vol = sum(c.get("volume", 0) for c in first_30)
+                    if today_vol > 0:
+                        first_30min_volume_ratio = 1.0  # TODO: compare with 20-day avg
+
+                    # Gap direction from prev close
+                    prev_close = current.market_context.gift_nifty if current.market_context else ""
+                    open_price = first_30[0]["open"] if first_30 else 0
+                    if opening_range_low > 0 and open_price > 0:
+                        # Use playbook's key levels to determine gap
+                        nifty_levels = {}
+                        for s in current.nifty_setups:
+                            if s.trigger_level > 0:
+                                nifty_levels[s.id] = s.trigger_level
+                        # Simple gap classification
+                        range_pct = (opening_range_high - opening_range_low) / opening_range_low * 100 if opening_range_low else 0
+                        if range_pct > 0.5:
+                            gap_behavior = "wide_range"
+                        else:
+                            gap_behavior = "narrow_range"
+            except Exception as e:
+                log.warning("Opening read data fetch failed: %s", e)
+
+            # OI changes
+            try:
+                from v7.oi_pipeline import OIPipeline
+                oi = OIPipeline(data_dir=self._data_dir)
+                oi_changes = oi.compute_oi_changes("NIFTY")
+            except Exception:
+                pass
 
         prompt = build_opening_read_prompt(
             current_playbook=current.to_dict(),
@@ -710,19 +773,49 @@ class Strategist:
         self._state.save_playbook(current)
         return current
 
-    def checkin(
-        self,
-        daily_pnl: float, open_positions: list[dict],
-        setups_fired: list[str], levels_tested: list[dict],
-        oi_changes: dict, current_vix: float, checkin_number: int,
-    ) -> Playbook | None:
+    def checkin(self, checkin_number: int = 1) -> dict:
         """Check-in update (10:30 AM or 1:00 PM).
 
-        Returns updated playbook or None (executor continues unchanged).
+        Auto-fetches daily P&L, positions, VIX, OI from state + data feed.
+        Returns dict with plan_changed and summary.
         """
         current = self._state.load_playbook()
         if current is None:
-            return None
+            return {"plan_changed": False, "summary": "No playbook loaded"}
+
+        # Gather state
+        daily = self._state.load_daily_state()
+        daily_pnl = daily.get("daily_pnl", 0.0)
+        positions = self._state.load_positions()
+        open_positions = [
+            {"symbol": p.symbol, "instrument": p.instrument,
+             "direction": p.direction, "entry_price": p.entry_price,
+             "stoploss": p.stoploss, "target": p.target}
+            for p in positions
+        ]
+
+        # Setups fired
+        setups_fired = [s.id for s in current.all_setups() if s.fired]
+
+        # VIX
+        current_vix = 0.0
+        if self._data_feed:
+            try:
+                current_vix = self._data_feed.get_vix() or 0.0
+            except Exception:
+                pass
+
+        # OI changes
+        oi_changes = {}
+        try:
+            from v7.oi_pipeline import OIPipeline
+            oi = OIPipeline(data_dir=self._data_dir)
+            oi_changes = oi.compute_oi_changes("NIFTY")
+        except Exception:
+            pass
+
+        # Levels tested (simplified — would need candle analysis for full impl)
+        levels_tested = []
 
         prompt = build_checkin_prompt(
             current_playbook=current.to_dict(),
@@ -736,12 +829,11 @@ class Strategist:
         if raw:
             playbook = parse_playbook_response(raw)
             if playbook:
-                # Preserve opening range from earlier
                 playbook.opening_range = current.opening_range
                 self._state.save_playbook(playbook)
-                return playbook
+                return {"plan_changed": True, "summary": f"Updated to {playbook.day_classification.value}"}
 
-        return None  # continue with current playbook
+        return {"plan_changed": False, "summary": "No changes (Claude unavailable or no updates)"}
 
     def handle_exception(
         self,

@@ -144,9 +144,8 @@ class Position:
             self.peak_price = self.entry_price
 
     def unrealized_pnl(self, current_price: float) -> float:
-        if self.direction == "bullish":
-            return self.quantity * (current_price - self.entry_price)
-        return self.quantity * (self.entry_price - current_price)
+        """P&L for long option positions (both CE and PE buys)."""
+        return self.quantity * (current_price - self.entry_price)
 
     def unrealized_pnl_pct(self, current_price: float) -> float:
         cost = self.entry_price * self.quantity
@@ -155,10 +154,8 @@ class Position:
         return (self.unrealized_pnl(current_price) / cost) * 100
 
     def risk_amount(self) -> float:
-        """Max loss if SL is hit."""
-        if self.direction == "bullish":
-            return self.quantity * (self.entry_price - self.stoploss)
-        return self.quantity * (self.stoploss - self.entry_price)
+        """Max loss = total premium paid (for long options, max loss is 100% of premium)."""
+        return self.allocated
 
     def to_dict(self) -> dict:
         return {

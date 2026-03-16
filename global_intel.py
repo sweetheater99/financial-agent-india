@@ -68,10 +68,10 @@ def fetch_us_markets() -> dict:
         sp500 = yf.Ticker("^GSPC").history(period="2d")
         nasdaq = yf.Ticker("^IXIC").history(period="2d")
         result = _compute_us_market_data(sp500, nasdaq)
+        _set_cache(cache_key, result)  # only cache successful fetches
     except Exception as e:
         logger.debug("US market fetch failed: %s", e)
         result = {"sp500_pct_change": 0.0, "nasdaq_pct_change": 0.0}
-    _set_cache(cache_key, result)
     return result
 
 
@@ -92,10 +92,11 @@ def fetch_gift_nifty_gap(prev_nifty_close: float) -> dict:
         nifty_fut = yf.Ticker("^NSEI").history(period="1d")
         ltp = float(nifty_fut["Close"].iloc[-1]) if not nifty_fut.empty else None
         result = _compute_gift_nifty_gap(ltp, prev_nifty_close)
+        if result.get("gift_nifty_ltp", 0) > 0:
+            _set_cache(cache_key, result)  # only cache if we got a real price
     except Exception as e:
         logger.debug("GIFT Nifty fetch failed: %s", e)
         result = {"gift_nifty_gap_pct": 0.0, "gift_nifty_ltp": 0.0}
-    _set_cache(cache_key, result)
     return result
 
 
@@ -116,10 +117,10 @@ def fetch_asia_markets() -> dict:
         hang_seng = yf.Ticker("^HSI").history(period="2d")
         nikkei = yf.Ticker("^N225").history(period="2d")
         result = _compute_asia_data(hang_seng, nikkei)
+        _set_cache(cache_key, result)
     except Exception as e:
         logger.debug("Asia market fetch failed: %s", e)
         result = {"hang_seng_pct": 0.0, "nikkei_pct": 0.0}
-    _set_cache(cache_key, result)
     return result
 
 
@@ -133,36 +134,42 @@ def fetch_fii_dii() -> dict:
         import requests
         from bs4 import BeautifulSoup
         url = "https://www.moneycontrol.com/stocks/marketstats/fii_dii_activity/index.php"
-        headers = {"User-Agent": "Mozilla/5.0"}
+        headers = {"User-Agent": "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36"}
         resp = requests.get(url, headers=headers, timeout=15)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
+        # Table structure: [date, fii_buy, fii_sell, fii_net, dii_buy, dii_sell, dii_net]
+        # Find the Cash tab table with daily rows (Table 2 typically)
         tables = soup.find_all("table")
         for table in tables:
             rows = table.find_all("tr")
-            for row in rows:
+            if len(rows) < 4:
+                continue
+            # Check header matches expected structure
+            header_cells = [c.get_text(strip=True) for c in rows[1].find_all(["td", "th"])]
+            if len(header_cells) < 7 or "Net Purchase" not in header_cells[3]:
+                continue
+            # Find most recent daily row (skip row 0=header group, 1=column headers, 2=month-to-date)
+            for row in rows[3:]:
                 cells = row.find_all("td")
-                if len(cells) >= 4:
-                    label = cells[0].get_text(strip=True).upper()
-                    if "FII" in label or "FPI" in label:
-                        try:
-                            buy = float(cells[1].get_text(strip=True).replace(",", ""))
-                            sell = float(cells[2].get_text(strip=True).replace(",", ""))
-                            result["fii_net_crores"] = round(buy - sell, 2)
-                            result["source"] = "moneycontrol"
-                        except ValueError:
-                            pass
-                    elif "DII" in label:
-                        try:
-                            buy = float(cells[1].get_text(strip=True).replace(",", ""))
-                            sell = float(cells[2].get_text(strip=True).replace(",", ""))
-                            result["dii_net_crores"] = round(buy - sell, 2)
-                        except ValueError:
-                            pass
-        result["date"] = datetime.now().strftime("%Y-%m-%d")
+                vals = [c.get_text(strip=True) for c in cells]
+                if len(vals) >= 7:
+                    try:
+                        fii_net = float(vals[3].replace(",", ""))
+                        dii_net = float(vals[6].replace(",", ""))
+                        result["fii_net_crores"] = round(fii_net, 2)
+                        result["dii_net_crores"] = round(dii_net, 2)
+                        result["source"] = "moneycontrol"
+                        result["date"] = vals[0][:11].strip()  # e.g. "06-Mar-2026"
+                        break
+                    except (ValueError, IndexError):
+                        continue
+            if result["source"] != "unavailable":
+                break
+        if result["source"] != "unavailable":
+            _set_cache(cache_key, result)  # only cache successful scrapes
     except Exception as e:
         logger.debug("FII/DII scrape failed: %s", e)
-    _set_cache(cache_key, result)
     return result
 
 

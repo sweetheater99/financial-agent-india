@@ -34,6 +34,9 @@ API_DELAY = 1.5  # seconds between SmartAPI calls to avoid rate-limiting
 # ── Zerodha Kite Connect ─────────────────────────────────────────────────
 KITE_API_KEY = os.getenv("KITE_API_KEY")
 KITE_API_SECRET = os.getenv("KITE_API_SECRET")
+KITE_USER_ID = os.getenv("KITE_USER_ID")
+KITE_PASSWORD = os.getenv("KITE_PASSWORD")
+KITE_TOTP_SECRET = os.getenv("KITE_TOTP_SECRET")
 KITE_ACCESS_TOKEN_FILE = os.path.join(os.path.dirname(__file__), "data", ".kite_access_token")
 
 # Data source: "angelone" (default) or "kite"
@@ -91,6 +94,7 @@ class ClaudeCLIClient:
                 "claude-opus-4-20250514": "opus",
                 "claude-haiku-3-5-20241022": "haiku",
                 "claude-haiku-4-5-20251001": "haiku",
+                "claude-haiku-4-20250414": "haiku",
             }
             cmd.extend(["--model", model_map.get(model_name, model_name)])
 
@@ -100,7 +104,7 @@ class ClaudeCLIClient:
             cmd.append(user_text.strip())
 
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=120,
+                cmd, capture_output=True, text=True, timeout=300,
             )
 
             if result.returncode != 0:

@@ -57,7 +57,9 @@ def select_directional_strike(
     option_type = "CE" if direction == "bullish" else "PE"
     delta_min, delta_max = STRIKE_FILTERS["directional_delta_range"]
     min_premium = STRIKE_FILTERS["min_premium"]
-    max_premium = risk_budget / lot_size
+    # risk_budget is total capital at risk; max_premium = per-unit cap
+    # Floor at 500 Rs/unit to ensure ATM options pass (paper trading viability)
+    max_premium = max(risk_budget / lot_size, 500.0)
 
     candidates = []
     for entry in chain:

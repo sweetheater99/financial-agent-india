@@ -81,7 +81,7 @@ def _init_components(paper: bool = False) -> dict:
 
     try:
         from v7.data_feed import DataFeed
-        data_feed = DataFeed(use_kite=not paper)
+        data_feed = DataFeed(use_kite=True)  # always use Kite for data; paper only affects orders
         components["data_feed"] = data_feed
     except (ImportError, Exception):
         data_feed = None
@@ -115,7 +115,12 @@ def _init_components(paper: bool = False) -> dict:
 
     try:
         from v7.strategist import Strategist
-        components["strategist"] = Strategist(state_dir=str(data_dir))
+        components["strategist"] = Strategist(
+            state_dir=str(data_dir),
+            data_feed=data_feed,
+            edge_tracker=edge_tracker,
+            risk_engine=risk_engine,
+        )
     except (ImportError, Exception):
         pass
 
@@ -128,6 +133,7 @@ def _init_components(paper: bool = False) -> dict:
             order_mgr=order_mgr,
             margin_tracker=margin,
             capital=capital,
+            strategist=components.get("strategist"),
         )
     except (ImportError, Exception):
         pass
@@ -179,6 +185,10 @@ def cmd_opening_read(components: dict) -> None:
         sys.exit(1)
 
     updated_playbook = strategist.opening_read()
+    if updated_playbook is None:
+        print("Opening read skipped — no playbook available")
+        return
+
     print(f"Opening read done. Day type: {updated_playbook.day_classification.value}")
 
     from v7.telegram import format_checkin, AlertLevel
@@ -203,10 +213,15 @@ def cmd_checkin(components: dict, num: int) -> None:
     print(f"Check-in #{num} done. Plan changed: {result.get('plan_changed', False)}")
 
     from v7.telegram import format_checkin, AlertLevel
+    state = components["state"]
+    daily = state.load_daily_state()
+    positions = state.load_positions()
     msg = format_checkin(
         checkin_num=num,
         plan_changed=result.get("plan_changed", False),
         summary=result.get("summary", "No changes"),
+        daily_pnl=daily.get("daily_pnl", 0.0),
+        open_count=len(positions),
     )
     telegram.send(msg, AlertLevel.LOW)
 
@@ -223,7 +238,7 @@ def cmd_tick(components: dict) -> None:
 
 def cmd_eod(components: dict) -> None:
     """Run EOD review + journal."""
-    import anthropic
+    from config import get_anthropic_client, CLAUDE_MODEL_LIGHT
     from v7.journal import grade_trades_prompt, parse_journal_response
     from v7.telegram import format_eod_summary, AlertLevel
     from v7.types import TradeResult, SetupType
@@ -251,9 +266,9 @@ def cmd_eod(components: dict) -> None:
         )
 
         try:
-            client = anthropic.Anthropic()
+            client = get_anthropic_client()
             response = client.messages.create(
-                model="claude-haiku-4-20250414",
+                model=CLAUDE_MODEL_LIGHT,
                 max_tokens=1000,
                 messages=[{"role": "user", "content": prompt}],
             )
@@ -323,7 +338,7 @@ def cmd_eod(components: dict) -> None:
 
 def cmd_weekly(components: dict) -> None:
     """Run weekly review."""
-    import anthropic
+    from config import get_anthropic_client, CLAUDE_MODEL
     from v7.journal import generate_weekly_review_prompt, parse_journal_response
     from v7.telegram import format_weekly_report, AlertLevel
 
@@ -351,9 +366,9 @@ def cmd_weekly(components: dict) -> None:
     )
 
     try:
-        client = anthropic.Anthropic()
+        client = get_anthropic_client()
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model=CLAUDE_MODEL,
             max_tokens=2000,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -380,7 +395,7 @@ def cmd_weekly(components: dict) -> None:
 
 def cmd_monthly(components: dict) -> None:
     """Run monthly report."""
-    import anthropic
+    from config import get_anthropic_client, CLAUDE_MODEL
     from v7.journal import generate_monthly_report_prompt, parse_journal_response
     from v7.telegram import format_weekly_report, AlertLevel
 
@@ -412,9 +427,9 @@ def cmd_monthly(components: dict) -> None:
     )
 
     try:
-        client = anthropic.Anthropic()
+        client = get_anthropic_client()
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model=CLAUDE_MODEL,
             max_tokens=2000,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -453,9 +468,14 @@ def cmd_status(components: dict) -> None:
     for p in positions:
         print(f"  {p.symbol} {p.instrument}: entry {p.entry_price:.2f}, SL {p.stoploss:.2f}")
 
-    print(f"Daily P&L: {daily.get('total_pnl', 0):+,.0f}")
-    print(f"Trade count: {daily.get('trade_count', 0)}")
-    print(f"SL hits: {daily.get('sl_hit_count', 0)}")
+    print(f"Daily P&L: {daily.get('daily_pnl', 0):+,.0f}")
+    print(f"Trade count: {daily.get('trades_today', 0)}")
+    print(f"SL hits: {daily.get('consecutive_sl_hits', 0)}")
+    closed = daily.get('closed_trades', [])
+    if closed:
+        print(f"Closed trades: {len(closed)}")
+        for t in closed:
+            print(f"  {t.get('symbol')} {t.get('instrument')}: pnl={t.get('pnl', 0):+,.0f} ({t.get('exit_reason')})")
 
 
 def cmd_paper_status(components: dict) -> None:

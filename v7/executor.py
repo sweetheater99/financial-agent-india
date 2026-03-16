@@ -175,7 +175,7 @@ class Executor:
 
         # Track Nifty open
         if self._daily.get("nifty_open") is None:
-            nifty_ltp = self._quotes.get("NSE:NIFTY 50")
+            nifty_ltp = self._get_ltp_for_symbol("NIFTY")
             if nifty_ltp:
                 self._daily["nifty_open"] = nifty_ltp
 
@@ -198,6 +198,9 @@ class Executor:
 
         if is_15min_boundary(now.time()):
             self._evaluate_triggers(now)
+
+            # Auto-refresh: if all setups are stale, ask strategist for new ones
+            self._check_stale_setups(now)
 
     def _handle_wind_down(self, now: datetime) -> None:
         """14:30-15:15: Close intraday, carry decisions."""
@@ -545,6 +548,28 @@ class Executor:
 
         logger.info("EXITED: %s reason=%s exit=%.2f pnl=%.2f", pos.instrument, reason, exit_price, pnl)
 
+        # Record trade result for EOD journal and edge tracking
+        trade = TradeResult(
+            symbol=pos.symbol,
+            instrument=pos.instrument,
+            setup_type=self._get_setup_type(pos.setup_id),
+            setup_id=pos.setup_id,
+            direction=pos.direction,
+            entry_price=pos.entry_price,
+            exit_price=exit_price,
+            quantity=pos.quantity,
+            pnl=pnl,
+            pnl_pct=(pnl / pos.allocated * 100) if pos.allocated else 0,
+            costs=0.0,
+            entry_date=str(pos.entry_date),
+            exit_date=str(now.date()),
+            exit_reason=reason,
+        )
+        self._state.append_trade(trade)
+        closed = self._daily.get("closed_trades", [])
+        closed.append(trade.to_dict())
+        self._daily["closed_trades"] = closed
+
         # Telegram alert on exit
         self._send_exit_alert(pos, exit_price, reason, pnl)
 
@@ -710,14 +735,14 @@ class Executor:
 
         # Nifty > 1.5% from open
         nifty_open = self._daily.get("nifty_open")
-        nifty_now = self._quotes.get("NSE:NIFTY 50")
+        nifty_now = self._get_ltp_for_symbol("NIFTY")
         if nifty_open and nifty_now:
             nifty_move_pct = abs(nifty_now - nifty_open) / nifty_open * 100
             if nifty_move_pct > 1.5:
                 exceptions.append(f"Nifty move: {nifty_move_pct:.1f}% from open")
 
         # Margin > 70%
-        margin_pct = self._margin.current_utilization_pct()
+        margin_pct = self._margin.utilization_pct()
         if margin_pct > 70:
             exceptions.append(f"Margin utilization: {margin_pct:.0f}%")
 
@@ -729,10 +754,14 @@ class Executor:
             logger.warning("EXCEPTION DETECTED: %s", "; ".join(exceptions))
             try:
                 self._strategist.handle_exception(
-                    exceptions=exceptions,
-                    positions=self._positions,
-                    daily_state=self._daily,
-                    vix=self._vix,
+                    exception_type="; ".join(exceptions),
+                    details={"daily_state": self._daily, "vix": self._vix},
+                    open_positions=[
+                        {"symbol": p.symbol, "instrument": p.instrument,
+                         "direction": p.direction, "entry_price": p.entry_price,
+                         "stoploss": p.stoploss, "target": p.target}
+                        for p in self._positions
+                    ],
                 )
             except Exception as e:
                 logger.error("Exception handler failed: %s", e)
@@ -876,7 +905,77 @@ class Executor:
         except Exception as e:
             logger.warning("Exit Telegram alert failed: %s", e)
 
+    # ── Stale Setup Detection ─────────────────────────────────────────
+
+    def _check_stale_setups(self, now: datetime) -> None:
+        """If all active setups are stale (price >1.5% from trigger), ask strategist to refresh.
+
+        Only refreshes once per hour to avoid spamming Claude calls.
+        Skips if we have open positions (focus on managing them).
+        """
+        if not self._playbook or not self._strategist:
+            return
+
+        # Don't refresh if we have open positions — focus on management
+        if self._positions:
+            return
+
+        # Rate limit: once per hour
+        last_refresh = self._daily.get("last_stale_refresh")
+        if last_refresh:
+            from datetime import datetime as dt
+            try:
+                last_dt = dt.fromisoformat(last_refresh)
+                if (now - last_dt).total_seconds() < 3600:
+                    return
+            except (ValueError, TypeError):
+                pass
+
+        active = self._playbook.active_setups()
+        if not active:
+            # All setups fired/cancelled, budget may still allow trades
+            trades_left = self._playbook.risk_budget.max_trades_today - self._daily.get("trades_today", 0)
+            if trades_left <= 0:
+                return
+            logger.info("STALE: No active setups, %d trade slots left — requesting refresh", trades_left)
+        else:
+            # Check if all active triggers are far from current price
+            all_stale = True
+            for s in active:
+                ltp = self._get_ltp_for_symbol(s.symbol)
+                if ltp is None:
+                    all_stale = False
+                    break
+                distance_pct = abs(ltp - s.trigger_level) / ltp * 100
+                if distance_pct < 1.5:
+                    all_stale = False
+                    break
+            if not all_stale:
+                return
+            logger.info("STALE: All %d active setups >1.5%% from trigger — requesting refresh", len(active))
+
+        # Call strategist checkin for a refresh
+        try:
+            result = self._strategist.checkin(checkin_number=0)  # 0 = ad-hoc refresh
+            if result.get("plan_changed"):
+                logger.info("STALE REFRESH: Playbook updated — %s", result.get("summary", ""))
+                self._playbook = self._state.load_playbook()  # reload
+                from v7.telegram import TelegramAlerter, AlertLevel
+                tg = TelegramAlerter()
+                tg.send(f"V7 auto-refresh: {result.get('summary', 'playbook updated')}", AlertLevel.LOW)
+            self._daily["last_stale_refresh"] = now.isoformat()
+        except Exception as e:
+            logger.warning("Stale refresh failed: %s", e)
+
     # ── Helpers ───────────────────────────────────────────────────────
+
+    def _get_setup_type(self, setup_id: str) -> SetupType:
+        """Look up SetupType from playbook by setup_id."""
+        if self._playbook:
+            for s in self._playbook.all_setups():
+                if s.id == setup_id:
+                    return s.type
+        return SetupType.BREAKOUT_LONG
 
     def _get_ltp_for_symbol(self, symbol: str) -> Optional[float]:
         """Get LTP for a symbol from latest quotes."""

@@ -1098,13 +1098,13 @@ class TestATR:
         assert compute_atr(None, 14) is None
 
     def test_atr_target_sl_prices(self):
-        """ATR-based target and SL are computed correctly (tuned: 2.0x target, 2.0x SL)."""
+        """ATR-based target and SL are computed correctly (V8: 1.5x target, 3.5x SL)."""
         entry = 1000.0
         atr = 50.0
-        target = entry + ATR_TARGET_MULTIPLIER * atr  # 1000 + 2.0*50 = 1100
-        sl = entry - ATR_STOPLOSS_MULTIPLIER * atr     # 1000 - 2.0*50 = 900
-        assert target == pytest.approx(1100.0)
-        assert sl == pytest.approx(900.0)
+        target = entry + ATR_TARGET_MULTIPLIER * atr  # 1000 + 1.5*50 = 1075
+        sl = entry - ATR_STOPLOSS_MULTIPLIER * atr     # 1000 - 3.5*50 = 825
+        assert target == pytest.approx(1075.0)
+        assert sl == pytest.approx(825.0)
 
     def test_atr_known_values(self):
         """ATR with specific true ranges."""

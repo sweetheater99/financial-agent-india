@@ -28,6 +28,31 @@ EQ_SEBI_PCT = 0.000001
 GST_PCT = 0.18
 EQ_SLIPPAGE_PCT = 0.001
 
+# Futures transaction cost rates
+FUT_STT_PCT = 0.0125 / 100       # 0.0125% on sell side only
+FUT_EXCHANGE_PCT = 0.0019 / 100  # NSE futures
+FUT_STAMP_DUTY_PCT = 0.002 / 100 # futures stamp duty
+FUT_SEBI_PCT = 0.000001
+FUT_SLIPPAGE_PCT = 0.0005        # tighter spread on liquid futures
+FUT_MARGIN_PCT = 0.15            # ~15% SPAN+exposure margin for stock futures
+
+
+def calc_fut_costs(price: float, quantity: int, side: str) -> float:
+    """Calculate futures transaction costs for one leg."""
+    turnover = price * quantity
+    brokerage = min(BROKERAGE_FLAT, turnover * 0.0003)
+    stt = turnover * FUT_STT_PCT if side == "sell" else 0  # STT only on sell
+    exchange = turnover * FUT_EXCHANGE_PCT
+    stamp = turnover * FUT_STAMP_DUTY_PCT if side == "buy" else 0
+    sebi = turnover * FUT_SEBI_PCT
+    gst = (brokerage + exchange) * GST_PCT
+    return brokerage + stt + exchange + stamp + sebi + gst
+
+
+def calc_fut_round_trip_costs(entry_price, exit_price, quantity):
+    """Total round-trip futures costs."""
+    return calc_fut_costs(entry_price, quantity, "buy") + calc_fut_costs(exit_price, quantity, "sell")
+
 # Default strategy params
 DEFAULT_PARAMS = {
     "atr_period": 14,
