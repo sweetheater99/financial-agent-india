@@ -121,7 +121,7 @@ def fetch_watchlist_news(symbols: list[str]) -> dict[str, list[str]]:
 
     result = {}
     try:
-        from duckduckgo_search import DDGS
+        from ddgs import DDGS
     except ImportError:
         log.warning("duckduckgo-search not installed, skipping news")
         return {}
@@ -219,7 +219,7 @@ def fetch_nse_corporate_actions(symbols: list[str]) -> list[str]:
 
     # Method 1: DuckDuckGo search for corporate actions
     try:
-        from duckduckgo_search import DDGS
+        from ddgs import DDGS
         for symbol in symbols:
             try:
                 with DDGS() as ddgs:
@@ -308,7 +308,7 @@ def get_economic_events() -> tuple[list[str], list[str]]:
         events_this_week.extend(cached.get("week", []))
     else:
         try:
-            from duckduckgo_search import DDGS
+            from ddgs import DDGS
             with DDGS() as ddgs:
                 results = list(ddgs.news(
                     "India economy RBI CPI GDP PMI manufacturing data release",
@@ -348,7 +348,7 @@ def fetch_fo_ban_list() -> list[str]:
 
     ban_list = []
     try:
-        from duckduckgo_search import DDGS
+        from ddgs import DDGS
         with DDGS() as ddgs:
             results = list(ddgs.text(
                 f"NSE F&O ban list {today.strftime('%d %B %Y')}",

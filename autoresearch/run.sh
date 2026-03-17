@@ -24,7 +24,7 @@ cd "$PROJECT_DIR"
 # shellcheck source=/dev/null
 source venv/bin/activate
 # shellcheck source=/dev/null
-source ~/.config/env/global.env
+set -a; source ~/.config/env/global.env; set +a
 
 # ── File lock ─────────────────────────────────────────────────────────────────
 exec 9>"$LOCK_FILE"
