@@ -51,6 +51,13 @@ Rules:
 - Stock plans MUST have trigger, target, stoploss as concrete price numbers (not 0) — if you can't find a good stock setup, return an empty stock_plans array instead of stub entries
 - Respond with ONLY a JSON playbook — no commentary before or after
 
+Strategy guidance (from backtested optimization):
+- PRIORITIZE directional trades (breakouts, support bounces, resistance fades) — these are our edge
+- Be AGGRESSIVE with directional setups: if a clear level exists, include it even at medium conviction
+- Iron condors / credit spreads ONLY when VIX >= 18 — condors in low-VIX environments dilute our directional edge
+- Theta plan should be "hold" or "exit" if VIX < 18, only "enter" if VIX >= 18
+- Aim for at least 2-3 actionable directional setups per day — don't default to "no trade" unless truly choppy
+
 Instrument universe: NIFTY, BANKNIFTY, RELIANCE, HDFCBANK, ICICIBANK, TCS, TMPV, BAJFINANCE, SBIN, INFY"""
 
 OPENING_READ_SYSTEM = """You are updating the morning playbook after the first 30 minutes of price discovery.
