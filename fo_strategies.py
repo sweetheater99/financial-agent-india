@@ -28,8 +28,8 @@ FUT_MAX_RISK_PCT = 0.02
 FUT_MAX_HOLD_DAYS = 15
 FUT_SLIPPAGE_PCT = 0.0005
 
-ENTRY_SCORE_THRESHOLD = 3.5
-HIGH_CONVICTION_THRESHOLD = 5.0
+ENTRY_SCORE_THRESHOLD = 2.5
+HIGH_CONVICTION_THRESHOLD = 3.5
 
 
 class BaseStrategy:
@@ -298,8 +298,8 @@ class SpreadStrategy(BaseStrategy):
 # Condor Strategy (Iron Condor)
 # ---------------------------------------------------------------------------
 
-CONDOR_MIN_VIX = 12
-CONDOR_MAX_VIX = 18
+CONDOR_MIN_VIX = 18
+CONDOR_MAX_VIX = 25
 CONDOR_MAX_RISK_PCT = 0.02
 CONDOR_TARGET_PCT = 0.50
 CONDOR_SL_MULTIPLIER = 2.0

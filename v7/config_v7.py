@@ -57,8 +57,8 @@ RISK_LIMITS = {
 # ── Theta Engine Limits ────────────────────────────────────────────────
 THETA_LIMITS = {
     "max_margin_pct": 0.40,
-    "min_vix": 14.0,
-    "max_vix": 20.0,
+    "min_vix": 18.0,
+    "max_vix": 25.0,
     "short_delta": 0.20,
     "wing_gap_nifty": 200,
     "profit_target_pct": 0.50,
@@ -105,7 +105,7 @@ TRAILING = {
 # ── Carry Rules ────────────────────────────────────────────────────────
 CARRY = {
     "min_profit_pct": 1.5,
-    "max_vix": 20.0,
+    "max_vix": 25.0,
     "min_dte": 3,
     "max_hedge_cost": 500.0,
     "never_carry": ["expiry_day", "event_tomorrow", "vix_above_22"],
