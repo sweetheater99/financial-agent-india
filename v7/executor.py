@@ -198,9 +198,8 @@ class Executor:
 
         self._evaluate_triggers(now)
 
-        # Auto-refresh on candle boundaries: if all setups are stale, ask strategist for new ones
-        if is_15min_boundary(now.time()):
-            self._check_stale_setups(now)
+        # Dynamic playbook: refresh when setups exhausted or stale (rate-limited to 1/hour)
+        self._check_stale_setups(now)
 
     def _handle_wind_down(self, now: datetime) -> None:
         """14:30-15:15: Close intraday, carry decisions."""
@@ -908,16 +907,17 @@ class Executor:
     # ── Stale Setup Detection ─────────────────────────────────────────
 
     def _check_stale_setups(self, now: datetime) -> None:
-        """If all active setups are stale (price >1.5% from trigger), ask strategist to refresh.
+        """Dynamic playbook: refresh when all setups are fired/stale.
 
-        Only refreshes once per hour to avoid spamming Claude calls.
-        Skips if we have open positions (focus on managing them).
+        Triggers strategist ad-hoc check-in to generate fresh setups.
+        Rate-limited to once per hour to avoid spamming Claude calls.
         """
         if not self._playbook or not self._strategist:
             return
 
-        # Don't refresh if we have open positions — focus on management
-        if self._positions:
+        # Don't refresh if at max trades for the day
+        trades_left = self._playbook.risk_budget.max_trades_today - self._daily.get("trades_today", 0)
+        if trades_left <= 0:
             return
 
         # Rate limit: once per hour
@@ -933,10 +933,7 @@ class Executor:
 
         active = self._playbook.active_setups()
         if not active:
-            # All setups fired/cancelled, budget may still allow trades
-            trades_left = self._playbook.risk_budget.max_trades_today - self._daily.get("trades_today", 0)
-            if trades_left <= 0:
-                return
+            # All setups fired/cancelled — need fresh setups
             logger.info("STALE: No active setups, %d trade slots left — requesting refresh", trades_left)
         else:
             # Check if all active triggers are far from current price
