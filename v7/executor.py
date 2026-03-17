@@ -4,7 +4,7 @@
 Runs every 3 minutes during market hours. No Claude calls. Pure rule execution.
 Phase-based behavior:
   - Opening Read (9:15-9:45): only manage carried positions
-  - Active Trading (9:45-14:30): full playbook execution on 15-min candle boundaries
+  - Active Trading (9:45-14:30): full playbook execution every tick (3 min)
   - Wind Down (14:30-15:15): close intraday, carry decisions
   - Post-close (15:15-15:30): final SL placement on carried positions
 
@@ -43,7 +43,7 @@ class Executor:
 
     Responsibilities:
     - Fetch LTP, candles, VIX each tick
-    - Evaluate playbook triggers on 15-min candle boundaries (Active Trading only)
+    - Evaluate playbook triggers every tick (Active Trading phase)
     - Manage open positions: SL, breakeven, trailing, target
     - Wind down: close intraday, evaluate carry
     - Detect exception conditions → delegate to Strategist.handle_exception()
@@ -188,7 +188,7 @@ class Executor:
             self._manage_carried_positions_gap(now, carried)
 
     def _handle_active_trading(self, now: datetime) -> None:
-        """9:45-14:30: Check triggers on candle boundaries only."""
+        """9:45-14:30: Check triggers every tick (3 min)."""
         if not self._playbook:
             return
 
@@ -196,10 +196,10 @@ class Executor:
         if self._is_expiry_cutoff(now):
             return
 
-        if is_15min_boundary(now.time()):
-            self._evaluate_triggers(now)
+        self._evaluate_triggers(now)
 
-            # Auto-refresh: if all setups are stale, ask strategist for new ones
+        # Auto-refresh on candle boundaries: if all setups are stale, ask strategist for new ones
+        if is_15min_boundary(now.time()):
             self._check_stale_setups(now)
 
     def _handle_wind_down(self, now: datetime) -> None:
@@ -215,7 +215,7 @@ class Executor:
     # ── Trigger Evaluation ────────────────────────────────────────────
 
     def _evaluate_triggers(self, now: datetime) -> None:
-        """Check all playbook setups in priority order. Only on candle boundaries."""
+        """Check all playbook setups in priority order. Every tick."""
         if not self._playbook:
             return
 
