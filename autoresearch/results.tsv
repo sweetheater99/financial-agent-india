@@ -1,1 +1,17 @@
 timestamp	experiment_num	baseline_score	experiment_score_train	experiment_score_holdout	delta	status	train_trades	holdout_trades	diff_lines	description
+2026-03-16T16:42:38	1	0.0627	0.0347	0.0027	-0.0600	REJECTED	229	53	2	Raise futures score threshold from 3.5 to 4.0
+2026-03-16T16:43:16	2	0.0627	0.0200	0.0627	0.0000	REJECTED	233	58	2	Lower momentum score threshold from 5.0 to 4.5
+2026-03-16T16:43:41	3	0.0627	0.0160	0.0627	0.0000	REJECTED	231	58	4	Tighten condor VIX range from 12-18 to 14-16
+2026-03-16T16:44:07	4	0.0627	0.0000	0.0387	-0.0240	REJECTED	205	72	2	Reduce condor stop-loss multiplier from 2.0 to 1.5
+2026-03-16T16:44:33	5	0.0627	0.0160	0.0627	0.0000	REJECTED	231	58	2	Reduce buildup signal weight from 2.0 to 1.5
+2026-03-16T16:44:58	6	0.0627	0.0173	0.0587	-0.0040	REJECTED	238	58	2	Reduce max holding period from 15 to 10 days
+2026-03-16T16:45:24	7	0.0627	0.0160	0.0627	0.0000	REJECTED	231	58	2	Reduce condor max allocation from 0.15 to 0.10
+2026-03-16T16:45:49	8	0.0627	0.0160	0.0627	0.0000	REJECTED	231	58	4	Tighten RSI thresholds from 70/30 to 75/25
+2026-03-16T16:46:16	9	0.0627	0.0787	0.1918	+0.1292	REJECTED	99	11	2	Disable condor strategy by setting VIX minimum to 50
+2026-03-16T16:46:43	10	0.0627	0.0787	0.1918	+0.1292	REJECTED	99	11	2	Partially restrict condors with VIX minimum 20
+2026-03-16T16:47:12	11	0.0627	0.0693	0.1918	+0.1292	REJECTED	104	11	4	Lower futures threshold to 3.0 and set condor VIX min to 18
+2026-03-16T16:47:40	12	0.0627	0.0773	0.1755	+0.1128	REJECTED	126	15	4	Lower momentum threshold to 3.5 and set condor VIX min to 18
+2026-03-16T16:48:06	13	0.0627	0.0573	0.3132	+0.2505	REJECTED	129	17	4	Lower futures threshold to 2.5 and set condor VIX min to 18
+2026-03-16T16:48:39	14	0.0627	0.0560	0.2938	+0.2312	REJECTED	155	21	6	Combine futures 2.5 + momentum 3.5 + condor VIX 18
+2026-03-16T16:49:08	15	0.0627	0.0400	0.2437	+0.1810	REJECTED	151	21	8	Tighten futures target to 1.25x with winning combo
+2026-03-16T16:49:44	16	0.0627	0.0467	0.2908	+0.2282	REJECTED	155	21	8	Tighten futures stop-loss to 3.0x with winning combo
