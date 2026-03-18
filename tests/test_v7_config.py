@@ -68,3 +68,30 @@ def test_get_conviction_risk_pct():
     assert get_conviction_risk_pct("high") == 2.0
     assert get_conviction_risk_pct("medium") == 1.5
     assert get_conviction_risk_pct("low") == 0.75
+
+
+def test_health_score_config():
+    from v7.config_v7 import HEALTH_SCORE
+    assert HEALTH_SCORE["progress_weight"] == 0.30
+    assert HEALTH_SCORE["momentum_weight"] == 0.25
+    assert HEALTH_SCORE["premium_weight"] == 0.20
+    assert HEALTH_SCORE["volume_weight"] == 0.15
+    assert HEALTH_SCORE["sl_distance_weight"] == 0.10
+    assert HEALTH_SCORE["exit_threshold"] == 30
+    assert HEALTH_SCORE["partial_threshold"] == 50
+    assert HEALTH_SCORE["tighten_threshold"] == 70
+
+
+def test_partial_exit_config():
+    from v7.config_v7 import PARTIAL_EXIT
+    assert PARTIAL_EXIT["first_target_rr"] == 1.0
+    assert PARTIAL_EXIT["first_exit_pct"] == 0.50
+    assert PARTIAL_EXIT["second_target_rr"] == 2.0
+    assert PARTIAL_EXIT["second_exit_pct"] == 0.50
+
+
+def test_profit_ratchet_config():
+    from v7.config_v7 import PROFIT_RATCHET
+    assert PROFIT_RATCHET["breakeven_to_1r"] == 1.2
+    assert PROFIT_RATCHET["1r_to_2r"] == 0.8
+    assert PROFIT_RATCHET["above_2r"] == 0.5

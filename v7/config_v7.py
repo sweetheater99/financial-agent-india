@@ -102,6 +102,34 @@ TRAILING = {
     "breakeven_rr": 1.0,
 }
 
+# ── Position Health Score ─────────────────────────────────────────────
+HEALTH_SCORE = {
+    "progress_weight": 0.30,
+    "momentum_weight": 0.25,
+    "premium_weight": 0.20,
+    "volume_weight": 0.15,
+    "sl_distance_weight": 0.10,
+    "exit_threshold": 30,
+    "partial_threshold": 50,
+    "tighten_threshold": 70,
+    "cooldown_on_exit": True,
+}
+
+# ── Partial Profit Booking ────────────────────────────────────────────
+PARTIAL_EXIT = {
+    "first_target_rr": 1.0,
+    "first_exit_pct": 0.50,
+    "second_target_rr": 2.0,
+    "second_exit_pct": 0.50,
+}
+
+# ── Profit Protection Ratchet (ATR multiplier by profit stage) ────────
+PROFIT_RATCHET = {
+    "breakeven_to_1r": 1.2,
+    "1r_to_2r": 0.8,
+    "above_2r": 0.5,
+}
+
 # ── Carry Rules ────────────────────────────────────────────────────────
 CARRY = {
     "min_profit_pct": 1.5,
