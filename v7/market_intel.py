@@ -553,3 +553,30 @@ def gather_premarket_intel(
         "computed_levels": computed_levels,
         "oi_context": oi_context,
     }
+
+
+# ---------------------------------------------------------------------------
+# Setup Performance Summary
+# ---------------------------------------------------------------------------
+
+
+def setup_performance_summary(edge_tracker) -> str:
+    """Generate per-symbol+setup performance text for checkin prompts."""
+    try:
+        combos = edge_tracker.all_symbol_setup_combos()
+    except Exception:
+        return ""
+    if not combos:
+        return "No setup performance data yet."
+    lines = ["## Recent Setup Performance (rolling, 14-day weighted)"]
+    for key, data in sorted(combos.items(), key=lambda x: x[1]["net_pnl"]):
+        wins = data["wins"]
+        losses = data["trades"] - wins
+        trend = "↑" if data["weighted_win_rate"] > 0.5 else "↓" if data["weighted_win_rate"] < 0.3 else "→"
+        lines.append(
+            f"- {key}: {wins}W/{losses}L | "
+            f"WR: {data['win_rate']:.0%} | "
+            f"Net: ₹{data['net_pnl']:+,.0f} | "
+            f"Trend: {trend}"
+        )
+    return "\n".join(lines)

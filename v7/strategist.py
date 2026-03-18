@@ -207,9 +207,10 @@ def build_checkin_prompt(
     oi_changes: dict,
     current_vix: float,
     checkin_number: int,
+    extra_sections: list[str] | None = None,
 ) -> str:
     """Build check-in prompt (10:30 AM or 1:00 PM)."""
-    return "\n".join([
+    parts = [
         f"Check-in #{checkin_number}. Update the playbook.\n",
         f"## Current Playbook\n{json.dumps(current_playbook, indent=2)}\n",
         f"## Session Status",
@@ -220,8 +221,14 @@ def build_checkin_prompt(
         f"- OI changes: {json.dumps(oi_changes)}",
         f"- Current VIX: {current_vix}",
         "",
-        "Update the playbook JSON. Confirm/modify remaining setups.",
-    ])
+    ]
+    if extra_sections:
+        for section in extra_sections:
+            if section:
+                parts.append(section)
+                parts.append("")
+    parts.append("Update the playbook JSON. Confirm/modify remaining setups.")
+    return "\n".join(parts)
 
 
 def build_exception_prompt(
@@ -834,12 +841,38 @@ class Strategist:
         # Levels tested (simplified — would need candle analysis for full impl)
         levels_tested = []
 
+        # Build extra context sections for enriched checkin
+        extra_sections: list[str] = []
+
+        # Setup performance from edge tracker
+        from v7.market_intel import setup_performance_summary
+        if self._edge_tracker:
+            setup_perf = setup_performance_summary(self._edge_tracker)
+            if setup_perf:
+                extra_sections.append(setup_perf)
+
+        # Open position health scores
+        if positions:
+            health_lines = ["## Open Position Health"]
+            for pos in positions:
+                status = (
+                    "healthy" if pos.health_score > 70
+                    else "warning" if pos.health_score > 40
+                    else "critical"
+                )
+                health_lines.append(
+                    f"- {pos.symbol} {pos.instrument} | Health: {pos.health_score:.0f}/100 ({status}) | "
+                    f"P&L: {pos.unrealized_pnl_pct(pos.entry_price):.1f}%"
+                )
+            extra_sections.append("\n".join(health_lines))
+
         prompt = build_checkin_prompt(
             current_playbook=current.to_dict(),
             daily_pnl=daily_pnl, open_positions=open_positions,
             setups_fired=setups_fired, levels_tested=levels_tested,
             oi_changes=oi_changes, current_vix=current_vix,
             checkin_number=checkin_number,
+            extra_sections=extra_sections,
         )
 
         raw = self._call_claude(prompt, system=CHECKIN_SYSTEM)

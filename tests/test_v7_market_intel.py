@@ -157,3 +157,51 @@ class TestGatherPremarketIntel:
         # Should have earnings event and positive sentiment event
         assert any("earnings" in e.lower() for e in result["events_today"])
         assert any("reliance" in e.lower() for e in result["events_today"])
+
+
+class TestSetupPerformanceSummary:
+    def test_basic(self):
+        from v7.market_intel import setup_performance_summary
+        edge_tracker = MagicMock()
+        edge_tracker.all_symbol_setup_combos.return_value = {
+            "RELIANCE:breakout_long": {
+                "trades": 4, "wins": 0, "win_rate": 0.0,
+                "net_pnl": -4550, "weighted_win_rate": 0.0,
+            },
+            "SBIN:breakout_short": {
+                "trades": 1, "wins": 1, "win_rate": 1.0,
+                "net_pnl": 675, "weighted_win_rate": 1.0,
+            },
+        }
+        text = setup_performance_summary(edge_tracker)
+        assert "RELIANCE:breakout_long" in text
+        assert "0W/4L" in text
+        assert "SBIN:breakout_short" in text
+        assert "1W/0L" in text
+
+    def test_empty_combos(self):
+        from v7.market_intel import setup_performance_summary
+        edge_tracker = MagicMock()
+        edge_tracker.all_symbol_setup_combos.return_value = {}
+        text = setup_performance_summary(edge_tracker)
+        assert "No setup performance data yet." in text
+
+    def test_exception_returns_empty_string(self):
+        from v7.market_intel import setup_performance_summary
+        edge_tracker = MagicMock()
+        edge_tracker.all_symbol_setup_combos.side_effect = Exception("boom")
+        text = setup_performance_summary(edge_tracker)
+        assert text == ""
+
+    def test_trend_arrows(self):
+        from v7.market_intel import setup_performance_summary
+        edge_tracker = MagicMock()
+        edge_tracker.all_symbol_setup_combos.return_value = {
+            "A:x": {"trades": 1, "wins": 1, "win_rate": 1.0, "net_pnl": 100, "weighted_win_rate": 0.8},
+            "B:y": {"trades": 1, "wins": 0, "win_rate": 0.0, "net_pnl": -100, "weighted_win_rate": 0.1},
+            "C:z": {"trades": 2, "wins": 1, "win_rate": 0.5, "net_pnl": 0, "weighted_win_rate": 0.4},
+        }
+        text = setup_performance_summary(edge_tracker)
+        assert "↑" in text
+        assert "↓" in text
+        assert "→" in text
