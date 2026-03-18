@@ -137,3 +137,91 @@ def test_edge_summary_for_prompt(tmp_tracker, sample_trade):
     summary = tmp_tracker.summary_for_prompt()
     assert "momentum" in summary
     assert "NIFTY" in summary
+
+
+def test_symbol_setup_performance(tmp_path):
+    tracker = EdgeTracker(data_dir=tmp_path)
+
+    # 4 RELIANCE breakout_long losses
+    for i in range(4):
+        t = TradeResult(
+            symbol="RELIANCE", instrument="RELIANCE CE",
+            direction="bullish", entry_price=100.0, exit_price=70.0,
+            quantity=50, entry_date=date(2026, 3, 10), exit_date=date(2026, 3, 10),
+            exit_reason="stoploss", pnl=-1500.0, pnl_pct=-30.0, costs=80.0,
+            setup_id=f"R{i}", setup_type=SetupType.BREAKOUT_LONG,
+        )
+        tracker.record(t, strategy="momentum", time_bucket="9:45-11:00")
+
+    # 1 SBIN breakout_short win
+    t_sbin = TradeResult(
+        symbol="SBIN", instrument="SBIN PE",
+        direction="bearish", entry_price=100.0, exit_price=130.0,
+        quantity=100, entry_date=date(2026, 3, 10), exit_date=date(2026, 3, 10),
+        exit_reason="target", pnl=3000.0, pnl_pct=30.0, costs=80.0,
+        setup_id="S1", setup_type=SetupType.BREAKOUT_SHORT,
+    )
+    tracker.record(t_sbin, strategy="momentum", time_bucket="11:00-13:00")
+
+    # RELIANCE:breakout_long — 4 trades, 0 wins, negative P&L
+    perf_rel = tracker.symbol_setup_performance("RELIANCE", "breakout_long")
+    assert perf_rel["trades"] == 4
+    assert perf_rel["wins"] == 0
+    assert perf_rel["losses"] == 4
+    assert perf_rel["win_rate"] == 0.0
+    assert perf_rel["net_pnl"] < 0
+
+    # SBIN:breakout_short — 1 trade, 1 win
+    perf_sbin = tracker.symbol_setup_performance("SBIN", "breakout_short")
+    assert perf_sbin["trades"] == 1
+    assert perf_sbin["wins"] == 1
+    assert perf_sbin["losses"] == 0
+    assert perf_sbin["win_rate"] == 1.0
+
+    # TCS:breakout_long — no trades
+    perf_tcs = tracker.symbol_setup_performance("TCS", "breakout_long")
+    assert perf_tcs["trades"] == 0
+    assert perf_tcs["wins"] == 0
+    assert perf_tcs["win_rate"] == 0.0
+
+
+def test_symbol_setup_combos_in_get_stats(tmp_path):
+    tracker = EdgeTracker(data_dir=tmp_path)
+
+    t = TradeResult(
+        symbol="RELIANCE", instrument="RELIANCE CE",
+        direction="bullish", entry_price=100.0, exit_price=120.0,
+        quantity=50, entry_date=date(2026, 3, 10), exit_date=date(2026, 3, 10),
+        exit_reason="target", pnl=1000.0, pnl_pct=20.0, costs=80.0,
+        setup_id="R1", setup_type=SetupType.BREAKOUT_LONG,
+    )
+    tracker.record(t, strategy="momentum", time_bucket="9:45-11:00")
+
+    stats = tracker.get_stats()
+    assert "by_symbol_setup" in stats
+    assert "RELIANCE:breakout_long" in stats["by_symbol_setup"]
+    combo = stats["by_symbol_setup"]["RELIANCE:breakout_long"]
+    assert combo["trades"] == 1
+    assert combo["wins"] == 1
+
+
+def test_kill_candidates_lower_threshold(tmp_path):
+    tracker = EdgeTracker(data_dir=tmp_path)
+
+    # Record 12 losing trades for strategy "scalp"
+    for i in range(12):
+        t = TradeResult(
+            symbol="NIFTY", instrument="NIFTY CE",
+            direction="bullish", entry_price=100.0, exit_price=70.0,
+            quantity=75, entry_date=date(2026, 3, 10), exit_date=date(2026, 3, 10),
+            exit_reason="stoploss", pnl=-2250.0, pnl_pct=-30.0, costs=80.0,
+            setup_id=f"NL{i}", setup_type=SetupType.BREAKOUT_LONG,
+        )
+        tracker.record(t, strategy="scalp", time_bucket="9:45-11:00")
+
+    # min_trades=30 → not enough trades, no kill candidates
+    assert tracker.kill_candidates(min_trades=30) == []
+
+    # min_trades=10 → 12 trades with 0% win rate → should be a kill candidate
+    kills = tracker.kill_candidates(min_trades=10)
+    assert "scalp" in kills

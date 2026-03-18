@@ -103,6 +103,7 @@ class EdgeTracker:
                 "by_instrument": {},
                 "by_time": {},
                 "by_setup_type": {},
+                "by_symbol_setup": {},
             }
 
         wins = [t for t in trades if t["is_win"]]
@@ -122,6 +123,7 @@ class EdgeTracker:
             "by_instrument": self._instrument_stats(trades),
             "by_time": self._group_stats(trades, "time_bucket"),
             "by_setup_type": self._group_stats(trades, "setup_type"),
+            "by_symbol_setup": self.all_symbol_setup_combos(),
         }
 
     def _group_stats(self, trades: list[dict], key: str) -> dict:
@@ -164,6 +166,47 @@ class EdgeTracker:
                 "wins": len(wins),
                 "win_rate": len(wins) / len(group) if group else 0.0,
                 "net_pnl": sum(t["pnl"] for t in group),
+                **weighted,
+            }
+        return result
+
+    def symbol_setup_performance(self, symbol: str, setup_type: str) -> dict:
+        """Get performance for a specific symbol + setup_type combo."""
+        matching = [
+            t for t in self._trades
+            if t["symbol"] == symbol and t["setup_type"] == setup_type
+        ]
+        if not matching:
+            return {"trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0, "net_pnl": 0.0}
+
+        wins = [t for t in matching if t["is_win"]]
+        weighted = self._weighted_overall(matching)
+        return {
+            "trades": len(matching),
+            "wins": len(wins),
+            "losses": len(matching) - len(wins),
+            "win_rate": len(wins) / len(matching),
+            "net_pnl": sum(t["pnl"] for t in matching),
+            "avg_pnl": sum(t["pnl"] for t in matching) / len(matching),
+            **weighted,
+        }
+
+    def all_symbol_setup_combos(self) -> dict[str, dict]:
+        """Get performance for all symbol+setup combos (for checkin prompt)."""
+        combos: dict[str, list] = {}
+        for t in self._trades:
+            key = f"{t['symbol']}:{t['setup_type']}"
+            combos.setdefault(key, []).append(t)
+
+        result = {}
+        for key, trades in combos.items():
+            wins = [t for t in trades if t["is_win"]]
+            weighted = self._weighted_overall(trades)
+            result[key] = {
+                "trades": len(trades),
+                "wins": len(wins),
+                "win_rate": len(wins) / len(trades),
+                "net_pnl": sum(t["pnl"] for t in trades),
                 **weighted,
             }
         return result
