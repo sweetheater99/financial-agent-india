@@ -192,3 +192,161 @@ def test_playbook_serialization():
     pb2 = Playbook.from_dict(d)
     assert pb2.date == pb.date
     assert pb2.day_classification == pb.day_classification
+
+
+# ── New Position field tests ────────────────────────────────────────────
+
+
+def _make_position(**kwargs) -> Position:
+    defaults = dict(
+        symbol="NIFTY", instrument="NIFTY CE 24400",
+        direction="bullish", entry_price=100.0,
+        quantity=75, lot_size=75, allocated=7500.0,
+        stoploss=80.0, target=150.0,
+        entry_date=date(2026, 3, 11), setup_id="N1",
+    )
+    defaults.update(kwargs)
+    return Position(**defaults)
+
+
+def test_position_entry_time():
+    """Position accepts an entry_time field."""
+    p = _make_position(entry_time=time(9, 30))
+    assert p.entry_time == time(9, 30)
+
+
+def test_position_entry_time_defaults_none():
+    """entry_time defaults to None when not provided."""
+    p = _make_position()
+    assert p.entry_time is None
+
+
+def test_position_age_minutes():
+    """age_minutes returns elapsed minutes since entry."""
+    p = _make_position(entry_time=time(9, 30))
+    assert p.age_minutes(time(10, 0)) == 30
+    assert p.age_minutes(time(9, 30)) == 0
+
+
+def test_position_age_minutes_no_entry_time():
+    """age_minutes returns 0 when entry_time is None."""
+    p = _make_position()
+    assert p.age_minutes(time(10, 0)) == 0
+
+
+def test_position_age_minutes_negative_clamped():
+    """age_minutes never returns negative values."""
+    p = _make_position(entry_time=time(10, 0))
+    assert p.age_minutes(time(9, 30)) == 0
+
+
+def test_position_premium_health():
+    """premium_health returns ratio of current to entry premium."""
+    p = _make_position(entry_price=100.0)
+    assert p.premium_health(80.0) == pytest.approx(0.8)
+    assert p.premium_health(100.0) == pytest.approx(1.0)
+    assert p.premium_health(150.0) == pytest.approx(1.5)
+
+
+def test_position_premium_health_zero_entry():
+    """premium_health returns 1.0 when entry_price is zero."""
+    p = _make_position(entry_price=0.0, allocated=0.0, stoploss=0.0, target=0.0)
+    assert p.premium_health(50.0) == 1.0
+
+
+def test_position_initial_quantity_auto_set():
+    """initial_quantity is set from quantity when not provided."""
+    p = _make_position(quantity=75)
+    assert p.initial_quantity == 75
+
+
+def test_position_initial_quantity_explicit():
+    """initial_quantity can be explicitly set."""
+    p = _make_position(quantity=75, initial_quantity=150)
+    assert p.initial_quantity == 150
+
+
+def test_position_partial_exit_done_defaults_false():
+    """partial_exit_done defaults to False."""
+    p = _make_position()
+    assert p.partial_exit_done is False
+
+
+def test_position_health_score_defaults_100():
+    """health_score defaults to 100.0."""
+    p = _make_position()
+    assert p.health_score == 100.0
+
+
+def test_position_to_dict_new_fields():
+    """New fields are included in to_dict output."""
+    p = _make_position(
+        entry_time=time(9, 30),
+        initial_quantity=150,
+        partial_exit_done=True,
+        health_score=75.0,
+    )
+    d = p.to_dict()
+    assert d["entry_time"] == "09:30:00"
+    assert d["initial_quantity"] == 150
+    assert d["partial_exit_done"] is True
+    assert d["health_score"] == 75.0
+
+
+def test_position_to_dict_entry_time_none():
+    """entry_time serializes as None when not set."""
+    p = _make_position()
+    d = p.to_dict()
+    assert d["entry_time"] is None
+
+
+def test_position_from_dict_new_fields():
+    """New fields deserialize correctly via from_dict."""
+    d = {
+        "symbol": "NIFTY", "instrument": "NIFTY CE 24400",
+        "direction": "bullish", "entry_price": 100.0,
+        "quantity": 75, "lot_size": 75, "allocated": 7500.0,
+        "stoploss": 80.0, "target": 150.0,
+        "entry_date": "2026-03-11", "setup_id": "N1",
+        "peak_price": 100.0,
+        "entry_time": "09:30:00",
+        "initial_quantity": 150,
+        "partial_exit_done": True,
+        "health_score": 75.0,
+    }
+    p = Position.from_dict(d)
+    assert p.entry_time == time(9, 30)
+    assert p.initial_quantity == 150
+    assert p.partial_exit_done is True
+    assert p.health_score == 75.0
+
+
+def test_position_from_dict_missing_new_fields():
+    """from_dict handles missing new fields with safe defaults."""
+    d = {
+        "symbol": "NIFTY", "instrument": "NIFTY CE 24400",
+        "direction": "bullish", "entry_price": 100.0,
+        "quantity": 75, "lot_size": 75, "allocated": 7500.0,
+        "stoploss": 80.0, "target": 150.0,
+        "entry_date": "2026-03-11", "setup_id": "N1",
+    }
+    p = Position.from_dict(d)
+    assert p.entry_time is None
+    assert p.initial_quantity == 75  # falls back to quantity
+    assert p.partial_exit_done is False
+    assert p.health_score == 100.0
+
+
+def test_position_roundtrip_with_new_fields():
+    """Full roundtrip: new fields survive to_dict -> from_dict."""
+    p = _make_position(
+        entry_time=time(10, 15),
+        initial_quantity=150,
+        partial_exit_done=True,
+        health_score=60.0,
+    )
+    p2 = Position.from_dict(p.to_dict())
+    assert p2.entry_time == p.entry_time
+    assert p2.initial_quantity == p.initial_quantity
+    assert p2.partial_exit_done == p.partial_exit_done
+    assert p2.health_score == p.health_score

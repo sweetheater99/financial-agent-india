@@ -138,10 +138,28 @@ class Position:
     carried: bool = False
     hedge_instrument: str | None = None
     hedge_cost: float = 0.0
+    entry_time: time | None = None
+    initial_quantity: int = 0
+    partial_exit_done: bool = False
+    health_score: float = 100.0
 
     def __post_init__(self):
         if self.peak_price == 0.0:
             self.peak_price = self.entry_price
+        if self.initial_quantity == 0:
+            self.initial_quantity = self.quantity
+
+    def age_minutes(self, current_time: time) -> int:
+        if self.entry_time is None:
+            return 0
+        entry_min = self.entry_time.hour * 60 + self.entry_time.minute
+        current_min = current_time.hour * 60 + current_time.minute
+        return max(0, current_min - entry_min)
+
+    def premium_health(self, current_premium: float) -> float:
+        if self.entry_price <= 0:
+            return 1.0
+        return current_premium / self.entry_price
 
     def unrealized_pnl(self, current_price: float) -> float:
         """P&L for long option positions (both CE and PE buys)."""
@@ -170,6 +188,10 @@ class Position:
             "carried": self.carried,
             "hedge_instrument": self.hedge_instrument,
             "hedge_cost": self.hedge_cost,
+            "entry_time": str(self.entry_time) if self.entry_time else None,
+            "initial_quantity": self.initial_quantity,
+            "partial_exit_done": self.partial_exit_done,
+            "health_score": self.health_score,
         }
 
     @classmethod
@@ -187,6 +209,10 @@ class Position:
             carried=d.get("carried", False),
             hedge_instrument=d.get("hedge_instrument"),
             hedge_cost=d.get("hedge_cost", 0.0),
+            entry_time=time.fromisoformat(d["entry_time"]) if d.get("entry_time") else None,
+            initial_quantity=d.get("initial_quantity", d.get("quantity", 0)),
+            partial_exit_done=d.get("partial_exit_done", False),
+            health_score=d.get("health_score", 100.0),
         )
 
 
