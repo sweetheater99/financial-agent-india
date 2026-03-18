@@ -225,6 +225,9 @@ def cmd_checkin(components: dict, num: int) -> None:
     )
     telegram.send(msg, AlertLevel.LOW)
 
+    # Send portfolio P&L status with each check-in
+    _send_portfolio_status(components)
+
 
 def cmd_tick(components: dict) -> None:
     """Run one executor tick."""
@@ -334,6 +337,9 @@ def cmd_eod(components: dict) -> None:
         day_type_actual=daily.get("actual_day_type", "?"),
     )
     telegram.send(msg, AlertLevel.MEDIUM)
+
+    # Send portfolio P&L status with EOD
+    _send_portfolio_status(components)
 
 
 def cmd_weekly(components: dict) -> None:
@@ -538,6 +544,72 @@ def _apply_level_updates(state, updates: dict) -> None:
             ]
 
     state.save_level_memory(level_memory)
+
+
+def _send_portfolio_status(components: dict) -> None:
+    """Compute and send unrealised + realised P&L to Telegram."""
+    from v7.telegram import format_portfolio_status, AlertLevel
+
+    state = components["state"]
+    telegram = components["telegram"]
+    capital = components["capital"]
+    data_feed = components.get("data_feed")
+
+    positions = state.load_positions()
+
+    # Compute unrealised P&L per position
+    position_details = []
+    total_unrealised = 0.0
+    for pos in positions:
+        ltp = None
+        if data_feed:
+            try:
+                ltp = data_feed.option_ltp(pos.instrument)
+            except Exception:
+                pass
+        if ltp is None:
+            # Can't get LTP — show entry cost as flat
+            position_details.append({
+                "symbol": pos.symbol,
+                "instrument": pos.instrument,
+                "pnl": 0.0,
+                "pnl_pct": 0.0,
+            })
+            continue
+
+        pnl = pos.unrealized_pnl(ltp)
+        pnl_pct = pos.unrealized_pnl_pct(ltp)
+        total_unrealised += pnl
+        position_details.append({
+            "symbol": pos.symbol,
+            "instrument": pos.instrument,
+            "pnl": pnl,
+            "pnl_pct": pnl_pct,
+        })
+
+    # Compute cumulative realised P&L from trade history
+    trade_history_file = components["data_dir"] / "trade_history.json"
+    realised_pnl = 0.0
+    realised_trades = 0
+    if trade_history_file.exists():
+        import json as _json
+        try:
+            trades = _json.loads(trade_history_file.read_text())
+            realised_pnl = sum(t.get("pnl", 0) for t in trades)
+            realised_trades = len(trades)
+        except Exception:
+            pass
+
+    msg = format_portfolio_status(
+        positions=[p.to_dict() for p in positions],
+        unrealised_pnl=total_unrealised,
+        position_details=position_details,
+        realised_pnl=realised_pnl,
+        realised_trades=realised_trades,
+        capital=capital,
+    )
+    telegram.send(msg, AlertLevel.MEDIUM)
+
 
 
 def main(argv: list[str] | None = None) -> None:
