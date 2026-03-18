@@ -177,12 +177,22 @@ def format_trade_exit(
 ) -> str:
     """Format trade exit alert."""
     emoji = "WIN" if result.pnl > 0 else "LOSS"
+
+    # Format exit reason with descriptive text for key reasons
+    reason = result.exit_reason
+    if reason == "health_exit":
+        reason_text = "HEALTH EXIT (position dying — momentum/premium/progress failed)"
+    elif reason == "time_stop":
+        reason_text = "TIME STOP (no progress toward target)"
+    else:
+        reason_text = reason.upper()
+
     return "\n".join([
         f"<b>V7 Exit: {result.symbol}</b> [{emoji}]",
         f"Instrument: {result.instrument}",
         f"Entry: {result.entry_price:,.2f} → Exit: {result.exit_price:,.2f}",
         f"P&amp;L: {result.pnl:+,.0f} ({result.pnl_pct:+.1f}%)",
-        f"Reason: {result.exit_reason}  |  Costs: {result.costs:,.0f}",
+        f"Reason: {reason_text}  |  Costs: {result.costs:,.0f}",
         f"Grade: entry={result.entry_grade} exit={result.exit_grade}",
         "",
         f"Day P&amp;L: {daily_pnl:+,.0f}  |  Open: {open_count}",
