@@ -5,6 +5,9 @@
 # 0 6 * * 2-6 pkill -f "autoresearch/run.sh"; pkill -f "claude.*program.md"
 # 30 10 * * 0 cd ~/financial-agent-india && source venv/bin/activate && python3 autoresearch/cache_data.py
 
+# Ensure claude CLI is on PATH (cron uses minimal PATH)
+export PATH="/usr/local/bin:$PATH"
+
 set -euo pipefail
 
 # ── Variables ─────────────────────────────────────────────────────────────────
