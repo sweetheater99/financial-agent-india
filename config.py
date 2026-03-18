@@ -51,19 +51,13 @@ CLAUDE_CLI_AVAILABLE = shutil.which("claude") is not None
 
 def get_anthropic_client():
     """
-    Create an Anthropic client using the best available auth method.
-    Returns a real Anthropic client if API key is set, otherwise a
-    ClaudeCLIClient wrapper that uses the `claude` CLI (Max subscription).
+    Create an Anthropic client using Claude Code CLI (Max subscription).
+    Always uses CLI — never falls back to paid API credits.
     """
-    if ANTHROPIC_API_KEY:
-        import anthropic
-        return anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
     if CLAUDE_CLI_AVAILABLE:
         return ClaudeCLIClient()
 
-    print("No Anthropic credentials found.")
-    print("Either set ANTHROPIC_API_KEY in .env, or install/login to Claude Code (Max subscription).")
+    print("Claude Code CLI not found. Install and login to Claude Code (Max subscription).")
     sys.exit(1)
 
 

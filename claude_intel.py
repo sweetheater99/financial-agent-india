@@ -93,43 +93,9 @@ def _call_claude_cli(prompt: str) -> str | None:
         return None
 
 
-def _get_client():
-    """Get Anthropic client, returns None if unavailable."""
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        return None
-    try:
-        import anthropic
-        return anthropic.Anthropic(api_key=api_key)
-    except Exception:
-        return None
-
-
 def _call_claude(prompt: str, max_tokens: int = 1024) -> str | None:
-    """Call Claude — prefers CLI (Max subscription, free) over API (paid).
-
-    Priority: Claude Code CLI → Anthropic API (Haiku) → None
-    """
-    # Try Claude Code CLI first (uses Max subscription — no API cost)
-    cli_result = _call_claude_cli(prompt)
-    if cli_result:
-        return cli_result
-
-    # Fallback to Anthropic API (paid)
-    client = _get_client()
-    if not client:
-        return None
-    try:
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=max_tokens,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return response.content[0].text.strip()
-    except Exception as e:
-        logger.warning("Claude API call failed: %s", e)
-        return None
+    """Call Claude via CLI (Max subscription, free). No API fallback."""
+    return _call_claude_cli(prompt)
 
 
 def _parse_json(text: str) -> list | dict | None:
