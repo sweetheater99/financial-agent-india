@@ -221,3 +221,22 @@ def compute_health_score(
         + s_sl * w["sl_distance_weight"]
     )
     return round(_clamp(composite), 1)
+
+
+# ── Class Wrapper ──────────────────────────────────────────────────────
+
+class PositionHealthScorer:
+    """Thin wrapper around compute_health_score for use by executor."""
+
+    def compute(
+        self,
+        pos: Position,
+        underlying_price: float,
+        option_price: float,
+        current_time: time,
+        candles: list[Candle],
+        setup_type: str = "default",
+    ) -> float:
+        return compute_health_score(
+            pos, underlying_price, current_time, candles, option_price, setup_type
+        )

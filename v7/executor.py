@@ -67,6 +67,9 @@ class Executor:
         self._capital = capital
         self._strategist = strategist  # for exception callbacks
 
+        from v7.health_scorer import PositionHealthScorer
+        self._health_scorer = PositionHealthScorer()
+
         # Runtime state — loaded from persistence at start
         self._playbook: Optional[Playbook] = None
         self._positions: list[Position] = []
@@ -465,6 +468,22 @@ class Executor:
                     if pos.sl_order_id:
                         self._update_exchange_sl(pos)
 
+                # Health score check (skip for carried positions)
+                if not pos.carried and option_ltp is not None:
+                    try:
+                        candles = self._data.get_candles(pos.symbol, interval="FIVE_MINUTE", days=1)
+                    except Exception:
+                        candles = []
+                    setup_type = self._get_setup_type(pos.setup_id)
+                    setup_str = setup_type.value if hasattr(setup_type, 'value') else str(setup_type)
+                    health = self._health_scorer.compute(
+                        pos, underlying_ltp, option_ltp,
+                        now.time(), candles, setup_str,
+                    )
+                    if self._apply_health_action(pos, health, underlying_ltp, option_ltp, now):
+                        positions_to_remove.append(pos)
+                        continue
+
         for pos in positions_to_remove:
             self._positions.remove(pos)
 
@@ -537,6 +556,44 @@ class Executor:
         if pos.direction == "bullish":
             return new_sl > pos.stoploss
         return new_sl < pos.stoploss
+
+    def _apply_health_action(self, pos, health, underlying_ltp, option_ltp, now):
+        """Apply graduated action based on health score. Returns True if position was exited."""
+        from v7.config_v7 import HEALTH_SCORE
+        pos.health_score = health
+
+        # Health < exit_threshold -> full exit
+        if health < HEALTH_SCORE["exit_threshold"]:
+            logger.info("HEALTH EXIT: %s health=%.1f < %d", pos.instrument, health, HEALTH_SCORE["exit_threshold"])
+            self._exit_position(pos, option_ltp, "health_exit", now)
+            if HEALTH_SCORE.get("cooldown_on_exit"):
+                cooldown = self._daily.setdefault("cooldown_symbols", [])
+                if pos.symbol not in cooldown:
+                    cooldown.append(pos.symbol)
+            return True
+
+        # Health < partial_threshold -> partial exit if not done
+        if health < HEALTH_SCORE["partial_threshold"] and not pos.partial_exit_done:
+            self._check_partial_exit(pos, underlying_ltp, option_ltp, now)
+
+        # Health < tighten_threshold -> tighten trail to 1.0x ATR
+        if health < HEALTH_SCORE["tighten_threshold"]:
+            try:
+                candles = self._data.get_candles(pos.symbol, interval="FIVE_MINUTE", days=1)
+                if candles and len(candles) >= 14:
+                    atr = self._compute_atr(candles[-14:])
+                    if atr > 0:
+                        tight_distance = 1.0 * atr
+                        if pos.direction == "bullish":
+                            new_sl = pos.peak_price - tight_distance
+                        else:
+                            new_sl = pos.peak_price + tight_distance
+                        if self._is_better_sl(pos, new_sl):
+                            pos.stoploss = new_sl
+                            logger.info("HEALTH TIGHTEN: %s health=%.1f, SL -> %.2f", pos.instrument, health, new_sl)
+            except Exception:
+                pass
+        return False
 
     def _exit_position(self, pos: Position, ltp: float, reason: str, now: datetime) -> None:
         """Execute exit order for a position."""

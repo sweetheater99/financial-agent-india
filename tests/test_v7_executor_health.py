@@ -206,3 +206,92 @@ class TestEntryTimeTracking:
         assert len(ex._positions) == 1
         pos = ex._positions[0]
         assert pos.entry_time == time(10, 30)
+
+
+# ── TestHealthBasedExit ────────────────────────────────────────────
+
+
+class TestHealthBasedExit:
+
+    def test_health_exit_below_threshold(self):
+        """Health < 30 -> full exit."""
+        executor = _make_executor()
+        pos = _make_position()
+        executor._positions = [pos]
+        executor._orders.place_exit_order.return_value = MagicMock(
+            filled=True, fill_price=12.0, order_id="exit_health"
+        )
+        executor._orders.cancel_order = MagicMock()
+        executor._state.append_trade = MagicMock()
+
+        result = executor._apply_health_action(pos, 25.0, 1385.0, 12.0,
+                                                datetime(2026, 3, 18, 13, 0))
+        assert result is True  # position was exited
+        assert "RELIANCE" in executor._daily.get("cooldown_symbols", [])
+
+    def test_health_no_exit_above_threshold(self):
+        """Health > 70 -> no action."""
+        executor = _make_executor()
+        pos = _make_position()
+        result = executor._apply_health_action(pos, 80.0, 1420.0, 16.0,
+                                                datetime(2026, 3, 18, 11, 0))
+        assert result is False
+        executor._orders.place_exit_order.assert_not_called()
+
+    def test_health_partial_exit_below_50(self):
+        """Health between 30 and 50 -> triggers partial exit check."""
+        executor = _make_executor()
+        pos = _make_position()
+        assert pos.partial_exit_done is False
+
+        # Mock partial exit order
+        executor._orders.place_exit_order.return_value = MagicMock(
+            filled=True, fill_price=18.0, order_id="partial"
+        )
+
+        result = executor._apply_health_action(pos, 45.0, 1460.0, 18.0,
+                                                datetime(2026, 3, 18, 12, 0))
+        assert result is False  # not a full exit
+
+    def test_health_tighten_below_70(self):
+        """Health between 50 and 70 -> tighten SL to 1.0x ATR."""
+        executor = _make_executor()
+        pos = _make_position(
+            entry_price=15.0, stoploss=1380.0, peak_price=1430.0,
+        )
+
+        # Mock candles for ATR computation (14 candles with ATR ~10)
+        candles = []
+        for i in range(15):
+            candles.append([i, 1420 + i, 1425 + i, 1415 + i, 1420 + i, 1000])
+        executor._data.get_candles.return_value = candles
+
+        result = executor._apply_health_action(pos, 65.0, 1430.0, 18.0,
+                                                datetime(2026, 3, 18, 12, 0))
+        assert result is False
+        # SL should have been tightened (moved up from 1380)
+        assert pos.stoploss > 1380.0
+
+    def test_health_score_stored_on_position(self):
+        """Health score is stored on the position object."""
+        executor = _make_executor()
+        pos = _make_position()
+        executor._apply_health_action(pos, 72.5, 1420.0, 16.0,
+                                       datetime(2026, 3, 18, 11, 0))
+        assert pos.health_score == 72.5
+
+    def test_health_exit_no_duplicate_cooldown(self):
+        """Repeated health exits don't duplicate cooldown entries."""
+        executor = _make_executor()
+        executor._daily["cooldown_symbols"] = ["RELIANCE"]
+        pos = _make_position()
+        executor._positions = [pos]
+        executor._orders.place_exit_order.return_value = MagicMock(
+            filled=True, fill_price=12.0, order_id="exit_health"
+        )
+        executor._orders.cancel_order = MagicMock()
+        executor._state.append_trade = MagicMock()
+
+        executor._apply_health_action(pos, 20.0, 1385.0, 12.0,
+                                       datetime(2026, 3, 18, 13, 0))
+        assert executor._daily["cooldown_symbols"].count("RELIANCE") == 1
