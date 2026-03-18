@@ -29,6 +29,34 @@ source venv/bin/activate
 # shellcheck source=/dev/null
 set -a; source ~/.config/env/global.env; set +a
 
+# ── Cache staleness check ─────────────────────────────────────────────────
+CACHE_FILE="$PROJECT_DIR/data/backtest_cache.csv"
+if [ -f "$CACHE_FILE" ]; then
+    CACHE_AGE_DAYS=$(( ($(date +%s) - $(stat -c%Y "$CACHE_FILE" 2>/dev/null || stat -f%m "$CACHE_FILE" 2>/dev/null || echo 0)) / 86400 ))
+    if [ "$CACHE_AGE_DAYS" -gt 10 ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARNING: backtest_cache.csv is ${CACHE_AGE_DAYS} days old!"
+        # Send Telegram alert
+        TG_TOKEN="${DEAL_BOT_TOKEN:-$TELEGRAM_BOT_TOKEN}"
+        TG_CHAT="${TELEGRAM_FORUM_CHAT_ID:-$DEAL_BOT_CHAT_ID}"
+        TG_TOPIC="${TELEGRAM_TOPIC_STOCKS}"
+        if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then
+            TMPFILE=$(mktemp)
+            echo "<b>Autoresearch: stale data warning</b>
+backtest_cache.csv is ${CACHE_AGE_DAYS} days old (limit: 10).
+Sunday cache_data.py may have failed. Running inline refresh..." > "$TMPFILE"
+            CURL_ARGS="-d chat_id=${TG_CHAT} -d parse_mode=HTML --data-urlencode text@$TMPFILE"
+            [ -n "$TG_TOPIC" ] && CURL_ARGS="$CURL_ARGS -d message_thread_id=$TG_TOPIC"
+            curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage"                 $CURL_ARGS > /dev/null 2>&1
+            rm -f "$TMPFILE"
+        fi
+        # Try to refresh inline
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Attempting inline cache refresh..."
+        python3 autoresearch/cache_data.py >> "$LOG_FILE" 2>&1 || echo "[$(date '+%Y-%m-%d %H:%M:%S')] Inline refresh failed"
+    fi
+else
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: backtest_cache.csv not found!"
+fi
+
 # ── File lock ─────────────────────────────────────────────────────────────────
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then

@@ -83,6 +83,25 @@ TICK_END=$(date +%s)
 TICK_DURATION=$((TICK_END - TICK_START))
 echo "[TIMING] Tick: ${TICK_DURATION}s (exit $EXIT_CODE)" >> "$LOG"
 
+# Alert on crash (non-zero exit)
+if [ "$EXIT_CODE" -ne 0 ]; then
+    TG_TOKEN="${DEAL_BOT_TOKEN:-$TELEGRAM_BOT_TOKEN}"
+    TG_CHAT="${TELEGRAM_FORUM_CHAT_ID:-$DEAL_BOT_CHAT_ID}"
+    TG_TOPIC="${TELEGRAM_TOPIC_STOCKS}"
+    if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then
+        # Get last 5 lines of log for context
+        ERROR_TAIL=$(tail -5 "$LOG" | head -4)
+        TMPFILE=$(mktemp)
+        echo "<b>V7 TICK CRASHED (exit $EXIT_CODE)</b>
+Duration: ${TICK_DURATION}s
+<pre>${ERROR_TAIL}</pre>" > "$TMPFILE"
+        CURL_ARGS="-d chat_id=${TG_CHAT} -d parse_mode=HTML --data-urlencode text@$TMPFILE"
+        [ -n "$TG_TOPIC" ] && CURL_ARGS="$CURL_ARGS -d message_thread_id=$TG_TOPIC"
+        curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage"             $CURL_ARGS > /dev/null 2>&1
+        rm -f "$TMPFILE"
+    fi
+fi
+
 # Alert if tick took too long (> 120s)
 if [ "$TICK_DURATION" -gt 120 ]; then
     TG_TOKEN="${DEAL_BOT_TOKEN:-$TELEGRAM_BOT_TOKEN}"

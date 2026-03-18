@@ -339,6 +339,9 @@ def cmd_eod(components: dict) -> None:
     )
     telegram.send(msg, AlertLevel.MEDIUM)
 
+    # Rotate trade history if > 200 trades
+    _rotate_trade_history(components["data_dir"])
+
     # Send portfolio P&L status with EOD
     _send_portfolio_status(components)
 
@@ -545,6 +548,33 @@ def _apply_level_updates(state, updates: dict) -> None:
             ]
 
     state.save_level_memory(level_memory)
+
+
+def _rotate_trade_history(data_dir) -> None:
+    """Keep only last 200 trades in trade_history.json. Archive older ones."""
+    import json as _json
+    history_file = data_dir / "trade_history.json"
+    if not history_file.exists():
+        return
+    try:
+        trades = _json.loads(history_file.read_text())
+        if len(trades) <= 200:
+            return
+        # Archive older trades
+        archive_file = data_dir / "trade_history_archive.json"
+        archived = []
+        if archive_file.exists():
+            try:
+                archived = _json.loads(archive_file.read_text())
+            except Exception:
+                pass
+        archived.extend(trades[:-200])
+        archive_file.write_text(_json.dumps(archived, indent=2, default=str))
+        # Keep only last 200
+        history_file.write_text(_json.dumps(trades[-200:], indent=2, default=str))
+    except Exception:
+        pass
+
 
 
 def _send_portfolio_status(components: dict) -> None:
