@@ -335,6 +335,7 @@ def cmd_eod(components: dict) -> None:
         carried_positions=daily.get("carried_positions", []),
         day_type_predicted=playbook.day_classification.value if playbook else "?",
         day_type_actual=daily.get("actual_day_type", "?"),
+        stale_refreshes=daily.get("stale_refreshes", 0),
     )
     telegram.send(msg, AlertLevel.MEDIUM)
 

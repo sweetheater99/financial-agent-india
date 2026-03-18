@@ -226,6 +226,7 @@ def format_eod_summary(
     carried_positions: list[dict],
     day_type_predicted: str,
     day_type_actual: str,
+    stale_refreshes: int = 0,
 ) -> str:
     """Format end-of-day summary."""
     pnl_pct = (total_pnl / capital * 100) if capital > 0 else 0.0
@@ -238,6 +239,7 @@ def format_eod_summary(
         f"<b>Total: {total_pnl:+,.0f} ({pnl_pct:+.1f}%)</b>",
         "",
         f"Day type: predicted {day_type_predicted} / actual {day_type_actual}",
+        f"Playbook refreshes: {stale_refreshes}",
     ]
 
     if carried_positions:

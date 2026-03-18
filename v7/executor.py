@@ -906,11 +906,41 @@ class Executor:
 
     # ── Stale Setup Detection ─────────────────────────────────────────
 
+    def _stale_threshold_pct(self) -> float:
+        """Adaptive stale threshold based on VIX.
+
+        Low VIX (<15): 1.0% — tight triggers, market is calm
+        Normal VIX (15-20): 1.5% — default
+        High VIX (>20): 2.5% — wider threshold, market is volatile
+        """
+        if self._vix <= 0:
+            return 1.5
+        if self._vix < 15:
+            return 1.0
+        if self._vix <= 20:
+            return 1.5
+        return 2.5
+
+    def _stale_cooldown_secs(self) -> int:
+        """Adaptive refresh cooldown.
+
+        First 30 min after open (9:15-9:45): 20 min cooldown (fast moves)
+        Normal hours: 60 min cooldown
+        Last hour (14:30-15:30): 45 min cooldown (wind-down setups)
+        """
+        from datetime import time
+        now_t = datetime.now().time()
+        if now_t < time(9, 45):
+            return 1200   # 20 min
+        if now_t >= time(14, 30):
+            return 2700   # 45 min
+        return 3600       # 60 min
+
     def _check_stale_setups(self, now: datetime) -> None:
         """Dynamic playbook: refresh when all setups are fired/stale.
 
         Triggers strategist ad-hoc check-in to generate fresh setups.
-        Rate-limited to once per hour to avoid spamming Claude calls.
+        Adaptive rate limiting and stale thresholds based on VIX and time of day.
         """
         if not self._playbook or not self._strategist:
             return
@@ -920,21 +950,26 @@ class Executor:
         if trades_left <= 0:
             return
 
-        # Rate limit: once per hour
+        # Adaptive rate limit
+        cooldown = self._stale_cooldown_secs()
         last_refresh = self._daily.get("last_stale_refresh")
         if last_refresh:
             from datetime import datetime as dt
             try:
                 last_dt = dt.fromisoformat(last_refresh)
-                if (now - last_dt).total_seconds() < 3600:
+                if (now - last_dt).total_seconds() < cooldown:
                     return
             except (ValueError, TypeError):
                 pass
 
+        threshold = self._stale_threshold_pct()
+        refresh_count = self._daily.get("stale_refreshes", 0)
+
         active = self._playbook.active_setups()
         if not active:
             # All setups fired/cancelled — need fresh setups
-            logger.info("STALE: No active setups, %d trade slots left — requesting refresh", trades_left)
+            logger.info("STALE: No active setups, %d trade slots left — requesting refresh (#%d)",
+                        trades_left, refresh_count + 1)
         else:
             # Check if all active triggers are far from current price
             all_stale = True
@@ -944,23 +979,42 @@ class Executor:
                     all_stale = False
                     break
                 distance_pct = abs(ltp - s.trigger_level) / ltp * 100
-                if distance_pct < 1.5:
+                if distance_pct < threshold:
                     all_stale = False
                     break
             if not all_stale:
                 return
-            logger.info("STALE: All %d active setups >1.5%% from trigger — requesting refresh", len(active))
+            logger.info("STALE: All %d active setups >%.1f%% from trigger (VIX=%.1f) — requesting refresh (#%d)",
+                        len(active), threshold, self._vix, refresh_count + 1)
 
         # Call strategist checkin for a refresh
         try:
             result = self._strategist.checkin(checkin_number=0)  # 0 = ad-hoc refresh
-            if result.get("plan_changed"):
-                logger.info("STALE REFRESH: Playbook updated — %s", result.get("summary", ""))
-                self._playbook = self._state.load_playbook()  # reload
-                from v7.telegram import TelegramAlerter, AlertLevel
-                tg = TelegramAlerter()
-                tg.send(f"V7 auto-refresh: {result.get('summary', 'playbook updated')}", AlertLevel.LOW)
+            self._daily["stale_refreshes"] = refresh_count + 1
             self._daily["last_stale_refresh"] = now.isoformat()
+            self._state.save_daily_state(self._daily)
+
+            from v7.telegram import TelegramAlerter, AlertLevel
+            tg = TelegramAlerter()
+
+            if result.get("plan_changed"):
+                new_pb = self._state.load_playbook()
+                new_setups = len(new_pb.active_setups()) if new_pb else 0
+                logger.info("STALE REFRESH: Playbook updated — %s (%d new setups)",
+                            result.get("summary", ""), new_setups)
+                self._playbook = new_pb
+                tg.send(
+                    f"V7 auto-refresh #{refresh_count + 1}: {result.get('summary', 'playbook updated')} "
+                    f"({new_setups} setups, VIX {self._vix:.1f}, cooldown {cooldown // 60}min)",
+                    AlertLevel.LOW,
+                )
+            else:
+                logger.info("STALE REFRESH: No new setups generated (refresh #%d)", refresh_count + 1)
+                tg.send(
+                    f"V7 auto-refresh #{refresh_count + 1}: no new setups found "
+                    f"(VIX {self._vix:.1f}, {trades_left} slots left)",
+                    AlertLevel.LOW,
+                )
         except Exception as e:
             logger.warning("Stale refresh failed: %s", e)
 
