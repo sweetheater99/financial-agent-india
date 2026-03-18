@@ -247,6 +247,16 @@ class Executor:
         if not triggered:
             return
 
+        # Concentration guard: max 1 position per symbol
+        if self._has_symbol_concentration(setup.symbol):
+            logger.info("Setup %s: already holding %s — concentration guard", setup.id, setup.symbol)
+            return
+
+        # Cooldown guard: symbol was health-exited today
+        if self._is_symbol_cooled_down(setup.symbol):
+            logger.info("Setup %s: %s cooled down today — skipping", setup.id, setup.symbol)
+            return
+
         # Skip if price already past target (would enter and exit same tick)
         if setup.type in (SetupType.BREAKOUT_SHORT, SetupType.RESISTANCE_FADE):
             if ltp < setup.target:
@@ -371,6 +381,7 @@ class Executor:
             target=setup.target,
             entry_date=now.date(),
             setup_id=setup.id,
+            entry_time=now.time(),
         )
         self._positions.append(pos)
         self._daily["trades_today"] = self._daily.get("trades_today", 0) + 1
@@ -437,6 +448,13 @@ class Executor:
                 # 1:1 R:R → move SL to breakeven (underlying levels)
                 self._check_breakeven(pos, underlying_ltp)
 
+                # Partial profit booking at 1:1 R:R
+                if option_ltp is not None:
+                    self._check_partial_exit(pos, underlying_ltp, option_ltp, now)
+                    if pos.quantity <= 0:
+                        positions_to_remove.append(pos)
+                        continue
+
                 # Trailing stop on underlying
                 trailing_sl = self._compute_trailing_sl(pos, underlying_ltp)
                 if trailing_sl is not None and self._is_better_sl(pos, trailing_sl):
@@ -494,7 +512,8 @@ class Executor:
             if atr <= 0:
                 return None
 
-            trailing_distance = 1.5 * atr
+            multiplier = self._get_trailing_multiplier(pos, ltp)
+            trailing_distance = multiplier * atr
             if pos.direction == "bullish":
                 return pos.peak_price - trailing_distance
             else:
@@ -571,6 +590,152 @@ class Executor:
 
         # Telegram alert on exit
         self._send_exit_alert(pos, exit_price, reason, pnl)
+
+    # ── Partial Profit Booking ─────────────────────────────────────────
+
+    def _check_partial_exit(self, pos: Position, underlying_ltp: float,
+                            option_ltp: float, now: datetime) -> int:
+        """Exit 50% of position at 1:1 R:R on the underlying.
+
+        Returns quantity exited (int). Updates pos.quantity and pos.partial_exit_done.
+        """
+        if pos.partial_exit_done:
+            return 0
+
+        from v7.config_v7 import PARTIAL_EXIT
+        target_rr = PARTIAL_EXIT["first_target_rr"]
+        exit_pct = PARTIAL_EXIT["first_exit_pct"]
+
+        # Estimate entry_underlying from SL/target midpoint (assumes ~1:1 R:R setup)
+        entry_underlying = (pos.stoploss + pos.target) / 2.0
+        risk = abs(entry_underlying - pos.stoploss)
+        if risk <= 0:
+            return 0
+
+        # Check if underlying has reached 1:1 R:R threshold
+        if pos.direction == "bullish":
+            threshold = entry_underlying + target_rr * risk
+            if underlying_ltp < threshold:
+                return 0
+        else:
+            threshold = entry_underlying - target_rr * risk
+            if underlying_ltp > threshold:
+                return 0
+
+        # Calculate exit quantity: 50% rounded to lot_size
+        exit_qty = int(pos.quantity * exit_pct)
+        exit_qty = (exit_qty // pos.lot_size) * pos.lot_size
+        if exit_qty <= 0:
+            # Can't exit less than 1 lot
+            return 0
+
+        # Place partial exit order
+        from v7.order_manager import OrderSide
+        side = OrderSide.SELL if pos.direction == "bullish" else OrderSide.BUY
+        limit_price = option_ltp - 0.50 if side == OrderSide.SELL else option_ltp + 0.50
+
+        result = self._orders.place_exit_order(
+            tradingsymbol=pos.instrument,
+            exchange="NFO",
+            side=side,
+            quantity=exit_qty,
+            limit_price=limit_price,
+            is_sl_exit=False,
+        )
+
+        exit_price = result.fill_price if result.filled else option_ltp
+        pnl = exit_qty * (exit_price - pos.entry_price)
+
+        # Update position
+        pos.quantity -= exit_qty
+        pos.partial_exit_done = True
+
+        # Move SL to breakeven on remaining
+        if pos.direction == "bullish":
+            if pos.stoploss < pos.entry_price:
+                pos.stoploss = pos.entry_price
+        else:
+            if pos.stoploss > pos.entry_price:
+                pos.stoploss = pos.entry_price
+
+        if pos.sl_order_id:
+            self._update_exchange_sl(pos)
+
+        logger.info("PARTIAL EXIT: %s exited %d qty @ %.2f, pnl=%.2f, remaining=%d",
+                     pos.instrument, exit_qty, exit_price, pnl, pos.quantity)
+
+        self._send_partial_exit_alert(pos, exit_qty, exit_price, pnl)
+        return exit_qty
+
+    def _send_partial_exit_alert(self, pos: Position, qty: int, price: float, pnl: float) -> None:
+        """Send Telegram alert for partial profit booking."""
+        try:
+            from v7.telegram import TelegramAlerter, AlertLevel
+            direction = "LONG" if pos.direction == "bullish" else "SHORT"
+            lines = [
+                "<b>V7 PARTIAL EXIT</b>",
+                "",
+                f"<b>{pos.symbol}</b> {direction}",
+                f"Exited {qty} qty @ {price:,.2f}",
+                f"P&amp;L: Rs.{pnl:+,.0f}",
+                f"Remaining: {pos.quantity} qty, SL moved to breakeven",
+            ]
+            tg = TelegramAlerter()
+            tg.send("\n".join(lines), AlertLevel.HIGH)
+        except Exception as e:
+            logger.warning("Partial exit Telegram alert failed: %s", e)
+
+    # ── Profit Protection Ratchet ──────────────────────────────────────
+
+    def _get_trailing_multiplier(self, pos: Position, underlying_ltp: float) -> float:
+        """Get ATR multiplier based on profit stage (R-multiple).
+
+        Returns tighter multiplier as profit grows, locking in more gains.
+        Detects breakeven by checking if SL has been moved to entry_price level.
+        Uses |target - stoploss| as the risk distance once at breakeven.
+        """
+        from v7.config_v7 import TRAILING, PROFIT_RATCHET
+
+        default_mult = TRAILING["atr_multiplier"]
+
+        # Detect breakeven: SL has been moved to entry level
+        if pos.direction == "bullish":
+            at_breakeven = pos.stoploss >= pos.entry_price
+        else:
+            at_breakeven = pos.stoploss <= pos.entry_price
+
+        if not at_breakeven:
+            return default_mult
+
+        # At breakeven: risk = |target - stoploss| (distance from SL to target)
+        risk = abs(pos.target - pos.stoploss)
+        if risk <= 0:
+            return default_mult
+
+        # R-multiple: profit from entry (= current SL at breakeven)
+        if pos.direction == "bullish":
+            profit = underlying_ltp - pos.stoploss
+        else:
+            profit = pos.stoploss - underlying_ltp
+
+        r_multiple = profit / risk if risk > 0 else 0
+
+        if r_multiple >= 2.0:
+            return PROFIT_RATCHET["above_2r"]
+        elif r_multiple > 1.0:
+            return PROFIT_RATCHET["1r_to_2r"]
+        else:
+            return PROFIT_RATCHET["breakeven_to_1r"]
+
+    # ── Concentration Guard ────────────────────────────────────────────
+
+    def _has_symbol_concentration(self, symbol: str) -> bool:
+        """Check if we already hold a position in this symbol."""
+        return any(p.symbol == symbol for p in self._positions)
+
+    def _is_symbol_cooled_down(self, symbol: str) -> bool:
+        """Check if symbol was health-exited today (in cooldown)."""
+        return symbol in self._daily.get("cooldown_symbols", [])
 
     # ── Carried Position Management ───────────────────────────────────
 
