@@ -364,6 +364,8 @@ def evaluate_candidates(
             f"MFI={c.get('mfi', '?')} OBV={c.get('obv_divergence', '?')} "
             f"VWAP={c.get('vwap_deviation', '?')} ADX={c.get('adx', '?')}"
         )
+        if c.get("debate_summary"):
+            candidate_lines.append(f"    DEBATE: {c['debate_summary']}")
 
     prompt = f"""BATCH ENTRY EVALUATION (F&O ONLY — no equity)
 
