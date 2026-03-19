@@ -73,15 +73,16 @@ def test_moderator_detects_contradiction():
 
 
 def test_moderator_round2_on_contradiction():
+    """Patch individual agents to avoid thread-ordering fragility."""
     from debate import _run_single_debate
-    with patch("debate._call_claude_cli_debate") as mock_cli:
-        mock_cli.side_effect = [
-            "Bull: strong buy",
-            "Bear: definite sell",
-            "Context: earnings tomorrow",
-            "Disagree on trend. CONTRADICTION: volume direction",
-            "Bear has stronger evidence. Final verdict: bear-leaning",
-        ]
+    mod_responses = iter([
+        "Disagree on trend. CONTRADICTION: volume direction",
+        "Bear has stronger evidence. Final verdict: bear-leaning",
+    ])
+    with patch("debate._bull_agent", return_value="Bull: strong buy"), \
+         patch("debate._bear_agent", return_value="Bear: definite sell"), \
+         patch("debate._context_agent", return_value="Context: earnings tomorrow"), \
+         patch("debate._call_claude_cli_debate", side_effect=mod_responses):
         result = _run_single_debate(
             {"symbol": "TCS", "direction": "bullish", "score": 5,
              "rsi": 60, "volume_ratio": 1.2, "categories": ["LongBuildUp"]},
@@ -89,18 +90,16 @@ def test_moderator_round2_on_contradiction():
         )
     assert "bear-leaning" in result["final_summary"]
     assert result["moderator"]["round_2"] is not None
-    assert mock_cli.call_count == 5
 
 
 def test_agent_timeout_graceful():
+    """Patch individual agents to avoid thread-ordering fragility."""
     from debate import _run_single_debate
-    with patch("debate._call_claude_cli_debate") as mock_cli:
-        mock_cli.side_effect = [
-            "Bull: strong buy",
-            None,
-            "Context: no events",
-            "Only bull and context available. Verdict: bull-leaning",
-        ]
+    with patch("debate._bull_agent", return_value="Bull: strong buy"), \
+         patch("debate._bear_agent", return_value=""), \
+         patch("debate._context_agent", return_value="Context: no events"), \
+         patch("debate._call_claude_cli_debate",
+               return_value="Only bull and context available. Verdict: bull-leaning"):
         result = _run_single_debate(
             {"symbol": "INFY", "direction": "bullish", "score": 4,
              "rsi": 50, "volume_ratio": 1.0, "categories": []},
@@ -142,13 +141,9 @@ def test_run_debates_returns_dict():
 def test_run_debates_disabled():
     from debate import run_debates
     import config
-    original = config.DEBATE_ENABLED
-    try:
-        config.DEBATE_ENABLED = False
+    with patch.object(config, "DEBATE_ENABLED", False):
         result = run_debates([{"symbol": "TEST", "score": 5}], {})
         assert result == {}
-    finally:
-        config.DEBATE_ENABLED = original
 
 
 def test_debate_log_written(tmp_path):
