@@ -416,6 +416,10 @@ MONTHLY_CONDOR_TARGET_PCT = 0.50    # take profit at 50% premium captured
 MONTHLY_CONDOR_MONTHLY_SL_PCT = 0.04  # 4% monthly SL → stop the condor
 MONTHLY_CONDOR_MAX_RISK_PCT = 0.03  # max 3% of capital at risk
 
+# V10: Debate system — adversarial multi-agent entry analysis
+DEBATE_ENABLED = True
+DEBATE_TOP_N = 3                         # debate on top N candidates only
+
 # V9: Dynamic hedge tightening (Reyaansh)
 HEDGE_TIGHTEN_ENABLED = True
 HEDGE_TIGHTEN_THRESHOLD_PCT = 0.40  # tighten when hedge drops to 40% of entry premium
