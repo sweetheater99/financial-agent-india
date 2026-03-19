@@ -2687,6 +2687,22 @@ def open_positions(smart_api, portfolio: dict, candidates: list[dict],
     except Exception as _e:
         logger.debug("V4 global intel signals failed: %s", _e)
 
+    # --- V10: Debate system — adversarial multi-agent analysis ---
+    if getattr(cfg_module, "DEBATE_ENABLED", False) and quality_filtered:
+        try:
+            from debate import run_debates
+            debate_caches = {"macro": macro or {}, "vix_history": []}
+            debate_results = run_debates(quality_filtered, debate_caches)
+            if debate_results:
+                logger.info("Debate completed for %d candidates", len(debate_results))
+                for sym, summary in debate_results.items():
+                    for c in quality_filtered:
+                        if c["symbol"] == sym:
+                            c["debate_summary"] = summary
+                            break
+        except Exception as e:
+            logger.warning("Debate system error: %s — continuing without debate", e)
+
     # --- Claude Intelligence: evaluate candidates before trading ---
     try:
         from claude_intel import evaluate_candidates
