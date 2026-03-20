@@ -87,12 +87,14 @@ class OrderManager:
         quantity: int,
         limit_price: float,
         timeout_seconds: int = ENTRY_TIMEOUT,
+        product: str = "MIS",
     ) -> OrderResult:
         """Place limit entry order. If not filled within timeout, modify to market.
 
         Args:
             limit_price: bid+₹0.50 for buy, ask-₹0.50 for sell (caller computes)
             timeout_seconds: seconds to wait before converting to market (default 30)
+            product: "MIS" for intraday, "NRML" for multi-day (theta condors)
         """
         if self.dry_run:
             return self._dry_order(limit_price, quantity, prefix="DRY_")
@@ -107,7 +109,7 @@ class OrderManager:
                 tradingsymbol=tradingsymbol,
                 transaction_type=_SIDE_MAP[side],
                 quantity=quantity,
-                product="MIS",  # intraday
+                product=product,
                 order_type="LIMIT",
                 price=limit_price,
             )
@@ -183,6 +185,7 @@ class OrderManager:
         limit_price: float,
         is_sl_exit: bool = False,
         timeout_seconds: Optional[int] = None,
+        product: str = "MIS",
     ) -> OrderResult:
         """Place limit exit order. SL exits use 15s timeout; target exits are passive.
 
@@ -205,7 +208,7 @@ class OrderManager:
                 tradingsymbol=tradingsymbol,
                 transaction_type=_SIDE_MAP[side],
                 quantity=quantity,
-                product="MIS",
+                product=product,
                 order_type="LIMIT",
                 price=limit_price,
             )

@@ -305,6 +305,7 @@ class ThetaEngine:
                 side=side,
                 quantity=leg.quantity,
                 limit_price=leg.premium + (2.0 if side == OrderSide.BUY else -2.0),
+                product="NRML",  # multi-day position, not intraday MIS
             )
             if result.filled:
                 leg.order_id = result.order_id or ""
@@ -453,8 +454,10 @@ class ThetaEngine:
                 side=side,
                 quantity=leg.quantity,
                 limit_price=leg.current_price or leg.premium,
+                product="NRML",
             )
 
+        self._send_theta_alert("EXIT", f"Reason: {reason}")
         self._condor = None
         self._state.save_theta_state(None)
 

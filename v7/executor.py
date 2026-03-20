@@ -202,7 +202,7 @@ class Executor:
         if not self._playbook:
             return
 
-        # Expiry day cutoff: no new positions after 1:00 PM on Thursday
+        # Expiry day cutoff: no new positions after 1:00 PM on Tuesday (expiry day)
         if self._is_expiry_cutoff(now):
             return
 
