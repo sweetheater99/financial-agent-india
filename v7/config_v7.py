@@ -90,7 +90,7 @@ STRIKE_FILTERS = {
     "max_bid_ask_banknifty": 5.0,
     "max_bid_ask_stock": 3.0,
     "min_premium": 10.0,
-    "directional_delta_range": (0.25, 0.50),
+    "directional_delta_range": (0.30, 0.45),  # Tighter range = better risk/reward
     "spread_sell_delta": 0.25,
     "hedge_delta": 0.10,
 }
@@ -118,7 +118,7 @@ HEALTH_SCORE = {
 # ── Partial Profit Booking ────────────────────────────────────────────
 PARTIAL_EXIT = {
     "first_target_rr": 1.0,
-    "first_exit_pct": 0.50,
+    "first_exit_pct": 0.33,  # Keep 67% for big moves (Mar 16 NIFTY PE went 85%)
     "second_target_rr": 2.0,
     "second_exit_pct": 0.50,
 }
@@ -165,4 +165,12 @@ PREMIUM_FILTER = {
 TIME_STOP = {
     "min_age_minutes": 90,     # Don't cut before 90 min
     "min_premium_drop_pct": 15.0,  # Only cut if premium dropped 15%+
+}
+
+# ── Daily Profit Target ───────────────────────────────────────────────
+# Stop directional trading when daily P&L exceeds target
+# Theta engine continues (it benefits from sitting)
+DAILY_PROFIT_TARGET = {
+    "target_pct": 2.0,  # Stop after 2% daily gain (Rs 6,000 on 3L)
+    "protect_mode": True,  # Switch to protect-only when target hit
 }

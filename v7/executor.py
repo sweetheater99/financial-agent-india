@@ -305,6 +305,14 @@ class Executor:
             logger.info("Setup %s: max 2 directional buys reached today — skipping", setup.id)
             return
 
+        # Daily profit target — stop directional when ahead
+        from v7.config_v7 import DAILY_PROFIT_TARGET
+        daily_pnl = self._daily.get("daily_pnl", 0)
+        target_amount = self._capital * (DAILY_PROFIT_TARGET["target_pct"] / 100)
+        if daily_pnl >= target_amount and self._is_directional_buy(setup):
+            logger.info("Setup %s: daily P&L %.0f >= target %.0f — protecting gains", setup.id, daily_pnl, target_amount)
+            return
+
         # Risk budget check
         risk_amount = self._capital * (setup.max_risk_pct / 100)
         current_risk = sum(p.risk_amount() for p in self._positions)
