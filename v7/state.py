@@ -92,6 +92,29 @@ class StateManager:
     def save_daily_state(self, state: dict) -> None:
         self._write_json("daily_state.json", state)
 
+
+    # ── Theta Engine State ────────────────────────────────────────────
+
+    def save_theta_state(self, state: dict | None) -> None:
+        """Persist theta engine condor state."""
+        import json
+        path = Path(self._state_dir) / "theta_state.json"
+        if state is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_text(json.dumps(state, indent=2, default=str))
+
+    def load_theta_state(self) -> dict | None:
+        """Load persisted theta engine condor state."""
+        import json
+        path = Path(self._state_dir) / "theta_state.json"
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text())
+        except (json.JSONDecodeError, Exception):
+            return None
+
     def load_daily_state(self, today: date | None = None) -> dict:
         today = today or date.today()
         data = self._read_json("daily_state.json")

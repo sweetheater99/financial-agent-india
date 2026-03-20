@@ -275,7 +275,55 @@ class ThetaEngine:
             net_credit=net_credit,
         )
 
+        # Place 4-leg orders via Kite (NRML product for multi-day)
+        from v7.order_manager import OrderSide
+        legs_to_place = [
+            (self._condor.short_ce, OrderSide.SELL, "sell short CE"),
+            (self._condor.long_ce, OrderSide.BUY, "buy long CE"),
+            (self._condor.short_pe, OrderSide.SELL, "sell short PE"),
+            (self._condor.long_pe, OrderSide.BUY, "buy long PE"),
+        ]
+        all_filled = True
+        for leg, side, desc in legs_to_place:
+            result = self._orders.place_entry_order(
+                tradingsymbol=leg.tradingsymbol,
+                exchange="NFO",
+                side=side,
+                quantity=leg.quantity,
+                limit_price=leg.premium + (2.0 if side == OrderSide.BUY else -2.0),
+            )
+            if result.filled:
+                leg.order_id = result.order_id or ""
+                logger.info("THETA ORDER: %s %s @ %.2f filled", desc, leg.tradingsymbol, result.fill_price)
+            else:
+                logger.warning("THETA ORDER FAILED: %s %s", desc, leg.tradingsymbol)
+                all_filled = False
+
+        if not all_filled:
+            logger.error("THETA: Not all legs filled — manual intervention needed!")
+            # TODO: unwind partial fills
+
+        # Send Telegram alert
+        self._send_theta_alert("ENTRY", f"Iron Condor {short_pe_strike}/{short_ce_strike} wings {WING_WIDTH}pt credit={net_credit:.1f}")
+
         self._state.save_theta_state(self._condor.to_dict())
+
+    def _send_theta_alert(self, action: str, details: str) -> None:
+        """Send Telegram alert for theta engine events."""
+        try:
+            import os, requests
+            token = os.environ.get("DEAL_BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
+            chat = os.environ.get("TELEGRAM_FORUM_CHAT_ID") or os.environ.get("DEAL_BOT_CHAT_ID")
+            topic = os.environ.get("TELEGRAM_TOPIC_STOCKS")
+            if not token or not chat:
+                return
+            msg = "<b>V7 THETA " + action + "</b>\n\n" + details + "\nVIX: " + str(round(self._data.get_vix() or 0, 1))
+            data = {"chat_id": chat, "parse_mode": "HTML", "text": msg}
+            if topic:
+                data["message_thread_id"] = topic
+            requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data=data, timeout=5)
+        except Exception as e:
+            logger.warning("Theta Telegram alert failed: %s", e)
 
     # ── Daily Management ──────────────────────────────────────────────
 

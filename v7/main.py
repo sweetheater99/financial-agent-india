@@ -103,8 +103,8 @@ def _init_components(paper: bool = False) -> dict:
     try:
         from v7.level_memory import LevelMemory
         components["level_memory"] = LevelMemory(state_dir=data_dir)
-    except (ImportError, Exception):
-        pass
+    except (ImportError, Exception) as e:
+        import logging; logging.getLogger("v7.main").warning("Component init failed: %s", e)
 
     try:
         from v7.order_manager import OrderManager
@@ -121,8 +121,8 @@ def _init_components(paper: bool = False) -> dict:
             edge_tracker=edge_tracker,
             risk_engine=risk_engine,
         )
-    except (ImportError, Exception):
-        pass
+    except (ImportError, Exception) as e:
+        import logging; logging.getLogger("v7.main").warning("Component init failed: %s", e)
 
     try:
         from v7.executor import Executor
@@ -135,8 +135,8 @@ def _init_components(paper: bool = False) -> dict:
             capital=capital,
             strategist=components.get("strategist"),
         )
-    except (ImportError, Exception):
-        pass
+    except (ImportError, Exception) as e:
+        import logging; logging.getLogger("v7.main").warning("Component init failed: %s", e)
 
     try:
         from v7.theta_engine import ThetaEngine
@@ -149,8 +149,8 @@ def _init_components(paper: bool = False) -> dict:
             margin_tracker=margin,
             capital=capital,
         )
-    except (ImportError, Exception):
-        pass
+    except (ImportError, Exception) as e:
+        import logging; logging.getLogger("v7.main").warning("Component init failed: %s", e)
 
     # Wire theta engine into executor so it ticks every cycle
     if "executor" in components and "theta_engine" in components:
