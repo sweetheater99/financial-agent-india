@@ -51,12 +51,23 @@ Rules:
 - Stock plans MUST have trigger, target, stoploss as concrete price numbers (not 0) — if you can't find a good stock setup, return an empty stock_plans array instead of stub entries
 - Respond with ONLY a JSON playbook — no commentary before or after
 
-Strategy guidance (from backtested optimization):
-- PRIORITIZE directional trades (breakouts, support bounces, resistance fades) — these are our edge
-- Be AGGRESSIVE with directional setups: if a clear level exists, include it even at medium conviction
-- Iron condors / credit spreads ONLY when VIX >= 18 — condors in low-VIX environments dilute our directional edge
-- Theta plan should be "hold" or "exit" if VIX < 18, only "enter" if VIX >= 18
-- Aim for at least 2-3 actionable directional setups per day — don't default to "no trade" unless truly choppy
+Strategy guidance (from backtested optimization + trade review):
+
+SETUP TYPE BY DAY CLASSIFICATION:
+- LIKELY_TREND_UP/DOWN → breakout_long or breakout_short ONLY. This is where breakouts work.
+- LIKELY_RANGE / UNCERTAIN → PREFER support_bounce and resistance_fade. Breakouts get chopped in range days.
+  If you can't identify clear S/R levels, declare "no trade" rather than forcing breakout entries.
+- EVENT_DAY → only low-conviction setups or theta if VIX >= 18.
+
+CRITICAL RULES:
+- MAX 2 directional option buys per day. Remaining slots should be credit spreads or skip.
+- NO NEW directional entries after 1:00 PM — theta decay in last 2.5h kills premium buyers.
+  Afternoon entries MUST be credit spreads/condors or nothing.
+- NEVER repeat a losing symbol same day. If RELIANCE lost in the morning, don't set up RELIANCE again.
+- Iron condors / credit spreads when VIX >= 18 — this is a REAL edge, not filler. Theta plan = "enter" when VIX >= 18.
+- Premium sweet spot: ₹15-80. Below ₹15 = slippage death. Above ₹80 = too much capital risk.
+- Grade A entries only: trigger + volume confirmation. Don't force B-grade entries to fill your setup slots.
+- If a symbol has been losing for 2+ consecutive days, DROP IT from the watchlist for the day.
 
 Instrument universe: NIFTY, BANKNIFTY, RELIANCE, HDFCBANK, ICICIBANK, TCS, TMPV, BAJFINANCE, SBIN, INFY"""
 

@@ -275,6 +275,16 @@ class Executor:
             logger.info("Setup %s: %s cooled down today — skipping", setup.id, setup.symbol)
             return
 
+        # S1: Same-symbol repeat blocker — don't re-enter a symbol that lost today
+        if self._symbol_lost_today(setup.symbol):
+            logger.info("Setup %s: %s already lost today — repeat blocker", setup.id, setup.symbol)
+            return
+
+        # S2: Afternoon entry guard — no new option buys after 1:00 PM
+        if self._is_afternoon_cutoff(now, setup):
+            logger.info("Setup %s: after 1PM cutoff for directional buys — skipping", setup.id)
+            return
+
         # Skip if price already past target (would enter and exit same tick)
         if setup.type in (SetupType.BREAKOUT_SHORT, SetupType.RESISTANCE_FADE):
             if ltp < setup.target:
@@ -286,6 +296,11 @@ class Executor:
                 logger.info("Setup %s: price %.2f already past target %.2f — skipping stale trigger",
                             setup.id, ltp, setup.target)
                 return
+
+        # S6: Max 2 directional option buys per day
+        if self._is_directional_buy(setup) and self._daily.get("directional_buys_today", 0) >= 2:
+            logger.info("Setup %s: max 2 directional buys reached today — skipping", setup.id)
+            return
 
         # Risk budget check
         risk_amount = self._capital * (setup.max_risk_pct / 100)
@@ -368,6 +383,17 @@ class Executor:
         logger.info("Setup %s: selected %s (strike=%s, delta=%.2f, premium=%.2f)",
                      setup.id, tradingsymbol, selected["strike"], selected["delta"], option_premium)
 
+        # S4: Premium filter — avoid too cheap (slippage) or too expensive (capital risk)
+        from v7.config_v7 import PREMIUM_FILTER
+        if option_premium < PREMIUM_FILTER["min_premium"]:
+            logger.info("Setup %s: premium %.2f < min %.0f — skipping", setup.id, option_premium, PREMIUM_FILTER["min_premium"])
+            setup.fired = False
+            return
+        if option_premium > PREMIUM_FILTER["max_premium"]:
+            logger.info("Setup %s: premium %.2f > max %.0f — skipping", setup.id, option_premium, PREMIUM_FILTER["max_premium"])
+            setup.fired = False
+            return
+
         # Limit price: option premium + small buffer
         limit_price = option_premium + 2.0
         quantity = actual_lot_size
@@ -403,6 +429,8 @@ class Executor:
         )
         self._positions.append(pos)
         self._daily["trades_today"] = self._daily.get("trades_today", 0) + 1
+        if self._is_directional_buy(setup):
+            self._daily["directional_buys_today"] = self._daily.get("directional_buys_today", 0) + 1
 
         logger.info("ENTERED: %s %s @ %.2f, SL=%.2f, TGT=%.2f",
                      setup.id, tradingsymbol, result.fill_price, setup.stoploss, setup.target)
@@ -1230,6 +1258,31 @@ class Executor:
             self._daily["last_stale_refresh"] = now.isoformat()
         except Exception as e:
             logger.warning("Stale refresh failed: %s", e)
+
+    # ── Structural Guards (S1-S6) ─────────────────────────────────────
+
+    def _symbol_lost_today(self, symbol: str) -> bool:
+        """S1: Check if symbol had a losing trade today."""
+        closed = self._daily.get("closed_trades", [])
+        return any(t.get("symbol") == symbol and t.get("pnl", 0) < 0 for t in closed)
+
+    def _is_afternoon_cutoff(self, now, setup: Setup) -> bool:
+        """S2: No new directional option buys after 1:00 PM.
+        Theta decay accelerates in the last 2.5h — only allow spreads or skip.
+        """
+        if now.hour < 13:
+            return False
+        # Allow spread/condor entries in afternoon
+        if setup.type in (SetupType.CREDIT_SPREAD_BULL, SetupType.CREDIT_SPREAD_BEAR, SetupType.IRON_CONDOR):
+            return False
+        return True
+
+    def _is_directional_buy(self, setup: Setup) -> bool:
+        """S6: Check if setup is a directional option buy (not a spread/condor)."""
+        return setup.type in (
+            SetupType.BREAKOUT_LONG, SetupType.BREAKOUT_SHORT,
+            SetupType.SUPPORT_BOUNCE, SetupType.RESISTANCE_FADE,
+        )
 
     # ── Helpers ───────────────────────────────────────────────────────
 

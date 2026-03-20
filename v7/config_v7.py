@@ -154,3 +154,9 @@ def is_15min_boundary(t: time) -> bool:
 def get_conviction_risk_pct(conviction: str) -> float:
     """Get risk % per trade for a given conviction level."""
     return {"high": 2.0, "medium": 1.5, "low": 0.75}.get(conviction, 1.5)
+
+# ── S4: Premium Filter ────────────────────────────────────────────────
+PREMIUM_FILTER = {
+    "min_premium": 15.0,   # Below this: bid-ask slippage kills you
+    "max_premium": 80.0,   # Above this: too much capital at risk per lot
+}
