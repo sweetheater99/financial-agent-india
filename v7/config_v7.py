@@ -160,3 +160,9 @@ PREMIUM_FILTER = {
     "min_premium": 15.0,   # Below this: bid-ask slippage kills you
     "max_premium": 80.0,   # Above this: too much capital at risk per lot
 }
+
+# ── S7: Soft Time Stop ────────────────────────────────────────────────
+TIME_STOP = {
+    "min_age_minutes": 90,     # Don't cut before 90 min
+    "min_premium_drop_pct": 15.0,  # Only cut if premium dropped 15%+
+}

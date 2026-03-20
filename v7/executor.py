@@ -511,6 +511,16 @@ class Executor:
                     if pos.sl_order_id:
                         self._update_exchange_sl(pos)
 
+                # S7: Soft time stop — cut bleeders after 90 min
+                if not pos.carried and option_ltp is not None:
+                    if self._should_time_stop(pos, option_ltp, now):
+                        logger.info("TIME STOP: %s age=%dmin premium_drop=%.1f%%",
+                                    pos.instrument, pos.age_minutes(now.time()),
+                                    (1 - option_ltp / pos.entry_price) * 100)
+                        self._exit_position(pos, option_ltp, "time_stop", now)
+                        positions_to_remove.append(pos)
+                        continue
+
                 # Health score check (skip for carried positions)
                 if not pos.carried and option_ltp is not None:
                     try:
@@ -1258,6 +1268,41 @@ class Executor:
             self._daily["last_stale_refresh"] = now.isoformat()
         except Exception as e:
             logger.warning("Stale refresh failed: %s", e)
+
+    # ── S7: Soft Time Stop ────────────────────────────────────────────
+
+    def _should_time_stop(self, pos, option_ltp: float, now) -> bool:
+        """Exit directional buys that are bleeding after 90 minutes.
+
+        Rules:
+        - Only applies to directional option buys (not spreads/condors)
+        - Must be open >= 90 minutes
+        - Premium must be down >= 15% from entry
+        - Skip if position is already at breakeven SL (trade is working)
+        """
+        from v7.config_v7 import TIME_STOP
+        min_age = TIME_STOP["min_age_minutes"]
+        min_drop = TIME_STOP["min_premium_drop_pct"]
+
+        age = pos.age_minutes(now.time())
+        if age < min_age:
+            return False
+
+        # Skip carried positions and spreads
+        if pos.carried:
+            return False
+
+        # Skip if at breakeven (trade moved in our favor at some point)
+        if pos.direction == "bullish" and pos.stoploss >= pos.entry_price:
+            return False
+        if pos.direction == "bearish" and pos.stoploss <= pos.entry_price:
+            return False
+
+        # Check premium drop
+        if pos.entry_price <= 0:
+            return False
+        drop_pct = (1 - option_ltp / pos.entry_price) * 100
+        return drop_pct >= min_drop
 
     # ── Structural Guards (S1-S6) ─────────────────────────────────────
 
