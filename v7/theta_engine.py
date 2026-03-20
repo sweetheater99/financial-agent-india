@@ -192,7 +192,7 @@ class ThetaEngine:
             return False
 
         # Margin check: condor shouldn't push margin above 40%
-        current_margin = self._margin.current_utilization_pct()
+        current_margin = self._margin.utilization_pct()
         if current_margin > THETA_MAX_MARGIN_PCT:
             return False
 
@@ -420,8 +420,12 @@ class ThetaEngine:
     # ── Time Management ───────────────────────────────────────────────
 
     def _should_close_for_time(self, today: date) -> bool:
-        """Close by Monday EOD or never hold to Tuesday (expiry day)."""
+        """Close by Monday EOD or never hold to Tuesday (expiry day).
+        But don't close on the same day we entered."""
         if self._condor is None:
+            return False
+        # Never close on entry day
+        if self._condor.entry_date == today:
             return False
         # Tuesday = expiry day → must close
         if today.weekday() == 1:  # Tuesday
@@ -517,12 +521,15 @@ class ThetaEngine:
         """
         # Get ATM price (middle of chain)
         spot = None
+        best_diff = float("inf")
         for entry in chain:
             ce = entry.get("CE")
             pe = entry.get("PE")
             if ce and pe and ce.get("ltp", 0) > 0 and pe.get("ltp", 0) > 0:
                 # ATM is where CE and PE premiums are closest
-                if abs(ce["ltp"] - pe["ltp"]) < (spot or float("inf")):
+                diff = abs(ce["ltp"] - pe["ltp"])
+                if diff < best_diff:
+                    best_diff = diff
                     spot = entry["strikePrice"]
         
         if spot is None:

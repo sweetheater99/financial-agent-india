@@ -283,6 +283,14 @@ class Executor:
             logger.info("Setup %s: %s already lost today — repeat blocker", setup.id, setup.symbol)
             return
 
+        # Playbook symbol/type bans (parsed from no_trade_conditions)
+        if setup.symbol in self._daily.get("banned_symbols", []):
+            logger.info("Setup %s: %s banned by playbook", setup.id, setup.symbol)
+            return
+        if setup.type.value in self._daily.get("banned_types", []):
+            logger.info("Setup %s: %s banned by playbook", setup.id, setup.type.value)
+            return
+
         # S2: Afternoon entry guard — no new option buys after 1:00 PM
         if self._is_afternoon_cutoff(now, setup):
             logger.info("Setup %s: after 1PM cutoff for directional buys — skipping", setup.id)
@@ -1060,6 +1068,18 @@ class Executor:
 
         for condition in self._playbook.no_trade_conditions:
             cond_lower = condition.lower()
+            # Parse symbol bans: "DO NOT trade RELIANCE"
+            if "do not trade" in cond_lower:
+                banned = cond_lower.split("do not trade")[-1].strip()
+                self._daily.setdefault("banned_symbols", [])
+                if banned.upper() not in self._daily["banned_symbols"]:
+                    self._daily["banned_symbols"].append(banned.upper())
+            # Parse type bans: "DO NOT initiate breakout_long"
+            if "do not initiate" in cond_lower:
+                banned_type = cond_lower.split("do not initiate")[-1].strip().split()[0]
+                self._daily.setdefault("banned_types", [])
+                if banned_type not in self._daily["banned_types"]:
+                    self._daily["banned_types"].append(banned_type)
             if "vix" in cond_lower:
                 # Parse "VIX > 22" style conditions
                 # Floor: playbook cannot halt trading below VIX 25 (config max_vix)

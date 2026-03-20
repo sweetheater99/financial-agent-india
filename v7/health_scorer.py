@@ -68,7 +68,7 @@ def score_progress(
     entry = pos.entry_price
     target = pos.target
 
-    total_move = target - entry
+    total_move = abs(target - entry)
     if total_move <= 0:
         return 50.0
 

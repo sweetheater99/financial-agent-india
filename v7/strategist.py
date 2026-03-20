@@ -61,7 +61,7 @@ SETUP TYPE BY DAY CLASSIFICATION:
 
 CRITICAL RULES:
 - MAX 2 directional option buys per day. Remaining slots should be credit spreads or skip.
-- NO NEW directional entries after 1:00 PM — theta decay in last 2.5h kills premium buyers.
+- NO NEW directional entries after 10:30 AM — theta decay in last 2.5h kills premium buyers.
   Afternoon entries MUST be credit spreads/condors or nothing.
 - NEVER repeat a losing symbol same day. If RELIANCE lost in the morning, don't set up RELIANCE again.
 - Iron condors / credit spreads when VIX >= 16 — this is the HIGHEST EDGE strategy. Research shows option sellers have 65-70% win rates vs 30% for buyers in Indian markets.
