@@ -98,7 +98,7 @@ class StateManager:
     def save_theta_state(self, state: dict | None) -> None:
         """Persist theta engine condor state."""
         import json
-        path = Path(self._state_dir) / "theta_state.json"
+        path = self.dir / "theta_state.json"
         if state is None:
             path.unlink(missing_ok=True)
         else:
@@ -107,7 +107,7 @@ class StateManager:
     def load_theta_state(self) -> dict | None:
         """Load persisted theta engine condor state."""
         import json
-        path = Path(self._state_dir) / "theta_state.json"
+        path = self.dir / "theta_state.json"
         if not path.exists():
             return None
         try:
