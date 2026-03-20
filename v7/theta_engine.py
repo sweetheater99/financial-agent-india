@@ -481,6 +481,7 @@ class ThetaEngine:
                 side=order_side,
                 quantity=leg.quantity,
                 limit_price=leg.current_price or leg.premium,
+                product="NRML",
             )
 
         logger.info("THETA: closed %s side", side)

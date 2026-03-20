@@ -133,7 +133,10 @@ class Executor:
 
         # 4. THETA ENGINE (every tick during market hours)
         if hasattr(self, '_theta_engine') and self._theta_engine:
-            self._theta_engine.tick()
+            try:
+                self._theta_engine.tick()
+            except Exception as e:
+                logger.error("Theta engine tick failed: %s", e)
 
         # 5. EXCEPTION DETECTION (every tick)
         self._check_exceptions(now)
