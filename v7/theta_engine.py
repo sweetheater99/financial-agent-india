@@ -261,17 +261,31 @@ class ThetaEngine:
         lot_mult = self._lot_multiplier()
         qty = int(lot_size * lot_mult)
 
+        # Get correct tradingsymbols from chain (not manual construction)
+        def _get_tsym(chain, strike, opt_type):
+            for entry in chain:
+                if entry["strikePrice"] == strike:
+                    opt = entry.get(opt_type)
+                    if opt:
+                        return opt.get("tradingsymbol", "")
+            return ""
+
+        short_ce_tsym = _get_tsym(chain, short_ce_strike, "CE")
+        long_ce_tsym = _get_tsym(chain, long_ce_strike, "CE")
+        short_pe_tsym = _get_tsym(chain, short_pe_strike, "PE")
+        long_pe_tsym = _get_tsym(chain, long_pe_strike, "PE")
+
+        if not all([short_ce_tsym, long_ce_tsym, short_pe_tsym, long_pe_tsym]):
+            logger.warning("THETA: missing tradingsymbols for condor strikes")
+            return
+
         self._condor = CondorPosition(
             entry_date=today,
             expiry_date=expiry,
-            short_ce=CondorLeg(f"NIFTY{expiry.strftime('%y%m%d')}{short_ce_strike}CE",
-                               short_ce_strike, short_ce_prem, qty, "CE"),
-            long_ce=CondorLeg(f"NIFTY{expiry.strftime('%y%m%d')}{long_ce_strike}CE",
-                              long_ce_strike, long_ce_prem, qty, "CE"),
-            short_pe=CondorLeg(f"NIFTY{expiry.strftime('%y%m%d')}{short_pe_strike}PE",
-                               short_pe_strike, short_pe_prem, qty, "PE"),
-            long_pe=CondorLeg(f"NIFTY{expiry.strftime('%y%m%d')}{long_pe_strike}PE",
-                              long_pe_strike, long_pe_prem, qty, "PE"),
+            short_ce=CondorLeg(short_ce_tsym, short_ce_strike, short_ce_prem, qty, "CE"),
+            long_ce=CondorLeg(long_ce_tsym, long_ce_strike, long_ce_prem, qty, "CE"),
+            short_pe=CondorLeg(short_pe_tsym, short_pe_strike, short_pe_prem, qty, "PE"),
+            long_pe=CondorLeg(long_pe_tsym, long_pe_strike, long_pe_prem, qty, "PE"),
             net_credit=net_credit,
         )
 
@@ -490,19 +504,53 @@ class ThetaEngine:
     # ── Strike Helpers ────────────────────────────────────────────────
 
     def _find_strike_by_delta(self, chain: list, option_type: str, target_delta: float) -> Optional[float]:
-        """Find strike closest to target delta from option chain."""
+        """Find strike closest to target delta from option chain.
+        
+        Kite chain has no Greeks — estimate delta from moneyness:
+        delta ~= 0.50 * exp(-0.5 * (moneyness / sigma)^2)
+        Simplified: use distance from ATM as proxy.
+        0.18 delta ~ 200-300 pts OTM for Nifty.
+        """
+        # Get ATM price (middle of chain)
+        spot = None
+        for entry in chain:
+            ce = entry.get("CE")
+            pe = entry.get("PE")
+            if ce and pe and ce.get("ltp", 0) > 0 and pe.get("ltp", 0) > 0:
+                # ATM is where CE and PE premiums are closest
+                if abs(ce["ltp"] - pe["ltp"]) < (spot or float("inf")):
+                    spot = entry["strikePrice"]
+        
+        if spot is None:
+            return None
+        
         best_strike = None
         best_diff = float("inf")
 
         for entry in chain:
             opt = entry.get(option_type)
-            if not opt:
+            if not opt or opt.get("ltp", 0) <= 0:
                 continue
-            delta = abs(opt.get("delta", 0))
-            diff = abs(delta - target_delta)
+            
+            strike = entry["strikePrice"]
+            # Estimate delta from OTM distance
+            # For Nifty: ~50 pts = 0.40 delta, ~150 pts = 0.25, ~250 pts = 0.18, ~400 pts = 0.10
+            if option_type == "CE":
+                otm_dist = strike - spot
+            else:
+                otm_dist = spot - strike
+            
+            if otm_dist < 0:
+                continue  # ITM, skip
+            
+            # Simple delta estimation: delta ~= 0.50 * exp(-otm_dist / 200)
+            import math
+            est_delta = 0.50 * math.exp(-otm_dist / 200)
+            
+            diff = abs(est_delta - target_delta)
             if diff < best_diff:
                 best_diff = diff
-                best_strike = entry["strikePrice"]
+                best_strike = strike
 
         return best_strike
 
