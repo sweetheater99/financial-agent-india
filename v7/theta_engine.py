@@ -315,8 +315,25 @@ class ThetaEngine:
                 all_filled = False
 
         if not all_filled:
-            logger.error("THETA: Not all legs filled — manual intervention needed!")
-            # TODO: unwind partial fills
+            logger.error("THETA: Not all legs filled — unwinding partial fills")
+            # Unwind: close any legs that did fill
+            from v7.order_manager import OrderSide as OS2
+            for leg, side, desc in legs_to_place:
+                if leg.order_id:  # This leg was filled
+                    # Reverse it
+                    reverse_side = OS2.BUY if side == OS2.SELL else OS2.SELL
+                    self._orders.place_exit_order(
+                        tradingsymbol=leg.tradingsymbol,
+                        exchange="NFO",
+                        side=reverse_side,
+                        quantity=leg.quantity,
+                        limit_price=leg.premium,
+                        product="NRML",
+                    )
+                    logger.info("THETA UNWIND: reversed %s %s", desc, leg.tradingsymbol)
+            self._condor = None
+            self._send_theta_alert("ABORT", "Partial fill — all legs unwound. Will retry next entry window.")
+            return
 
         # Send Telegram alert
         self._send_theta_alert("ENTRY", f"Iron Condor {short_pe_strike}/{short_ce_strike} wings {WING_WIDTH}pt credit={net_credit:.1f}")
@@ -351,6 +368,52 @@ class ThetaEngine:
         if self._should_close_for_time(today):
             logger.info("THETA: closing condor for time management (day=%s)", today.strftime("%A"))
             self._close_condor("time_management")
+            return
+
+        # Fetch actual option LTPs for the 4 legs (not stock prices)
+        option_prices = {}
+        try:
+            leg_keys = []
+            for leg in [self._condor.short_ce, self._condor.long_ce,
+                        self._condor.short_pe, self._condor.long_pe]:
+                key = f"NFO:{leg.tradingsymbol}"
+                leg_keys.append(key)
+            if hasattr(self._data, 'kite') and self._data.kite:
+                quotes = self._data.kite.quote(leg_keys)
+                for key, q in quotes.items():
+                    ltp = q.get("last_price", 0)
+                    option_prices[key] = ltp
+                    # Also store without prefix for current_value lookup
+                    tsym = key.replace("NFO:", "")
+                    option_prices[tsym] = ltp
+                # Update leg current_price
+                for leg in [self._condor.short_ce, self._condor.long_ce,
+                            self._condor.short_pe, self._condor.long_pe]:
+                    leg.current_price = option_prices.get(leg.tradingsymbol, leg.premium)
+        except Exception as e:
+            logger.warning("THETA: option LTP fetch failed: %s", e)
+            return  # Can't manage without prices
+
+        # Profit check with actual option prices
+        profit_pct = self._condor.profit_pct(option_prices)
+        target = self._profit_target()
+        if profit_pct >= target:
+            logger.info("THETA PROFIT TARGET: %.1f%% >= %.1f%% — closing", profit_pct * 100, target * 100)
+            self._close_condor("profit_target")
+            return
+
+        # Delta risk check using Nifty spot movement as proxy
+        nifty_ltp = self._data.get_batch_ltp(["NIFTY"]).get("NIFTY")
+        if nifty_ltp:
+            # If Nifty is within 100pts of a short strike, close that side
+            if abs(nifty_ltp - self._condor.short_ce.strike) < 100:
+                logger.info("THETA DELTA BREACH: Nifty %.0f near short CE %.0f", nifty_ltp, self._condor.short_ce.strike)
+                self._close_condor("delta_breach_ce")
+                return
+            if abs(nifty_ltp - self._condor.short_pe.strike) < 100:
+                logger.info("THETA DELTA BREACH: Nifty %.0f near short PE %.0f", nifty_ltp, self._condor.short_pe.strike)
+                self._close_condor("delta_breach_pe")
+                return
             return
 
         # Profit check
@@ -461,7 +524,19 @@ class ThetaEngine:
                 product="NRML",
             )
 
-        self._send_theta_alert("EXIT", f"Reason: {reason}")
+        # Calculate and record P&L
+        pnl = 0.0
+        if self._condor:
+            # P&L = net credit received - cost to close
+            close_cost = sum(leg.current_price or leg.premium for leg in
+                           [self._condor.short_ce, self._condor.short_pe]) -                          sum(leg.current_price or leg.premium for leg in
+                           [self._condor.long_ce, self._condor.long_pe])
+            pnl = (self._condor.net_credit - close_cost) * self._condor.short_ce.quantity
+            logger.info("THETA P&L: credit=%.1f close_cost=%.1f qty=%d pnl=%.0f",
+                        self._condor.net_credit, close_cost,
+                        self._condor.short_ce.quantity, pnl)
+
+        self._send_theta_alert("EXIT", f"Reason: {reason}, P&L: Rs.{pnl:+,.0f}")
         self._condor = None
         self._state.save_theta_state(None)
 
