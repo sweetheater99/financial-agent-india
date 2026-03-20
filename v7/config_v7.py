@@ -57,12 +57,12 @@ RISK_LIMITS = {
 # ── Theta Engine Limits ────────────────────────────────────────────────
 THETA_LIMITS = {
     "max_margin_pct": 0.40,
-    "min_vix": 18.0,
+    "min_vix": 16.0,
     "max_vix": 25.0,
     "short_delta": 0.20,
     "wing_gap_nifty": 200,
     "profit_target_pct": 0.50,
-    "close_by_day": "wednesday",
+    "close_by_day": "monday",  # Close Monday before Tuesday expiry
     "survival_delta": 0.15,
     "max_risk_pct": 3.0,
 }

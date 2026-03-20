@@ -928,7 +928,7 @@ class Executor:
             return False
         # Check never-carry conditions
         today = date.today()
-        if today.weekday() == 3:  # Thursday = expiry day
+        if today.weekday() == 1:  # Tuesday = expiry day (NSE changed Sep 2025)
             return False
         if "vix_above_22" in rules.never_carry and self._vix > 22:
             return False
@@ -1099,9 +1099,9 @@ class Executor:
     # ── Expiry Day ────────────────────────────────────────────────────
 
     def _is_expiry_day(self, today: Optional[date] = None) -> bool:
-        """Thursday is weekly expiry for index options."""
+        """Tuesday is weekly expiry for index options (NSE changed Sep 2025)."""
         today = today or date.today()
-        return today.weekday() == 3
+        return today.weekday() == 1
 
     def _expiry_adjusted_sl(self, pos: Position) -> float:
         """On expiry day, tighten SL to half normal distance."""

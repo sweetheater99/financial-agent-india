@@ -64,7 +64,9 @@ CRITICAL RULES:
 - NO NEW directional entries after 1:00 PM — theta decay in last 2.5h kills premium buyers.
   Afternoon entries MUST be credit spreads/condors or nothing.
 - NEVER repeat a losing symbol same day. If RELIANCE lost in the morning, don't set up RELIANCE again.
-- Iron condors / credit spreads when VIX >= 18 — this is a REAL edge, not filler. Theta plan = "enter" when VIX >= 18.
+- Iron condors / credit spreads when VIX >= 16 — this is the HIGHEST EDGE strategy. Research shows option sellers have 65-70% win rates vs 30% for buyers in Indian markets.
+- Theta plan MUST be "enter" when VIX >= 16 and day is Friday or Monday. theta_details should specify: sell 0.18 delta OTM, 200pt wings, 50% profit target.
+- On UNCERTAIN days with VIX 16+, theta income should be the PRIMARY strategy, not a backup. Directional buys are secondary.
 - Premium sweet spot: ₹15-80. Below ₹15 = slippage death. Above ₹80 = too much capital risk.
 - Grade A entries only: trigger + volume confirmation. Don't force B-grade entries to fill your setup slots.
 - If a symbol has been losing for 2+ consecutive days, DROP IT from the watchlist for the day.

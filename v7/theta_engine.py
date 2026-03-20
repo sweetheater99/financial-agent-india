@@ -3,7 +3,7 @@
 Independent background income. Own risk budget (max 3% capital at risk).
 Max 40% margin utilization.
 
-Entry: Monday/Tuesday when VIX 14-20
+Entry: Friday/Monday when VIX 16-25 (NSE weekly expiry = Tuesday since Sep 2025)
 Exit: profit target (50%), delta breach, Wednesday EOD, never Thursday
 
 Spec ref: Component 5 (lines 597-642), Margin Budget (lines 942-957)
@@ -116,12 +116,12 @@ class CondorPosition:
 # Constants
 THETA_MAX_RISK_PCT = 3.0        # max 3% of capital at risk
 THETA_MAX_MARGIN_PCT = 40.0     # max 40% margin utilization
-VIX_ENTRY_LOW = 14.0
-VIX_ENTRY_HIGH = 20.0
-ENTRY_DELTA = 0.20
+VIX_ENTRY_LOW = 16.0
+VIX_ENTRY_HIGH = 25.0
+ENTRY_DELTA = 0.18
 SURVIVAL_ENTRY_DELTA = 0.15
 WING_WIDTH = 200                # points between short and long strikes
-MIN_CREDIT_PER_LOT = 30.0      # minimum net credit ₹30/lot
+MIN_CREDIT_PER_LOT = 40.0      # minimum net credit ₹30/lot
 PROFIT_TARGET_PCT = 0.50
 SURVIVAL_PROFIT_TARGET_PCT = 0.40
 
@@ -130,7 +130,7 @@ class ThetaEngine:
     """Weekly Nifty iron condor manager.
 
     Lifecycle:
-    1. Entry check: Monday/Tuesday, VIX 14-20, no existing condor
+    1. Entry check: Friday/Monday, VIX 16-25, no existing condor
     2. Strike selection: short at delta 0.20, long at +200pts OTM
     3. Daily management: delta monitoring, profit target
     4. Exit: profit target, delta breach, time cutoff
@@ -182,8 +182,8 @@ class ThetaEngine:
         if self._condor is not None:
             return False
 
-        # Only Monday (0) or Tuesday (1)
-        if today.weekday() not in (0, 1):
+        # Friday(4) or Monday(0) — 2 days before Tuesday weekly expiry
+        if today.weekday() not in (4, 0):
             return False
 
         # VIX range check
