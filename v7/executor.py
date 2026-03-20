@@ -172,9 +172,16 @@ class Executor:
         except Exception as e:
             logger.warning("VIX fetch failed: %s", e)
 
-        # Track VIX 30min ago for exception detection
-        if self._daily.get("vix_30min_ago") is None:
-            self._daily["vix_30min_ago"] = self._vix
+        # Track VIX rolling 30min history for exception detection
+        # Ring buffer: store VIX every tick (~3min), keep last 10 entries (~30min)
+        if "_vix_history" not in self._daily:
+            self._daily["_vix_history"] = []
+        vix_hist = self._daily["_vix_history"]
+        vix_hist.append(self._vix)
+        if len(vix_hist) > 10:
+            vix_hist.pop(0)
+        # vix_30min_ago = oldest entry in the ring (actual ~30min ago)
+        self._daily["vix_30min_ago"] = vix_hist[0]
 
         # Track Nifty open
         if self._daily.get("nifty_open") is None:
@@ -219,6 +226,7 @@ class Executor:
     def _evaluate_triggers(self, now: datetime) -> None:
         """Check all playbook setups in priority order. Every tick."""
         if not self._playbook:
+            logger.info("TICK: No playbook loaded")
             return
 
         # Check no-trade conditions
@@ -226,9 +234,12 @@ class Executor:
             return
 
         all_setups = self._playbook.all_setups()
-        for setup in sorted(all_setups, key=lambda s: s.priority):
-            if setup.fired or setup.cancelled:
-                continue
+        active_setups = [s for s in all_setups if not s.fired and not s.cancelled]
+        if not active_setups:
+            logger.info("TICK: All setups fired/cancelled, none remaining")
+            return
+
+        for setup in sorted(active_setups, key=lambda s: s.priority):
             self._evaluate_single_trigger(setup, now)
 
     def _evaluate_single_trigger(self, setup: Setup, now: datetime) -> None:
@@ -248,6 +259,10 @@ class Executor:
             triggered = ltp > setup.trigger_level  # simplified
 
         if not triggered:
+            dist = abs(ltp - setup.trigger_level)
+            dist_pct = dist / setup.trigger_level * 100 if setup.trigger_level else 0
+            logger.info("TICK %s(%s): ltp=%.1f trigger=%.1f dist=%.1f(%.1f%%)",
+                        setup.id, setup.symbol, ltp, setup.trigger_level, dist, dist_pct)
             return
 
         # Concentration guard: max 1 position per symbol
@@ -998,14 +1013,44 @@ class Executor:
             cond_lower = condition.lower()
             if "vix" in cond_lower:
                 # Parse "VIX > 22" style conditions
+                # Floor: playbook cannot halt trading below VIX 25 (config max_vix)
+                # VIX 20-25 is normal volatility; only halt on genuine spikes
                 try:
                     threshold = float(cond_lower.split(">")[-1].strip())
+                    threshold = max(threshold, 25.0)  # enforce floor
                     if self._vix > threshold:
-                        logger.info("No-trade: %s (VIX=%.1f)", condition, self._vix)
+                        logger.info("No-trade: %s (VIX=%.1f, threshold=%.1f)", condition, self._vix, threshold)
+                        # Track consecutive blocked ticks and alert once
+                        blocked = self._daily.get("_notrade_blocked_ticks", 0) + 1
+                        self._daily["_notrade_blocked_ticks"] = blocked
+                        if blocked == 5:  # alert after 15min of blocking
+                            self._send_notrade_alert(condition, threshold)
                         return True
                 except (ValueError, IndexError):
                     pass
         return False
+
+    def _send_notrade_alert(self, condition: str, threshold: float) -> None:
+        """Send Telegram alert when no-trade condition blocks 5+ consecutive ticks."""
+        try:
+            import os, requests
+            token = os.environ.get("DEAL_BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
+            chat = os.environ.get("TELEGRAM_FORUM_CHAT_ID") or os.environ.get("DEAL_BOT_CHAT_ID")
+            topic = os.environ.get("TELEGRAM_TOPIC_STOCKS")
+            if not token or not chat:
+                return
+            msg = (
+                f"<b>V7 NO-TRADE ALERT</b>\n"
+                f"All ticks blocked for 15+ min\n"
+                f"Condition: VIX={self._vix:.1f} > {threshold:.0f}\n"
+                f"<i>No trades will be taken until VIX drops below {threshold:.0f}</i>"
+            )
+            data = {"chat_id": chat, "parse_mode": "HTML", "text": msg}
+            if topic:
+                data["message_thread_id"] = topic
+            requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data=data, timeout=5)
+        except Exception as e:
+            logger.warning("No-trade alert failed: %s", e)
 
     # ── Theta Engine Integration ──────────────────────────────────────
 
@@ -1128,41 +1173,11 @@ class Executor:
 
     # ── Stale Setup Detection ─────────────────────────────────────────
 
-    def _stale_threshold_pct(self) -> float:
-        """Adaptive stale threshold based on VIX.
-
-        Low VIX (<15): 1.0% — tight triggers, market is calm
-        Normal VIX (15-20): 1.5% — default
-        High VIX (>20): 2.5% — wider threshold, market is volatile
-        """
-        if self._vix <= 0:
-            return 1.5
-        if self._vix < 15:
-            return 1.0
-        if self._vix <= 20:
-            return 1.5
-        return 2.5
-
-    def _stale_cooldown_secs(self) -> int:
-        """Adaptive refresh cooldown.
-
-        First 30 min after open (9:15-9:45): 20 min cooldown (fast moves)
-        Normal hours: 60 min cooldown
-        Last hour (14:30-15:30): 45 min cooldown (wind-down setups)
-        """
-        from datetime import time
-        now_t = datetime.now().time()
-        if now_t < time(9, 45):
-            return 1200   # 20 min
-        if now_t >= time(14, 30):
-            return 2700   # 45 min
-        return 3600       # 60 min
-
     def _check_stale_setups(self, now: datetime) -> None:
         """Dynamic playbook: refresh when all setups are fired/stale.
 
         Triggers strategist ad-hoc check-in to generate fresh setups.
-        Adaptive rate limiting and stale thresholds based on VIX and time of day.
+        Rate-limited to once per hour to avoid spamming Claude calls.
         """
         if not self._playbook or not self._strategist:
             return
@@ -1172,26 +1187,21 @@ class Executor:
         if trades_left <= 0:
             return
 
-        # Adaptive rate limit
-        cooldown = self._stale_cooldown_secs()
+        # Rate limit: once per hour
         last_refresh = self._daily.get("last_stale_refresh")
         if last_refresh:
             from datetime import datetime as dt
             try:
                 last_dt = dt.fromisoformat(last_refresh)
-                if (now - last_dt).total_seconds() < cooldown:
+                if (now - last_dt).total_seconds() < 3600:
                     return
             except (ValueError, TypeError):
                 pass
 
-        threshold = self._stale_threshold_pct()
-        refresh_count = self._daily.get("stale_refreshes", 0)
-
         active = self._playbook.active_setups()
         if not active:
             # All setups fired/cancelled — need fresh setups
-            logger.info("STALE: No active setups, %d trade slots left — requesting refresh (#%d)",
-                        trades_left, refresh_count + 1)
+            logger.info("STALE: No active setups, %d trade slots left — requesting refresh", trades_left)
         else:
             # Check if all active triggers are far from current price
             all_stale = True
@@ -1201,42 +1211,23 @@ class Executor:
                     all_stale = False
                     break
                 distance_pct = abs(ltp - s.trigger_level) / ltp * 100
-                if distance_pct < threshold:
+                if distance_pct < 1.5:
                     all_stale = False
                     break
             if not all_stale:
                 return
-            logger.info("STALE: All %d active setups >%.1f%% from trigger (VIX=%.1f) — requesting refresh (#%d)",
-                        len(active), threshold, self._vix, refresh_count + 1)
+            logger.info("STALE: All %d active setups >1.5%% from trigger — requesting refresh", len(active))
 
         # Call strategist checkin for a refresh
         try:
             result = self._strategist.checkin(checkin_number=0)  # 0 = ad-hoc refresh
-            self._daily["stale_refreshes"] = refresh_count + 1
-            self._daily["last_stale_refresh"] = now.isoformat()
-            self._state.save_daily_state(self._daily)
-
-            from v7.telegram import TelegramAlerter, AlertLevel
-            tg = TelegramAlerter()
-
             if result.get("plan_changed"):
-                new_pb = self._state.load_playbook()
-                new_setups = len(new_pb.active_setups()) if new_pb else 0
-                logger.info("STALE REFRESH: Playbook updated — %s (%d new setups)",
-                            result.get("summary", ""), new_setups)
-                self._playbook = new_pb
-                tg.send(
-                    f"V7 auto-refresh #{refresh_count + 1}: {result.get('summary', 'playbook updated')} "
-                    f"({new_setups} setups, VIX {self._vix:.1f}, cooldown {cooldown // 60}min)",
-                    AlertLevel.LOW,
-                )
-            else:
-                logger.info("STALE REFRESH: No new setups generated (refresh #%d)", refresh_count + 1)
-                tg.send(
-                    f"V7 auto-refresh #{refresh_count + 1}: no new setups found "
-                    f"(VIX {self._vix:.1f}, {trades_left} slots left)",
-                    AlertLevel.LOW,
-                )
+                logger.info("STALE REFRESH: Playbook updated — %s", result.get("summary", ""))
+                self._playbook = self._state.load_playbook()  # reload
+                from v7.telegram import TelegramAlerter, AlertLevel
+                tg = TelegramAlerter()
+                tg.send(f"V7 auto-refresh: {result.get('summary', 'playbook updated')}", AlertLevel.LOW)
+            self._daily["last_stale_refresh"] = now.isoformat()
         except Exception as e:
             logger.warning("Stale refresh failed: %s", e)
 

@@ -159,13 +159,8 @@ class DataFeed:
         if self.mode == "kite" and self.kite:
             from kite_data import get_vix_kite
             return get_vix_kite()
-        if self.angelone:
-            try:
-                data = self.angelone.ltpData("NSE", "India VIX", "26017")
-                if data and data.get("data"):
-                    return float(data["data"]["ltp"])
-            except Exception:
-                pass
+        # AngelOne VIX removed — stale token 26017 causes errors
+        # Fall through to yfinance
         # yfinance fallback
         try:
             import yfinance as yf

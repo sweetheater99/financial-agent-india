@@ -236,7 +236,6 @@ def format_eod_summary(
     carried_positions: list[dict],
     day_type_predicted: str,
     day_type_actual: str,
-    stale_refreshes: int = 0,
 ) -> str:
     """Format end-of-day summary."""
     pnl_pct = (total_pnl / capital * 100) if capital > 0 else 0.0
@@ -249,7 +248,6 @@ def format_eod_summary(
         f"<b>Total: {total_pnl:+,.0f} ({pnl_pct:+.1f}%)</b>",
         "",
         f"Day type: predicted {day_type_predicted} / actual {day_type_actual}",
-        f"Playbook refreshes: {stale_refreshes}",
     ]
 
     if carried_positions:
@@ -273,46 +271,3 @@ def format_error(error: str, detail: str) -> str:
         f"{error}",
         f"{detail}",
     ])
-
-
-def format_portfolio_status(
-    positions: list[dict],
-    unrealised_pnl: float,
-    position_details: list[dict],
-    realised_pnl: float,
-    realised_trades: int,
-    capital: float,
-) -> str:
-    """Format portfolio P&L status for Telegram."""
-    lines = [
-        "<b>V7 Portfolio Status</b>",
-        "",
-    ]
-
-    # Open positions with unrealised P&L
-    if position_details:
-        lines.append(f"<b>Open ({len(position_details)}):</b>")
-        for pd in position_details:
-            lines.append(
-                f"  {pd['symbol']} {pd['instrument']}: "
-                f"Rs.{pd['pnl']:+,.0f} ({pd['pnl_pct']:+.1f}%)"
-            )
-        unr_pct = (unrealised_pnl / capital * 100) if capital else 0
-        lines.append(f"<b>Unrealised: Rs.{unrealised_pnl:+,.0f} ({unr_pct:+.1f}%)</b>")
-    else:
-        lines.append("No open positions")
-
-    # Cumulative realised P&L
-    lines.append("")
-    real_pct = (realised_pnl / capital * 100) if capital else 0
-    lines.append(
-        f"<b>Realised: Rs.{realised_pnl:+,.0f} ({real_pct:+.1f}%) "
-        f"[{realised_trades} trades]</b>"
-    )
-
-    # Net (realised + unrealised)
-    net = realised_pnl + unrealised_pnl
-    net_pct = (net / capital * 100) if capital else 0
-    lines.append(f"<b>Net: Rs.{net:+,.0f} ({net_pct:+.1f}%)</b>")
-
-    return "\n".join(lines)

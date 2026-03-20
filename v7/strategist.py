@@ -66,25 +66,15 @@ Output an updated playbook JSON with:
 - Day type confirmation or override
 - Opening range levels added
 - Setups adjusted if levels invalidated
-- Add NEW directional setups if opening range reveals clear levels not in the morning playbook
-
-Strategy guidance (from backtested optimization):
-- PRIORITIZE directional trades — these are our edge. Always look for breakout/bounce/fade setups.
-- Iron condors / credit spreads ONLY when VIX >= 18
-- Don't default to "theta only" unless market is truly directionless — look harder for levels
+- Possible: "no good setups today, theta only"
 Respond with ONLY the updated JSON playbook."""
 
 CHECKIN_SYSTEM = """You are doing a mid-session check-in on the trading playbook.
 Review current P&L, open positions, fired/unfired setups, level tests, OI changes, VIX.
 Output an updated playbook JSON with:
 - Confirm or modify remaining setups
-- Add new directional setups if clear opportunities emerged (new levels, OI shifts, sector moves)
-- Only declare "no trade rest of day" if genuinely choppy with no identifiable levels
-
-Strategy guidance (from backtested optimization):
-- PRIORITIZE directional trades — add new breakout/bounce/fade setups if you see levels forming
-- Iron condors / credit spreads ONLY when VIX >= 18
-- If all setups have fired, generate fresh ones — don't leave the executor idle with trade slots available
+- Add new setup ONLY if a clear opportunity emerged
+- Declare "no trade rest of day" if choppy
 Respond with ONLY the updated JSON playbook."""
 
 EXCEPTION_SYSTEM = """You are handling an EXCEPTION in the trading session.

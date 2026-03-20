@@ -4,7 +4,7 @@
 Runs every 3 minutes during market hours. No Claude calls. Pure rule execution.
 Phase-based behavior:
   - Opening Read (9:15-9:45): only manage carried positions
-  - Active Trading (9:45-14:30): full playbook execution on 15-min candle boundaries
+  - Active Trading (9:45-14:30): full playbook execution every tick (3 min)
   - Wind Down (14:30-15:15): close intraday, carry decisions
   - Post-close (15:15-15:30): final SL placement on carried positions
 
@@ -43,7 +43,7 @@ class Executor:
 
     Responsibilities:
     - Fetch LTP, candles, VIX each tick
-    - Evaluate playbook triggers on 15-min candle boundaries (Active Trading only)
+    - Evaluate playbook triggers every tick (Active Trading phase)
     - Manage open positions: SL, breakeven, trailing, target
     - Wind down: close intraday, evaluate carry
     - Detect exception conditions → delegate to Strategist.handle_exception()
@@ -66,6 +66,9 @@ class Executor:
         self._margin = margin_tracker
         self._capital = capital
         self._strategist = strategist  # for exception callbacks
+
+        from v7.health_scorer import PositionHealthScorer
+        self._health_scorer = PositionHealthScorer()
 
         # Runtime state — loaded from persistence at start
         self._playbook: Optional[Playbook] = None
@@ -136,13 +139,15 @@ class Executor:
         self._check_exceptions(now)
 
         # 6. PERSIST STATE
+        if self._playbook:
+            self._state.save_playbook(self._playbook)
         self._state.save_positions(self._positions)
         self._state.save_daily_state(self._daily)
 
     # ── Data Fetching ─────────────────────────────────────────────────
 
     def _fetch_data(self, now: datetime) -> None:
-        """Fetch LTP batch + VIX. Candles fetched on demand."""
+        """Fetch LTP batch for watchlist + open option positions + VIX."""
         try:
             from v7.config_v7 import WATCHLIST
             symbols = [w["symbol"] for w in WATCHLIST]
@@ -150,6 +155,17 @@ class Executor:
         except Exception as e:
             logger.error("LTP batch fetch failed: %s", e)
             self._quotes = {}
+
+        # Fetch option LTPs for open positions
+        if self._positions and self._data.can_trade():
+            try:
+                option_keys = [f"NFO:{p.instrument}" for p in self._positions if p.instrument]
+                if option_keys:
+                    option_quotes = self._data.kite.quote(option_keys)
+                    for key, q in option_quotes.items():
+                        self._quotes[key] = q.get("last_price", 0)
+            except Exception as e:
+                logger.warning("Option LTP fetch failed: %s", e)
 
         try:
             self._vix = self._data.get_vix() or 0.0
@@ -162,7 +178,7 @@ class Executor:
 
         # Track Nifty open
         if self._daily.get("nifty_open") is None:
-            nifty_ltp = self._quotes.get("NSE:NIFTY 50")
+            nifty_ltp = self._get_ltp_for_symbol("NIFTY")
             if nifty_ltp:
                 self._daily["nifty_open"] = nifty_ltp
 
@@ -175,7 +191,7 @@ class Executor:
             self._manage_carried_positions_gap(now, carried)
 
     def _handle_active_trading(self, now: datetime) -> None:
-        """9:45-14:30: Check triggers on candle boundaries only."""
+        """9:45-14:30: Check triggers every tick (3 min)."""
         if not self._playbook:
             return
 
@@ -183,8 +199,10 @@ class Executor:
         if self._is_expiry_cutoff(now):
             return
 
-        if is_15min_boundary(now.time()):
-            self._evaluate_triggers(now)
+        self._evaluate_triggers(now)
+
+        # Dynamic playbook: refresh when setups exhausted or stale (rate-limited to 1/hour)
+        self._check_stale_setups(now)
 
     def _handle_wind_down(self, now: datetime) -> None:
         """14:30-15:15: Close intraday, carry decisions."""
@@ -199,7 +217,7 @@ class Executor:
     # ── Trigger Evaluation ────────────────────────────────────────────
 
     def _evaluate_triggers(self, now: datetime) -> None:
-        """Check all playbook setups in priority order. Only on candle boundaries."""
+        """Check all playbook setups in priority order. Every tick."""
         if not self._playbook:
             return
 
@@ -232,6 +250,28 @@ class Executor:
         if not triggered:
             return
 
+        # Concentration guard: max 1 position per symbol
+        if self._has_symbol_concentration(setup.symbol):
+            logger.info("Setup %s: already holding %s — concentration guard", setup.id, setup.symbol)
+            return
+
+        # Cooldown guard: symbol was health-exited today
+        if self._is_symbol_cooled_down(setup.symbol):
+            logger.info("Setup %s: %s cooled down today — skipping", setup.id, setup.symbol)
+            return
+
+        # Skip if price already past target (would enter and exit same tick)
+        if setup.type in (SetupType.BREAKOUT_SHORT, SetupType.RESISTANCE_FADE):
+            if ltp < setup.target:
+                logger.info("Setup %s: price %.2f already past target %.2f — skipping stale trigger",
+                            setup.id, ltp, setup.target)
+                return
+        elif setup.type in (SetupType.BREAKOUT_LONG, SetupType.SUPPORT_BOUNCE):
+            if ltp > setup.target:
+                logger.info("Setup %s: price %.2f already past target %.2f — skipping stale trigger",
+                            setup.id, ltp, setup.target)
+                return
+
         # Risk budget check
         risk_amount = self._capital * (setup.max_risk_pct / 100)
         current_risk = sum(p.risk_amount() for p in self._positions)
@@ -244,11 +284,6 @@ class Executor:
             daily_pnl=self._daily.get("daily_pnl", 0),
         ):
             logger.info("Setup %s triggered but risk budget exhausted", setup.id)
-            return
-
-        # Margin check
-        if not self._risk.check_margin(risk_amount):
-            logger.info("Setup %s triggered but margin insufficient", setup.id)
             return
 
         # F&O ban check, brokerage check would go here
@@ -332,7 +367,8 @@ class Executor:
         )
 
         if not result.filled:
-            logger.warning("Entry order for %s did not fill", setup.id)
+            logger.warning("Entry order for %s did not fill — will retry next boundary", setup.id)
+            setup.fired = False
             return
 
         # Create position
@@ -348,6 +384,7 @@ class Executor:
             target=setup.target,
             entry_date=now.date(),
             setup_id=setup.id,
+            entry_time=now.time(),
         )
         self._positions.append(pos)
         self._daily["trades_today"] = self._daily.get("trades_today", 0) + 1
@@ -361,49 +398,91 @@ class Executor:
     # ── Position Management ───────────────────────────────────────────
 
     def _manage_positions(self, now: datetime) -> None:
-        """Update P&L, check SL/target/trailing for each position."""
+        """Update P&L, check SL/target/trailing for each position.
+
+        SL and target are UNDERLYING price levels from the playbook.
+        We check the underlying symbol's price against these levels,
+        then exit the option position at its current premium.
+        """
         positions_to_remove = []
 
         for pos in self._positions:
-            ltp = self._get_ltp_for_instrument(pos.instrument)
-            if ltp is None:
+            # Get underlying price for SL/target evaluation
+            underlying_ltp = self._get_ltp_for_symbol(pos.symbol)
+            # Get option premium for P&L and exit
+            option_ltp = self._get_ltp_for_instrument(pos.instrument)
+
+            if underlying_ltp is None and option_ltp is None:
                 continue
 
-            # Update peak price
-            if pos.direction == "bullish":
-                pos.peak_price = max(pos.peak_price, ltp)
-            else:
-                pos.peak_price = min(pos.peak_price, ltp) if pos.peak_price > 0 else ltp
+            # Track option premium for P&L
+            if option_ltp is not None:
+                pnl = pos.unrealized_pnl(option_ltp)
 
-            pnl = pos.unrealized_pnl(ltp)
+            # Update peak price (track underlying for trailing SL)
+            if underlying_ltp is not None:
+                if pos.direction == "bullish":
+                    pos.peak_price = max(pos.peak_price, underlying_ltp)
+                else:
+                    pos.peak_price = min(pos.peak_price, underlying_ltp) if pos.peak_price > 0 else underlying_ltp
 
-            # SL hit → EXIT immediately
-            if self._is_sl_hit(pos, ltp):
-                logger.info("SL HIT: %s @ %.2f (SL=%.2f)", pos.instrument, ltp, pos.stoploss)
-                self._exit_position(pos, ltp, "stoploss", now)
-                positions_to_remove.append(pos)
-                self._daily["consecutive_sl_hits"] = self._daily.get("consecutive_sl_hits", 0) + 1
-                continue
+            # SL/target checks use UNDERLYING price
+            if underlying_ltp is not None:
+                # SL hit → EXIT immediately
+                if self._is_sl_hit(pos, underlying_ltp):
+                    exit_price = option_ltp if option_ltp is not None else 0
+                    logger.info("SL HIT: %s underlying=%.2f (SL=%.2f), option=%s@%.2f",
+                                pos.instrument, underlying_ltp, pos.stoploss, pos.instrument, exit_price)
+                    self._exit_position(pos, exit_price, "stoploss", now)
+                    positions_to_remove.append(pos)
+                    self._daily["consecutive_sl_hits"] = self._daily.get("consecutive_sl_hits", 0) + 1
+                    continue
 
-            # Target hit → full exit
-            if self._is_target_hit(pos, ltp):
-                logger.info("TARGET HIT: %s @ %.2f (TGT=%.2f)", pos.instrument, ltp, pos.target)
-                self._exit_position(pos, ltp, "target", now)
-                positions_to_remove.append(pos)
-                self._daily["consecutive_sl_hits"] = 0
-                continue
+                # Target hit → full exit
+                if self._is_target_hit(pos, underlying_ltp):
+                    exit_price = option_ltp if option_ltp is not None else 0
+                    logger.info("TARGET HIT: %s underlying=%.2f (TGT=%.2f), option=%s@%.2f",
+                                pos.instrument, underlying_ltp, pos.target, pos.instrument, exit_price)
+                    self._exit_position(pos, exit_price, "target", now)
+                    positions_to_remove.append(pos)
+                    self._daily["consecutive_sl_hits"] = 0
+                    continue
 
-            # 1:1 R:R → move SL to breakeven
-            self._check_breakeven(pos, ltp)
+                # 1:1 R:R → move SL to breakeven (underlying levels)
+                self._check_breakeven(pos, underlying_ltp)
 
-            # Trailing stop: peak - 1.5x ATR
-            trailing_sl = self._compute_trailing_sl(pos, ltp)
-            if trailing_sl is not None and self._is_better_sl(pos, trailing_sl):
-                old_sl = pos.stoploss
-                pos.stoploss = trailing_sl
-                logger.info("TRAILING SL: %s moved %.2f → %.2f", pos.instrument, old_sl, trailing_sl)
-                if pos.sl_order_id:
-                    self._update_exchange_sl(pos)
+                # Partial profit booking at 1:1 R:R
+                if option_ltp is not None:
+                    self._check_partial_exit(pos, underlying_ltp, option_ltp, now)
+                    if pos.quantity <= 0:
+                        positions_to_remove.append(pos)
+                        continue
+
+                # Trailing stop on underlying
+                trailing_sl = self._compute_trailing_sl(pos, underlying_ltp)
+                if trailing_sl is not None and self._is_better_sl(pos, trailing_sl):
+                    old_sl = pos.stoploss
+                    pos.stoploss = trailing_sl
+                    logger.info("TRAILING SL: %s underlying moved %.2f → %.2f",
+                                pos.instrument, old_sl, trailing_sl)
+                    if pos.sl_order_id:
+                        self._update_exchange_sl(pos)
+
+                # Health score check (skip for carried positions)
+                if not pos.carried and option_ltp is not None:
+                    try:
+                        candles = self._data.get_candles(pos.symbol, interval="FIVE_MINUTE", days=1)
+                    except Exception:
+                        candles = []
+                    setup_type = self._get_setup_type(pos.setup_id)
+                    setup_str = setup_type.value if hasattr(setup_type, 'value') else str(setup_type)
+                    health = self._health_scorer.compute(
+                        pos, underlying_ltp, option_ltp,
+                        now.time(), candles, setup_str,
+                    )
+                    if self._apply_health_action(pos, health, underlying_ltp, option_ltp, now):
+                        positions_to_remove.append(pos)
+                        continue
 
         for pos in positions_to_remove:
             self._positions.remove(pos)
@@ -452,7 +531,8 @@ class Executor:
             if atr <= 0:
                 return None
 
-            trailing_distance = 1.5 * atr
+            multiplier = self._get_trailing_multiplier(pos, ltp)
+            trailing_distance = multiplier * atr
             if pos.direction == "bullish":
                 return pos.peak_price - trailing_distance
             else:
@@ -476,6 +556,44 @@ class Executor:
         if pos.direction == "bullish":
             return new_sl > pos.stoploss
         return new_sl < pos.stoploss
+
+    def _apply_health_action(self, pos, health, underlying_ltp, option_ltp, now):
+        """Apply graduated action based on health score. Returns True if position was exited."""
+        from v7.config_v7 import HEALTH_SCORE
+        pos.health_score = health
+
+        # Health < exit_threshold -> full exit
+        if health < HEALTH_SCORE["exit_threshold"]:
+            logger.info("HEALTH EXIT: %s health=%.1f < %d", pos.instrument, health, HEALTH_SCORE["exit_threshold"])
+            self._exit_position(pos, option_ltp, "health_exit", now)
+            if HEALTH_SCORE.get("cooldown_on_exit"):
+                cooldown = self._daily.setdefault("cooldown_symbols", [])
+                if pos.symbol not in cooldown:
+                    cooldown.append(pos.symbol)
+            return True
+
+        # Health < partial_threshold -> partial exit if not done
+        if health < HEALTH_SCORE["partial_threshold"] and not pos.partial_exit_done:
+            self._check_partial_exit(pos, underlying_ltp, option_ltp, now)
+
+        # Health < tighten_threshold -> tighten trail to 1.0x ATR
+        if health < HEALTH_SCORE["tighten_threshold"]:
+            try:
+                candles = self._data.get_candles(pos.symbol, interval="FIVE_MINUTE", days=1)
+                if candles and len(candles) >= 14:
+                    atr = self._compute_atr(candles[-14:])
+                    if atr > 0:
+                        tight_distance = 1.0 * atr
+                        if pos.direction == "bullish":
+                            new_sl = pos.peak_price - tight_distance
+                        else:
+                            new_sl = pos.peak_price + tight_distance
+                        if self._is_better_sl(pos, new_sl):
+                            pos.stoploss = new_sl
+                            logger.info("HEALTH TIGHTEN: %s health=%.1f, SL -> %.2f", pos.instrument, health, new_sl)
+            except Exception:
+                pass
+        return False
 
     def _exit_position(self, pos: Position, ltp: float, reason: str, now: datetime) -> None:
         """Execute exit order for a position."""
@@ -505,8 +623,176 @@ class Executor:
 
         logger.info("EXITED: %s reason=%s exit=%.2f pnl=%.2f", pos.instrument, reason, exit_price, pnl)
 
+        # Record trade result for EOD journal and edge tracking
+        trade = TradeResult(
+            symbol=pos.symbol,
+            instrument=pos.instrument,
+            setup_type=self._get_setup_type(pos.setup_id),
+            setup_id=pos.setup_id,
+            direction=pos.direction,
+            entry_price=pos.entry_price,
+            exit_price=exit_price,
+            quantity=pos.quantity,
+            pnl=pnl,
+            pnl_pct=(pnl / pos.allocated * 100) if pos.allocated else 0,
+            costs=0.0,
+            entry_date=str(pos.entry_date),
+            exit_date=str(now.date()),
+            exit_reason=reason,
+        )
+        self._state.append_trade(trade)
+        closed = self._daily.get("closed_trades", [])
+        closed.append(trade.to_dict())
+        self._daily["closed_trades"] = closed
+
         # Telegram alert on exit
         self._send_exit_alert(pos, exit_price, reason, pnl)
+
+    # ── Partial Profit Booking ─────────────────────────────────────────
+
+    def _check_partial_exit(self, pos: Position, underlying_ltp: float,
+                            option_ltp: float, now: datetime) -> int:
+        """Exit 50% of position at 1:1 R:R on the underlying.
+
+        Returns quantity exited (int). Updates pos.quantity and pos.partial_exit_done.
+        """
+        if pos.partial_exit_done:
+            return 0
+
+        from v7.config_v7 import PARTIAL_EXIT
+        target_rr = PARTIAL_EXIT["first_target_rr"]
+        exit_pct = PARTIAL_EXIT["first_exit_pct"]
+
+        # Estimate entry_underlying from SL/target midpoint (assumes ~1:1 R:R setup)
+        entry_underlying = (pos.stoploss + pos.target) / 2.0
+        risk = abs(entry_underlying - pos.stoploss)
+        if risk <= 0:
+            return 0
+
+        # Check if underlying has reached 1:1 R:R threshold
+        if pos.direction == "bullish":
+            threshold = entry_underlying + target_rr * risk
+            if underlying_ltp < threshold:
+                return 0
+        else:
+            threshold = entry_underlying - target_rr * risk
+            if underlying_ltp > threshold:
+                return 0
+
+        # Calculate exit quantity: 50% rounded to lot_size
+        exit_qty = int(pos.quantity * exit_pct)
+        exit_qty = (exit_qty // pos.lot_size) * pos.lot_size
+        if exit_qty <= 0:
+            # Can't exit less than 1 lot
+            return 0
+
+        # Place partial exit order
+        from v7.order_manager import OrderSide
+        side = OrderSide.SELL if pos.direction == "bullish" else OrderSide.BUY
+        limit_price = option_ltp - 0.50 if side == OrderSide.SELL else option_ltp + 0.50
+
+        result = self._orders.place_exit_order(
+            tradingsymbol=pos.instrument,
+            exchange="NFO",
+            side=side,
+            quantity=exit_qty,
+            limit_price=limit_price,
+            is_sl_exit=False,
+        )
+
+        exit_price = result.fill_price if result.filled else option_ltp
+        pnl = exit_qty * (exit_price - pos.entry_price)
+
+        # Update position
+        pos.quantity -= exit_qty
+        pos.partial_exit_done = True
+
+        # Move SL to breakeven on remaining
+        if pos.direction == "bullish":
+            if pos.stoploss < pos.entry_price:
+                pos.stoploss = pos.entry_price
+        else:
+            if pos.stoploss > pos.entry_price:
+                pos.stoploss = pos.entry_price
+
+        if pos.sl_order_id:
+            self._update_exchange_sl(pos)
+
+        logger.info("PARTIAL EXIT: %s exited %d qty @ %.2f, pnl=%.2f, remaining=%d",
+                     pos.instrument, exit_qty, exit_price, pnl, pos.quantity)
+
+        self._send_partial_exit_alert(pos, exit_qty, exit_price, pnl)
+        return exit_qty
+
+    def _send_partial_exit_alert(self, pos: Position, qty: int, price: float, pnl: float) -> None:
+        """Send Telegram alert for partial profit booking."""
+        try:
+            from v7.telegram import TelegramAlerter, AlertLevel
+            direction = "LONG" if pos.direction == "bullish" else "SHORT"
+            lines = [
+                "<b>V7 PARTIAL EXIT</b>",
+                "",
+                f"<b>{pos.symbol}</b> {direction}",
+                f"Exited {qty} qty @ {price:,.2f}",
+                f"P&amp;L: Rs.{pnl:+,.0f}",
+                f"Remaining: {pos.quantity} qty, SL moved to breakeven",
+            ]
+            tg = TelegramAlerter()
+            tg.send("\n".join(lines), AlertLevel.HIGH)
+        except Exception as e:
+            logger.warning("Partial exit Telegram alert failed: %s", e)
+
+    # ── Profit Protection Ratchet ──────────────────────────────────────
+
+    def _get_trailing_multiplier(self, pos: Position, underlying_ltp: float) -> float:
+        """Get ATR multiplier based on profit stage (R-multiple).
+
+        Returns tighter multiplier as profit grows, locking in more gains.
+        Detects breakeven by checking if SL has been moved to entry_price level.
+        Uses |target - stoploss| as the risk distance once at breakeven.
+        """
+        from v7.config_v7 import TRAILING, PROFIT_RATCHET
+
+        default_mult = TRAILING["atr_multiplier"]
+
+        # Detect breakeven: SL has been moved to entry level
+        if pos.direction == "bullish":
+            at_breakeven = pos.stoploss >= pos.entry_price
+        else:
+            at_breakeven = pos.stoploss <= pos.entry_price
+
+        if not at_breakeven:
+            return default_mult
+
+        # At breakeven: risk = |target - stoploss| (distance from SL to target)
+        risk = abs(pos.target - pos.stoploss)
+        if risk <= 0:
+            return default_mult
+
+        # R-multiple: profit from entry (= current SL at breakeven)
+        if pos.direction == "bullish":
+            profit = underlying_ltp - pos.stoploss
+        else:
+            profit = pos.stoploss - underlying_ltp
+
+        r_multiple = profit / risk if risk > 0 else 0
+
+        if r_multiple >= 2.0:
+            return PROFIT_RATCHET["above_2r"]
+        elif r_multiple > 1.0:
+            return PROFIT_RATCHET["1r_to_2r"]
+        else:
+            return PROFIT_RATCHET["breakeven_to_1r"]
+
+    # ── Concentration Guard ────────────────────────────────────────────
+
+    def _has_symbol_concentration(self, symbol: str) -> bool:
+        """Check if we already hold a position in this symbol."""
+        return any(p.symbol == symbol for p in self._positions)
+
+    def _is_symbol_cooled_down(self, symbol: str) -> bool:
+        """Check if symbol was health-exited today (in cooldown)."""
+        return symbol in self._daily.get("cooldown_symbols", [])
 
     # ── Carried Position Management ───────────────────────────────────
 
@@ -670,14 +956,14 @@ class Executor:
 
         # Nifty > 1.5% from open
         nifty_open = self._daily.get("nifty_open")
-        nifty_now = self._quotes.get("NSE:NIFTY 50")
+        nifty_now = self._get_ltp_for_symbol("NIFTY")
         if nifty_open and nifty_now:
             nifty_move_pct = abs(nifty_now - nifty_open) / nifty_open * 100
             if nifty_move_pct > 1.5:
                 exceptions.append(f"Nifty move: {nifty_move_pct:.1f}% from open")
 
         # Margin > 70%
-        margin_pct = self._margin.current_utilization_pct()
+        margin_pct = self._margin.utilization_pct()
         if margin_pct > 70:
             exceptions.append(f"Margin utilization: {margin_pct:.0f}%")
 
@@ -689,10 +975,14 @@ class Executor:
             logger.warning("EXCEPTION DETECTED: %s", "; ".join(exceptions))
             try:
                 self._strategist.handle_exception(
-                    exceptions=exceptions,
-                    positions=self._positions,
-                    daily_state=self._daily,
-                    vix=self._vix,
+                    exception_type="; ".join(exceptions),
+                    details={"daily_state": self._daily, "vix": self._vix},
+                    open_positions=[
+                        {"symbol": p.symbol, "instrument": p.instrument,
+                         "direction": p.direction, "entry_price": p.entry_price,
+                         "stoploss": p.stoploss, "target": p.target}
+                        for p in self._positions
+                    ],
                 )
             except Exception as e:
                 logger.error("Exception handler failed: %s", e)
@@ -836,10 +1126,81 @@ class Executor:
         except Exception as e:
             logger.warning("Exit Telegram alert failed: %s", e)
 
+    # ── Stale Setup Detection ─────────────────────────────────────────
+
+    def _check_stale_setups(self, now: datetime) -> None:
+        """Dynamic playbook: refresh when all setups are fired/stale.
+
+        Triggers strategist ad-hoc check-in to generate fresh setups.
+        Rate-limited to once per hour to avoid spamming Claude calls.
+        """
+        if not self._playbook or not self._strategist:
+            return
+
+        # Don't refresh if at max trades for the day
+        trades_left = self._playbook.risk_budget.max_trades_today - self._daily.get("trades_today", 0)
+        if trades_left <= 0:
+            return
+
+        # Rate limit: once per hour
+        last_refresh = self._daily.get("last_stale_refresh")
+        if last_refresh:
+            from datetime import datetime as dt
+            try:
+                last_dt = dt.fromisoformat(last_refresh)
+                if (now - last_dt).total_seconds() < 3600:
+                    return
+            except (ValueError, TypeError):
+                pass
+
+        active = self._playbook.active_setups()
+        if not active:
+            # All setups fired/cancelled — need fresh setups
+            logger.info("STALE: No active setups, %d trade slots left — requesting refresh", trades_left)
+        else:
+            # Check if all active triggers are far from current price
+            all_stale = True
+            for s in active:
+                ltp = self._get_ltp_for_symbol(s.symbol)
+                if ltp is None:
+                    all_stale = False
+                    break
+                distance_pct = abs(ltp - s.trigger_level) / ltp * 100
+                if distance_pct < 1.5:
+                    all_stale = False
+                    break
+            if not all_stale:
+                return
+            logger.info("STALE: All %d active setups >1.5%% from trigger — requesting refresh", len(active))
+
+        # Call strategist checkin for a refresh
+        try:
+            result = self._strategist.checkin(checkin_number=0)  # 0 = ad-hoc refresh
+            if result.get("plan_changed"):
+                logger.info("STALE REFRESH: Playbook updated — %s", result.get("summary", ""))
+                self._playbook = self._state.load_playbook()  # reload
+                from v7.telegram import TelegramAlerter, AlertLevel
+                tg = TelegramAlerter()
+                tg.send(f"V7 auto-refresh: {result.get('summary', 'playbook updated')}", AlertLevel.LOW)
+            self._daily["last_stale_refresh"] = now.isoformat()
+        except Exception as e:
+            logger.warning("Stale refresh failed: %s", e)
+
     # ── Helpers ───────────────────────────────────────────────────────
+
+    def _get_setup_type(self, setup_id: str) -> SetupType:
+        """Look up SetupType from playbook by setup_id."""
+        if self._playbook:
+            for s in self._playbook.all_setups():
+                if s.id == setup_id:
+                    return s.type
+        return SetupType.BREAKOUT_LONG
 
     def _get_ltp_for_symbol(self, symbol: str) -> Optional[float]:
         """Get LTP for a symbol from latest quotes."""
+        # Try plain symbol first (get_batch_ltp returns {'NIFTY': 23461.5})
+        if symbol in self._quotes:
+            return self._quotes[symbol]
         # Try NSE:SYMBOL format
         key = f"NSE:{symbol}"
         if key in self._quotes:
