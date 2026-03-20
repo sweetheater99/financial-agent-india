@@ -152,6 +152,10 @@ def _init_components(paper: bool = False) -> dict:
     except (ImportError, Exception):
         pass
 
+    # Wire theta engine into executor so it ticks every cycle
+    if "executor" in components and "theta_engine" in components:
+        components["executor"].set_theta_engine(components["theta_engine"])
+
     return components
 
 

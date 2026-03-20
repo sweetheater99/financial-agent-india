@@ -4,7 +4,7 @@ Independent background income. Own risk budget (max 3% capital at risk).
 Max 40% margin utilization.
 
 Entry: Friday/Monday when VIX 16-25 (NSE weekly expiry = Tuesday since Sep 2025)
-Exit: profit target (50%), delta breach, Wednesday EOD, never Thursday
+Exit: profit target (70%), delta breach, Monday EOD, never Tuesday (expiry)
 
 Spec ref: Component 5 (lines 597-642), Margin Budget (lines 942-957)
 """
@@ -246,11 +246,11 @@ class ThetaEngine:
             logger.info("Condor risk exceeds 3%% budget, skipping")
             return
 
-        # Compute next Thursday expiry
-        days_to_thu = (3 - today.weekday()) % 7
-        if days_to_thu == 0:
-            days_to_thu = 7
-        expiry = today + timedelta(days=days_to_thu)
+        # Compute next Tuesday expiry (NSE weekly expiry moved to Tuesday Sep 2025)
+        days_to_tue = (1 - today.weekday()) % 7
+        if days_to_tue == 0:
+            days_to_tue = 7
+        expiry = today + timedelta(days=days_to_tue)
 
         logger.info(
             "THETA ENTRY: Nifty iron condor %d/%d/%d/%d credit=%.1f expiry=%s",
@@ -357,14 +357,14 @@ class ThetaEngine:
     # ── Time Management ───────────────────────────────────────────────
 
     def _should_close_for_time(self, today: date) -> bool:
-        """Close by Wednesday EOD or never hold to Thursday."""
+        """Close by Monday EOD or never hold to Tuesday (expiry day)."""
         if self._condor is None:
             return False
-        # Thursday = expiry day → must close
-        if today.weekday() == 3:  # Thursday
+        # Tuesday = expiry day → must close
+        if today.weekday() == 1:  # Tuesday
             return True
-        # Wednesday → close if still open (gamma risk)
-        if today.weekday() == 2:  # Wednesday
+        # Monday → close if still open (gamma risk before Tuesday expiry)
+        if today.weekday() == 0:  # Monday
             return True
         return False
 
