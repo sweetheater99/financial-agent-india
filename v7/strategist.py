@@ -69,6 +69,10 @@ CRITICAL RULES:
 - On UNCERTAIN days with VIX 16+, theta income should be the PRIMARY strategy, not a backup. Directional buys are secondary.
 - Premium sweet spot: ₹15-80. Below ₹15 = slippage death. Above ₹80 = too much capital risk.
 - Grade A entries only: trigger + volume confirmation. Don't force B-grade entries to fill your setup slots.
+- USE 60-MIN OPENING RANGE (9:15-10:15) for breakout levels — backtested 88.8% win rate vs 55% for 15-min.
+  Wait for the full 60-min candle to close before defining breakout levels. First hour = observe, then act.
+- DIRECTIONAL entries ONLY between 9:30-10:30 AM. After that, switch to theta/selling strategies.
+- Monday-Wednesday are the best directional days. Friday = mean reversion bias, skip breakouts.
 - If a symbol has been losing for 2+ consecutive days, DROP IT from the watchlist for the day.
 
 Instrument universe: NIFTY, BANKNIFTY, RELIANCE, HDFCBANK, ICICIBANK, TCS, TMPV, BAJFINANCE, SBIN, INFY"""

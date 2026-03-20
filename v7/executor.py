@@ -1312,10 +1312,12 @@ class Executor:
         return any(t.get("symbol") == symbol and t.get("pnl", 0) < 0 for t in closed)
 
     def _is_afternoon_cutoff(self, now, setup: Setup) -> bool:
-        """S2: No new directional option buys after 1:00 PM.
-        Theta decay accelerates in the last 2.5h — only allow spreads or skip.
+        """S2: No new directional option buys after 10:30 AM.
+        Research: 88.8% of ORB wins happen in first hour. After that,
+        theta decay + momentum fade kills option buying edge.
+        Spreads/condors allowed all day (they benefit from theta).
         """
-        if now.hour < 13:
+        if now.hour < 10 or (now.hour == 10 and now.minute < 30):
             return False
         # Allow spread/condor entries in afternoon
         if setup.type in (SetupType.CREDIT_SPREAD_BULL, SetupType.CREDIT_SPREAD_BEAR, SetupType.IRON_CONDOR):

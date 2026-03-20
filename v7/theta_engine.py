@@ -122,8 +122,8 @@ ENTRY_DELTA = 0.18
 SURVIVAL_ENTRY_DELTA = 0.15
 WING_WIDTH = 200                # points between short and long strikes
 MIN_CREDIT_PER_LOT = 40.0      # minimum net credit ₹30/lot
-PROFIT_TARGET_PCT = 0.50
-SURVIVAL_PROFIT_TARGET_PCT = 0.40
+PROFIT_TARGET_PCT = 0.70  # Research: close at 70-80% of max profit beats holding to expiry
+SURVIVAL_PROFIT_TARGET_PCT = 0.50  # Survival: still take 50%
 
 
 class ThetaEngine:
