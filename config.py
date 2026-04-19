@@ -95,10 +95,10 @@ class ClaudeCLIClient:
             if system:
                 cmd.extend(["--system-prompt", system])
 
-            cmd.append(user_text.strip())
-
+            # Pass prompt via stdin to avoid OS arg length limits
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=300,
+                cmd, capture_output=True, text=True, timeout=120,
+                input=user_text.strip(),
             )
 
             if result.returncode != 0:
@@ -108,6 +108,17 @@ class ClaudeCLIClient:
             try:
                 output = json.loads(result.stdout)
                 text = output.get("result", result.stdout)
+                # Log usage for window optimizer
+                try:
+                    usage = output.get("usage", {})
+                    if usage:
+                        import time, pathlib
+                        entry = json.dumps({"ts": int(time.time()), "input": usage.get("input_tokens", 0), "output": usage.get("output_tokens", 0), "cache_read": usage.get("cache_read_input_tokens", 0), "cache_create": usage.get("cache_creation_input_tokens", 0), "model": model_name, "label": "financial-agent"})
+                        pathlib.Path.home().joinpath(".claude-usage").mkdir(exist_ok=True)
+                        with open(pathlib.Path.home() / ".claude-usage" / "usage.jsonl", "a") as uf:
+                            uf.write(entry + "\n")
+                except Exception:
+                    pass  # Never break the agent for logging
             except json.JSONDecodeError:
                 text = result.stdout.strip()
 
@@ -185,22 +196,22 @@ def is_market_open(_now=None) -> tuple[bool, str]:
 # ── V2 Trading System Constants ──────────────────────────────────────────────
 
 NSE_HOLIDAYS_2026 = {
+    date(2026, 1, 15),   # Municipal Corporation Election (Maharashtra)
     date(2026, 1, 26),   # Republic Day
-    date(2026, 2, 26),   # Maha Shivaratri
     date(2026, 3, 3),    # Holi
-    date(2026, 3, 30),   # Id-Ul-Fitr
-    date(2026, 4, 2),    # Ram Navami
+    date(2026, 3, 26),   # Shri Ram Navami
+    date(2026, 3, 31),   # Shri Mahavir Jayanti
     date(2026, 4, 3),    # Good Friday
-    date(2026, 4, 14),   # Dr. Ambedkar Jayanti
+    date(2026, 4, 14),   # Dr. Baba Saheb Ambedkar Jayanti
     date(2026, 5, 1),    # Maharashtra Day
-    date(2026, 6, 5),    # Id-Ul-Adha
-    date(2026, 7, 6),    # Muharram
-    date(2026, 8, 15),   # Independence Day
-    date(2026, 8, 19),   # Janmashtami
+    date(2026, 5, 28),   # Bakri Id (Eid al-Adha)
+    date(2026, 6, 26),   # Muharram
+    date(2026, 9, 14),   # Ganesh Chaturthi
     date(2026, 10, 2),   # Mahatma Gandhi Jayanti
     date(2026, 10, 20),  # Dussehra
-    date(2026, 11, 9),   # Diwali (Laxmi Pujan)
-    date(2026, 11, 30),  # Guru Nanak Jayanti
+    date(2026, 11, 10),  # Diwali - Balipratipada
+    date(2026, 11, 24),  # Prakash Gurpurb Sri Guru Nanak Dev
+    date(2026, 12, 25),  # Christmas
 }
 
 

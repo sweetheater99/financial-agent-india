@@ -396,7 +396,7 @@ class ThetaEngine:
 
         # Profit check with actual option prices
         profit_pct = self._condor.profit_pct(option_prices)
-        target = self._profit_target()
+        target = self._profit_target_pct()
         if profit_pct >= target:
             logger.info("THETA PROFIT TARGET: %.1f%% >= %.1f%% — closing", profit_pct * 100, target * 100)
             self._close_condor("profit_target")

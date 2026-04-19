@@ -52,6 +52,7 @@ def _estimate_delta(strike: float, spot: float, option_type: str) -> float:
 def select_directional_strike(
     chain: list[dict], direction: str, spot: float,
     risk_budget: float, lot_size: int, symbol: str,
+    target_delta_override: float | None = None,
 ) -> dict | None:
     """Select the best strike for a directional option buy."""
     option_type = "CE" if direction == "bullish" else "PE"
@@ -150,7 +151,7 @@ def select_directional_strike(
     if not candidates:
         return None
 
-    target_delta = 0.45
+    target_delta = target_delta_override if target_delta_override is not None else 0.45
     candidates.sort(key=lambda c: (abs(c["delta"] - target_delta), -c["oi"]))
     return candidates[0]
 
@@ -162,32 +163,48 @@ def select_spread_strikes(
     """Select strikes for a credit spread."""
     sell_delta = STRIKE_FILTERS["spread_sell_delta"]
 
+    # Bear credit spread = sell CE (call spread), Bull credit spread = sell PE (put spread)
     if direction == "bearish":
-        option_type = "PE"
-    else:
         option_type = "CE"
+    else:
+        option_type = "PE"
+
+    # Pick sell strike at ~0.5% OTM from spot (delta estimator is unreliable for weeklies).
+    # For bear call: sell strike ABOVE spot. For bull put: sell strike BELOW spot.
+    if direction == "bearish":
+        target_strike = spot * 1.005
+    else:
+        target_strike = spot * 0.995
 
     sell_candidates = []
     for entry in chain:
         opt = entry.get(option_type)
         if not opt or not opt.get("ltp"):
             continue
-        delta = abs(opt.get("delta", 0))
-        if abs(delta - sell_delta) < 0.10:
-            oi = opt.get("oi", 0)
-            volume = opt.get("volume", 0)
-            spread = _get_bid_ask_spread(opt)
-            if passes_liquidity_filter(oi, volume, spread, symbol):
-                sell_candidates.append({
-                    "strike": entry["strikePrice"],
-                    "premium": opt["ltp"],
-                    "delta": delta,
-                })
+        # Must be on the correct side of spot for the spread direction
+        if direction == "bearish" and entry["strikePrice"] <= spot:
+            continue
+        if direction == "bullish" and entry["strikePrice"] >= spot:
+            continue
+        # Premium must be reasonable (avoid deep OTM lottery strikes)
+        if opt["ltp"] < 5:
+            continue
+        oi = opt.get("oi", 0)
+        volume = opt.get("volume", 0)
+        spread = _get_bid_ask_spread(opt)
+        if not passes_liquidity_filter(oi, volume, spread, symbol):
+            continue
+        sell_candidates.append({
+            "strike": entry["strikePrice"],
+            "premium": opt["ltp"],
+            "delta": abs(opt.get("delta", 0)) or _estimate_delta(entry["strikePrice"], spot, option_type),
+        })
 
     if not sell_candidates:
         return None
 
-    sell_candidates.sort(key=lambda c: abs(c["delta"] - sell_delta))
+    # Pick the strike closest to target_strike
+    sell_candidates.sort(key=lambda c: abs(c["strike"] - target_strike))
     sell = sell_candidates[0]
 
     strikes = sorted(set(e["strikePrice"] for e in chain))
@@ -195,10 +212,13 @@ def select_spread_strikes(
     if sell_idx < 0:
         return None
 
+    # Bear call spread: buy HIGHER strike CE (further OTM protection)
+    # Bull put spread: buy LOWER strike PE (further OTM protection)
+    # 1 strike width (50pt for NIFTY) — keeps max_loss small enough to fit risk budget
     if direction == "bearish":
-        buy_idx = sell_idx - 2 if sell_idx >= 2 else 0
+        buy_idx = sell_idx + 1 if sell_idx + 1 < len(strikes) else len(strikes) - 1
     else:
-        buy_idx = sell_idx + 2 if sell_idx + 2 < len(strikes) else len(strikes) - 1
+        buy_idx = sell_idx - 1 if sell_idx >= 1 else 0
 
     buy_strike = strikes[buy_idx]
     buy_entry = next((e for e in chain if e["strikePrice"] == buy_strike), None)
@@ -210,23 +230,33 @@ def select_spread_strikes(
         return None
 
     net_credit = sell["premium"] - buy_opt["ltp"]
-    if net_credit < 15:
+    if net_credit < 5:
         return None
 
     strike_width = abs(sell["strike"] - buy_strike)
     max_loss = (strike_width - net_credit) * lot_size
 
-    if max_loss > risk_budget:
+    # Allow up to 1.25x risk_budget — daily gate will reject if it overflows total daily risk.
+    # NIFTY 50pt-wide spread can hit ₹3750 max loss; with low credit it overshoots a tight ₹3000 cap.
+    if max_loss > risk_budget * 1.25:
         return None
+
+    # Get tradingsymbols for both legs
+    sell_entry = next((e for e in chain if e["strikePrice"] == sell["strike"]), None)
+    sell_ts = sell_entry.get(option_type, {}).get("tradingsymbol", "") if sell_entry else ""
+    buy_ts = buy_opt.get("tradingsymbol", "")
 
     return {
         "sell_strike": sell["strike"],
         "buy_strike": buy_strike,
         "sell_premium": sell["premium"],
         "buy_premium": buy_opt["ltp"],
+        "sell_tradingsymbol": sell_ts,
+        "buy_tradingsymbol": buy_ts,
         "net_credit": net_credit,
         "max_loss": max_loss,
         "option_type": option_type,
+        "lot_size": sell_entry.get(option_type, {}).get("lotSize", lot_size) if sell_entry else lot_size,
     }
 
 

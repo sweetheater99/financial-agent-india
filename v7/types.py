@@ -142,6 +142,7 @@ class Position:
     initial_quantity: int = 0
     partial_exit_done: bool = False
     health_score: float = 100.0
+    breakeven_set: bool = False
 
     def __post_init__(self):
         if self.peak_price == 0.0:

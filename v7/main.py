@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import logging
 import traceback
 from datetime import date, datetime
 from pathlib import Path
@@ -563,6 +564,7 @@ def _apply_level_updates(state, updates: dict) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     """Main entry point."""
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = parse_args(argv)
 
     try:

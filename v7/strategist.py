@@ -57,21 +57,21 @@ SETUP TYPE BY DAY CLASSIFICATION:
 - LIKELY_TREND_UP/DOWN → breakout_long or breakout_short ONLY. This is where breakouts work.
 - LIKELY_RANGE / UNCERTAIN → PREFER support_bounce and resistance_fade. Breakouts get chopped in range days.
   If you can't identify clear S/R levels, declare "no trade" rather than forcing breakout entries.
-- EVENT_DAY → only low-conviction setups or theta if VIX >= 18.
+- EVENT_DAY → credit spreads and theta are highest edge. Low-to-medium conviction. VIX >= 18 means rich premiums — SELL them, do not sit out.
 
 CRITICAL RULES:
 - MAX 2 directional option buys per day. Remaining slots should be credit spreads or skip.
-- NO NEW directional entries after 10:30 AM — theta decay in last 2.5h kills premium buyers.
-  Afternoon entries MUST be credit spreads/condors or nothing.
-- NEVER repeat a losing symbol same day. If RELIANCE lost in the morning, don't set up RELIANCE again.
+- Directional buys allowed until 1:00 PM (any conviction). 1:00-2:30 PM: MEDIUM+ conviction only. After 2:30 PM: theta/spreads only.
+- AVOID repeating a losing symbol same day unless the setup is clearly different (e.g., morning breakout failed, afternoon reversal forming).
 - Iron condors / credit spreads when VIX >= 16 — this is the HIGHEST EDGE strategy. Research shows option sellers have 65-70% win rates vs 30% for buyers in Indian markets.
 - Theta plan MUST be "enter" when VIX >= 16 and day is Friday or Monday. theta_details should specify: sell 0.18 delta OTM, 200pt wings, 50% profit target.
 - On UNCERTAIN days with VIX 16+, theta income should be the PRIMARY strategy, not a backup. Directional buys are secondary.
-- Premium sweet spot: ₹15-80. Below ₹15 = slippage death. Above ₹80 = too much capital risk.
+- Premium sweet spot: ₹15-80 at normal VIX (15). At elevated VIX (20+), premiums scale — acceptable range is ₹15-120. The executor auto-adjusts the cap based on VIX. Do NOT avoid setups just because VIX makes premiums above ₹80.
+- MINIMUM: Always output at least 1 NIFTY setup with trigger_level, target, stoploss (non-zero). An empty nifty_setups array is NEVER acceptable when trade slots remain.
 - Grade A entries only: trigger + volume confirmation. Don't force B-grade entries to fill your setup slots.
 - USE 60-MIN OPENING RANGE (9:15-10:15) for breakout levels — backtested 88.8% win rate vs 55% for 15-min.
   Wait for the full 60-min candle to close before defining breakout levels. First hour = observe, then act.
-- DIRECTIONAL entries ONLY between 9:30-10:30 AM. After that, switch to theta/selling strategies.
+- BEST directional window: 9:30-11:00 AM. Full window: 9:30 AM-1:00 PM. Acceptable: 1:00-2:30 PM for MEDIUM+ conviction.
 - Monday-Wednesday are the best directional days. Friday = mean reversion bias, skip breakouts.
 - If a symbol has been losing for 2+ consecutive days, DROP IT from the watchlist for the day.
 
@@ -86,12 +86,23 @@ Output an updated playbook JSON with:
 - Possible: "no good setups today, theta only"
 Respond with ONLY the updated JSON playbook."""
 
-CHECKIN_SYSTEM = """You are doing a mid-session check-in on the trading playbook.
-Review current P&L, open positions, fired/unfired setups, level tests, OI changes, VIX.
-Output an updated playbook JSON with:
-- Confirm or modify remaining setups
-- Add new setup ONLY if a clear opportunity emerged
-- Declare "no trade rest of day" if choppy
+CHECKIN_SYSTEM = """You are doing a mid-session check-in. Your job is to KEEP THE AGENT TRADING, not to find reasons to stop.
+
+Review: current P&L, open positions, fired/unfired setups, level tests, OI changes, VIX.
+
+MANDATORY OUTPUT RULES:
+1. REMOVE no_trade_conditions that are no longer true (VIX dropped? remove VIX block. Chop settled? remove chop block). Start fresh — only include conditions that are CURRENTLY valid RIGHT NOW.
+2. For each unfired setup: confirm trigger is still valid OR replace with a better one. Do NOT just cancel — replace.
+3. If a stock was banned but the reason expired (news absorbed, results digested), UNBAN it.
+4. Add 1-2 NEW setups if clear opportunities emerged. The market moves — new levels form.
+5. Mark setups as "cancelled": true ONLY if the level was definitively broken against the setup direction.
+6. If zero trades have fired today and it's past 11 AM, actively look for the BEST available setup even if conviction is medium. One disciplined trade > zero trades.
+7. Maximum 5 no_trade_conditions. If you have more, keep only the 5 most important.
+8. MINIMUM SETUP RULE: You MUST output at least 1 NIFTY setup with ALL fields filled (trigger_level, target, stoploss — never zero). High VIX = rich premiums = high edge for credit spreads. If VIX > 20, at least one setup MUST be a credit_spread (bull or bear). No excuse for empty nifty_setups when there are trade slots remaining.
+9. Every setup MUST have numeric target and stoploss. If you cannot determine exact levels, use the opening range high/low +/- 50 points. Never output target=0 or stoploss=0.
+
+BIAS: A day with 1 disciplined trade that loses on SL is BETTER than a day with 0 trades. Do not optimize for zero-loss days. High VIX is an OPPORTUNITY for premium sellers, not a reason to stop trading.
+
 Respond with ONLY the updated JSON playbook."""
 
 EXCEPTION_SYSTEM = """You are handling an EXCEPTION in the trading session.
@@ -292,7 +303,8 @@ def _playbook_schema_hint() -> str:
         "target": float,
         "stoploss": float,
         "max_risk_pct": float,
-        "conviction": "high|medium|low"
+        "conviction": "high|medium|low",
+        "cancelled": false
       }
     ],
     "no_trade_zone": "low-high"
@@ -381,7 +393,7 @@ def _parse_setup(d: dict, symbol: str = "NIFTY") -> Setup:
     """Parse a setup dict from Claude's response into a Setup object."""
     target = float(d.get("target", 0))
     stoploss = float(d.get("stoploss", 0))
-    trigger_text = d.get("trigger", "")
+    trigger_text = d.get("trigger", d.get("entry_condition", d.get("trigger_condition", "")))
 
     # Map type string to SetupType enum
     type_map = {
@@ -389,11 +401,44 @@ def _parse_setup(d: dict, symbol: str = "NIFTY") -> Setup:
         "breakout_short": SetupType.BREAKOUT_SHORT,
         "support_bounce": SetupType.SUPPORT_BOUNCE,
         "resistance_fade": SetupType.RESISTANCE_FADE,
+        "range_fade": SetupType.RESISTANCE_FADE,
         "credit_spread_bull": SetupType.CREDIT_SPREAD_BULL,
         "credit_spread_bear": SetupType.CREDIT_SPREAD_BEAR,
+        "credit_spread": SetupType.CREDIT_SPREAD_BEAR,  # infer from direction below
         "iron_condor": SetupType.IRON_CONDOR,
     }
-    setup_type = type_map.get(d.get("type", ""), SetupType.BREAKOUT_LONG)
+    raw_type = d.get("type", "")
+    setup_type = type_map.get(raw_type, SetupType.BREAKOUT_LONG)
+    # Handle "credit_spread" with direction field
+    if raw_type == "credit_spread":
+        direction = d.get("direction", "bear")
+        if "bull" in direction:
+            setup_type = SetupType.CREDIT_SPREAD_BULL
+
+    # STRICT VALIDATION: resolve direction from target/stoploss orientation (LLM numbers are more
+    # reliable than LLM labels). Bear setups: target < stoploss. Bull: target > stoploss.
+    bullish_types = {SetupType.BREAKOUT_LONG, SetupType.SUPPORT_BOUNCE, SetupType.CREDIT_SPREAD_BULL}
+    bearish_types = {SetupType.BREAKOUT_SHORT, SetupType.RESISTANCE_FADE, SetupType.CREDIT_SPREAD_BEAR}
+    if target > 0 and stoploss > 0 and target != stoploss:
+        numbers_bullish = target > stoploss
+        label_bullish = setup_type in bullish_types
+        if numbers_bullish != label_bullish:
+            import logging
+            _logger = logging.getLogger(__name__)
+            _logger.warning(
+                "Setup %s: type=%s says %s but target=%.1f/stoploss=%.1f says %s — flipping to match numbers",
+                d.get("id", d.get("setup_id", "?")), raw_type,
+                "bullish" if label_bullish else "bearish",
+                target, stoploss,
+                "bullish" if numbers_bullish else "bearish",
+            )
+            # Flip to the orientation the numbers imply, preferring spread types if name has "credit"/"spread"
+            setup_id_lower = str(d.get("id", d.get("setup_id", ""))).lower()
+            is_spread = "spread" in setup_id_lower or "credit" in setup_id_lower or setup_type in {SetupType.CREDIT_SPREAD_BULL, SetupType.CREDIT_SPREAD_BEAR}
+            if numbers_bullish:
+                setup_type = SetupType.CREDIT_SPREAD_BULL if is_spread else SetupType.BREAKOUT_LONG
+            else:
+                setup_type = SetupType.CREDIT_SPREAD_BEAR if is_spread else SetupType.BREAKOUT_SHORT
 
     conviction_map = {
         "high": Conviction.HIGH,
@@ -402,10 +447,15 @@ def _parse_setup(d: dict, symbol: str = "NIFTY") -> Setup:
     }
     conviction = conviction_map.get(d.get("conviction", "medium"), Conviction.MEDIUM)
 
-    trigger_level = _extract_trigger_level(trigger_text, target, stoploss)
+    # Handle direct trigger_level or extract from text
+    raw_trigger = d.get("trigger_level")
+    if raw_trigger is not None and float(raw_trigger) > 0:
+        trigger_level = float(raw_trigger)
+    else:
+        trigger_level = _extract_trigger_level(trigger_text, target, stoploss)
 
     return Setup(
-        id=d.get("id", "X1"),
+        id=d.get("id", d.get("setup_id", "X1")),
         priority=int(d.get("priority", 99)),
         type=setup_type,
         symbol=d.get("symbol", symbol),
@@ -417,6 +467,8 @@ def _parse_setup(d: dict, symbol: str = "NIFTY") -> Setup:
         stoploss=stoploss,
         max_risk_pct=float(d.get("max_risk_pct", 1.5)),
         conviction=conviction,
+        fired=bool(d.get("fired", False)),
+        cancelled=bool(d.get("cancelled", False)),
     )
 
 
@@ -463,11 +515,14 @@ def parse_playbook_response(raw: str, today: date | None = None) -> Playbook | N
             DayClassification.UNCERTAIN,
         )
 
-        # Nifty setups
+        # Nifty setups — handle both nifty_plan.setups and direct nifty_setups
         nifty_plan = data.get("nifty_plan", {})
+        nifty_raw = data.get("nifty_setups", [])
+        if not nifty_raw:
+            nifty_raw = nifty_plan.get("setups", [])
         nifty_setups = [
             _parse_setup(s, symbol="NIFTY")
-            for s in nifty_plan.get("setups", [])
+            for s in nifty_raw
         ]
 
         # Stock plans (cap at MAX_STOCK_PLANS, drop stubs with no levels)
@@ -513,7 +568,7 @@ def parse_playbook_response(raw: str, today: date | None = None) -> Playbook | N
             nifty_setups=nifty_setups,
             stock_plans=stock_plans,
             risk_budget=risk_budget,
-            no_trade_conditions=data.get("no_trade_conditions", []),
+            no_trade_conditions=data.get("no_trade_conditions", [])[:5],
             carry_rules=carry_rules,
             market_context=market_context,
             theta_action=theta_action,
@@ -617,6 +672,55 @@ def default_exception_action(exception_type: str) -> dict:
     return defaults.get(exception_type, {"action": "hold_no_new", "details": f"Unknown exception: {exception_type}. Defaulting to hold."})
 
 
+def _backfill_or_levels(playbook: "Playbook", or_high: float, or_low: float) -> None:
+    """Fill in target/stoploss/trigger for OR setups that Claude left at 0.
+
+    Uses opening range high/low to derive sensible levels based on setup ID.
+    Also fixes setup types that may have been misassigned.
+    """
+    if or_high <= 0 or or_low <= 0:
+        return
+
+    or_range = or_high - or_low
+    type_fixes = {
+        "NF_OR_HIGH_FADE": SetupType.RESISTANCE_FADE,
+        "NF_OR_LOW_BOUNCE": SetupType.SUPPORT_BOUNCE,
+        "NF_OR_BREAKOUT_LONG": SetupType.BREAKOUT_LONG,
+        "NF_OR_BREAKDOWN_SHORT": SetupType.BREAKOUT_SHORT,
+    }
+
+    for s in playbook.nifty_setups:
+        # Fix misassigned setup types
+        if s.id in type_fixes and s.type != type_fixes[s.id]:
+            log.info("Fixing setup %s type: %s -> %s", s.id, s.type.value, type_fixes[s.id].value)
+            s.type = type_fixes[s.id]
+
+        # Backfill trigger/target/stoploss from OR levels
+        if s.target == 0 or s.stoploss == 0:
+            if "HIGH_FADE" in s.id or "RESISTANCE" in s.id:
+                s.trigger_level = or_high
+                s.target = or_low  # fade from high to low
+                s.stoploss = or_high + or_range * 0.3  # SL above OR high
+            elif "LOW_BOUNCE" in s.id or "SUPPORT" in s.id:
+                s.trigger_level = or_low
+                s.target = or_high  # bounce from low to high
+                s.stoploss = or_low - or_range * 0.3  # SL below OR low
+            elif "BREAKOUT_LONG" in s.id:
+                s.trigger_level = or_high
+                s.target = or_high + or_range  # 1:1 R:R from OR range
+                s.stoploss = or_high - or_range * 0.5  # SL inside OR
+            elif "BREAKDOWN_SHORT" in s.id:
+                s.trigger_level = or_low
+                s.target = or_low - or_range  # 1:1 R:R from OR range
+                s.stoploss = or_low + or_range * 0.5  # SL inside OR
+            else:
+                # Generic: skip — cannot infer levels
+                log.warning("Setup %s has target=0 but no OR-level inference rule — skipping backfill", s.id)
+                continue
+            log.info("Backfilled OR levels for %s: trigger=%.2f target=%.2f sl=%.2f",
+                     s.id, s.trigger_level, s.target, s.stoploss)
+
+
 # ── Strategist Class ────────────────────────────────────────────────────
 
 
@@ -632,8 +736,8 @@ class Strategist:
         self._client = get_anthropic_client()
         self._model = CLAUDE_MODEL
         self._model_light = CLAUDE_MODEL_LIGHT
-        self._max_retries = 3
-        self._retry_delay = 120  # seconds
+        self._max_retries = 1
+        self._retry_delay = 5  # seconds
 
         from v7.state import StateManager
         from pathlib import Path
@@ -771,7 +875,12 @@ class Strategist:
             try:
                 from v7.oi_pipeline import OIPipeline
                 oi = OIPipeline(data_dir=self._data_dir)
-                oi_changes = oi.compute_oi_changes("NIFTY")
+                oi_changes_raw = oi.compute_oi_changes("NIFTY")
+                # Trim to top 5 strikes to reduce prompt size
+                if isinstance(oi_changes_raw, dict):
+                    oi_changes = dict(list(oi_changes_raw.items())[:3])
+                else:
+                    oi_changes = oi_changes_raw
             except Exception:
                 pass
 
@@ -793,6 +902,7 @@ class Strategist:
                     "high": opening_range_high,
                     "low": opening_range_low,
                 }
+                _backfill_or_levels(playbook, opening_range_high, opening_range_low)
                 self._state.save_playbook(playbook)
                 return playbook
 
@@ -801,6 +911,7 @@ class Strategist:
             "high": opening_range_high,
             "low": opening_range_low,
         }
+        _backfill_or_levels(current, opening_range_high, opening_range_low)
         self._state.save_playbook(current)
         return current
 
@@ -841,7 +952,12 @@ class Strategist:
         try:
             from v7.oi_pipeline import OIPipeline
             oi = OIPipeline(data_dir=self._data_dir)
-            oi_changes = oi.compute_oi_changes("NIFTY")
+            oi_changes_raw = oi.compute_oi_changes("NIFTY")
+            # Trim to top 5 strikes to reduce prompt size
+            if isinstance(oi_changes_raw, dict):
+                oi_changes = dict(list(oi_changes_raw.items())[:3])
+            else:
+                oi_changes = oi_changes_raw
         except Exception:
             pass
 
@@ -873,6 +989,29 @@ class Strategist:
                 )
             extra_sections.append("\n".join(health_lines))
 
+        # Trade hunger: show trade activity vs target
+        trades_today = daily.get("trades_today", 0)
+        banned_count = len(daily.get("banned_symbols", []))
+        hunger_lines = ["## Trade Activity"]
+        hunger_lines.append(f"- Trades today: {trades_today} (target: 1-2)")
+        hunger_lines.append(f"- Banned symbols: {banned_count}")
+        if trades_today == 0:
+            hunger_lines.append("- WARNING: Zero trades today. Bias toward finding the best available setup.")
+        extra_sections.append("\n".join(hunger_lines))
+
+        # Add current spot prices so LLM knows where the market IS
+        if self._data_feed:
+            spot_lines = ["## Current Spot Prices"]
+            try:
+                ltps = self._data_feed.get_batch_ltp(["NIFTY", "BANKNIFTY"])
+                for sym, ltp in ltps.items():
+                    if ltp:
+                        spot_lines.append(f"- {sym}: {ltp:.2f}")
+            except Exception:
+                pass
+            if len(spot_lines) > 1:
+                extra_sections.append("\n".join(spot_lines))
+
         prompt = build_checkin_prompt(
             current_playbook=current.to_dict(),
             daily_pnl=daily_pnl, open_positions=open_positions,
@@ -882,8 +1021,12 @@ class Strategist:
             extra_sections=extra_sections,
         )
 
-        raw = self._call_claude(prompt, system=CHECKIN_SYSTEM)
+        raw = self._call_claude(prompt, system=CHECKIN_SYSTEM, model=self._model_light)
         if raw:
+            # Debug: log raw response to see what the LLM actually returned
+            with open("/tmp/checkin_raw.txt", "w") as _f:
+                _f.write(raw)
+            log.info("CHECKIN RAW dumped to /tmp/checkin_raw.txt (%d bytes)", len(raw))
             playbook = parse_playbook_response(raw)
             if playbook:
                 playbook.opening_range = current.opening_range

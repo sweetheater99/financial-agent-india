@@ -23,7 +23,13 @@ from v7.config_v7 import HEALTH_SCORE
 from v7.types import Position
 
 # Candle: [timestamp, open, high, low, close, volume]
-Candle = Sequence  # [ts, o, h, l, c, v]
+Candle = Sequence  # [ts, o, h, l, c, v] or dict with named keys
+
+def _close(c) -> float:
+    return c["close"] if isinstance(c, dict) else c[4]
+
+def _volume(c) -> float:
+    return c["volume"] if isinstance(c, dict) else c[5]
 
 # Expected trade duration (minutes) by setup type
 _SETUP_DURATIONS: dict[str, int] = {
@@ -101,7 +107,7 @@ def score_momentum(pos: Position, candles: list[Candle]) -> float:
         return 50.0
 
     last5 = candles[-5:]
-    closes = [c[4] for c in last5]
+    closes = [_close(c) for c in last5]
     # Weights: oldest=1, newest=5
     weights = [1, 2, 3, 4, 5]
     total_weight = sum(weights[1:])  # 14 — we compare pairs
@@ -150,8 +156,8 @@ def score_volume(candles: list[Candle]) -> float:
     prior3 = candles[-6:-3]
     last3 = candles[-3:]
 
-    prior_vol = sum(c[5] for c in prior3)
-    last_vol = sum(c[5] for c in last3)
+    prior_vol = sum(_volume(c) for c in prior3)
+    last_vol = sum(_volume(c) for c in last3)
 
     if prior_vol <= 0:
         return 50.0

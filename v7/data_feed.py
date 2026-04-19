@@ -80,6 +80,25 @@ class DataFeed:
             log.error(f"DataFeed: LTP fetch failed — {e}")
             return self._last_ltp
 
+    def is_quote_stale(self) -> bool:
+        """Check if Kite quotes are from a previous day (market closed / holiday).
+        Returns True if quotes are stale and should NOT be acted on."""
+        if self.mode != "kite" or not self.kite:
+            return False
+        try:
+            q = self.kite.quote(["NSE:NIFTY 50"])
+            ts = q.get("NSE:NIFTY 50", {}).get("timestamp")
+            if ts is None:
+                return True
+            from datetime import date
+            quote_date = ts.date() if hasattr(ts, "date") else date.today()
+            if quote_date < date.today():
+                log.warning("DataFeed: STALE QUOTES — NIFTY timestamp %s is from previous day. Market likely closed.", ts)
+                return True
+        except Exception as e:
+            log.warning("DataFeed: stale check failed: %s", e)
+        return False
+
     def _fetch_ltp_batch(self, symbols: list[str]) -> dict[str, float]:
         if self.mode == "kite" and self.kite:
             from v7.config_v7 import WATCHLIST

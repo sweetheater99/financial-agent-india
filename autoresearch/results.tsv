@@ -37,3 +37,25 @@ timestamp	experiment_num	baseline_score	experiment_score_train	experiment_score_
 2026-03-18T15:57:37	36	0.2952	0.0773	0.2952	0.0000	REJECTED	156	21	2	Increase momentum target from 0.9 to 1.0
 2026-03-18T15:57:55	37	0.2952	0.0773	0.2952	0.0000	REJECTED	156	21	2	Reduce trailing activation from 3.0 to 2.5
 2026-03-18T15:57:58	38	0.2952	0.0773	0.2952	0.0000	REJECTED	156	21	2	Increase ADX threshold from 20 to 25
+2026-03-23T15:46:18	39	0.1862	0.0773	0.1862	0.0000	REJECTED	148	27	2	Lower cash trigger VIX from 25 to 20
+2026-03-23T15:46:53	40	0.1862	0.0533	0.2067	+0.0205	REJECTED	152	28	2	Reduce max holding period from 15 to 12 days
+2026-03-23T15:47:12	41	0.1862	0.0840	0.1692	-0.0170	REJECTED	160	29	2	Reduce max holding period from 15 to 10 days
+2026-03-23T15:47:34	42	0.1862	0.0693	0.2067	+0.0205	REJECTED	151	28	2	Reduce max holding period from 15 to 13 days
+2026-03-23T15:48:04	43	0.1862	0.0760	0.2010	+0.0148	REJECTED	153	28	4	Reduce max_hold_days to 12 + tighten futures SL to 3.0x ATR
+2026-03-23T15:48:26	44	0.1862	0.0773	0.1862	0.0000	REJECTED	148	27	2	Increase buildup signal weight from 2.0 to 2.5
+2026-03-23T15:48:59	45	0.1862	0.0533	0.2315	+0.0453	REJECTED	173	40	2	Lower futures score threshold from 2.5 to 2.0
+2026-03-23T15:49:20	46	0.1862	0.0533	0.2315	+0.0453	REJECTED	173	40	2	Lower futures score threshold from 2.5 to 1.8
+2026-03-23T15:49:49	47	0.1862	0.0520	0.2390	+0.0528	REJECTED	180	41	4	Combine futures threshold 2.0 + max_hold_days 12
+2026-03-23T15:50:19	48	0.1862	0.0547	0.1947	+0.0085	REJECTED	180	42	6	Add tighter SL (3.0x) to winning combo
+2026-03-23T15:50:41	49	0.1862	0.0773	0.1862	0.0000	REJECTED	154	27	2	Lower momentum score threshold from 3.5 to 3.0
+2026-03-23T15:51:07	50	0.1862	0.0747	0.2452	+0.0590	REJECTED	159	34	4	Combine futures threshold 2.2 + max_hold_days 12
+2026-03-23T15:51:31	51	0.1862	0.0747	0.2452	+0.0590	REJECTED	159	34	4	Combine futures threshold 2.3 + max_hold_days 12
+2026-03-23T15:51:55	52	0.1862	0.0773	0.2745	+0.0883	REJECTED	161	34	4	Combine futures threshold 2.2 + max_hold_days 11
+2026-03-23T15:52:21	53	0.1862	0.0840	0.2217	+0.0355	REJECTED	163	34	4	Combine futures threshold 2.2 + max_hold_days 10
+2026-03-23T15:52:52	54	0.1862	0.0893	0.2393	+0.0532	REJECTED	169	35	6	Add tighter target (1.25x) to winning combo
+2026-03-23T15:53:20	55	0.1862	0.0773	0.2745	+0.0883	REJECTED	161	34	4	Combine futures threshold 2.1 + max_hold_days 11
+2026-03-23T15:53:44	56	0.1862	0.0773	0.1862	0.0000	REJECTED	148	27	2	Lower spread max allocation from 0.4 to 0.3
+2026-03-23T15:54:11	57	0.1862	0.0773	0.1862	0.0000	REJECTED	148	27	2	Reduce momentum max allocation from 0.2 to 0.1
+2026-03-23T15:54:38	58	0.1862	0.0773	0.1862	0.0000	REJECTED	148	27	2	Disable condor strategy by setting VIX min to 50
+2026-03-23T15:55:13	59	0.1862	0.0773	0.2745	+0.0883	REJECTED	161	34	6	Winning combo + increase cash_min to 0.25
+2026-03-23T15:55:51	60	0.1862	0.0773	0.2745	+0.0883	REJECTED	161	34	6	Winning combo + tighter trailing stops (2.0%)

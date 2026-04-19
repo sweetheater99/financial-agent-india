@@ -157,14 +157,38 @@ def get_conviction_risk_pct(conviction: str) -> float:
 
 # ── S4: Premium Filter ────────────────────────────────────────────────
 PREMIUM_FILTER = {
-    "min_premium": 15.0,   # Below this: bid-ask slippage kills you
-    "max_premium": 80.0,   # Above this: too much capital at risk per lot
+    "min_premium": 5.0,    # 50pt-wide spreads have ₹5-15 credit. Live: raise back to 10+
+    "max_premium_base": 80.0,   # Base max at normal VIX (~15)
+    "max_premium_abs": 200.0,   # Absolute ceiling regardless of VIX
+    "vix_baseline": 15.0,       # VIX level where base max applies
+    "vix_scale_per_point": 0.08, # 8% increase per VIX point above baseline
 }
+
+
+def get_max_premium(vix: float) -> float:
+    # VIX-adjusted max premium. Higher VIX = higher premiums are normal.
+    base = PREMIUM_FILTER["max_premium_base"]
+    ceiling = PREMIUM_FILTER["max_premium_abs"]
+    baseline = PREMIUM_FILTER["vix_baseline"]
+    scale = PREMIUM_FILTER["vix_scale_per_point"]
+    if vix <= baseline:
+        return base
+    adjusted = base * (1.0 + (vix - baseline) * scale)
+    return min(adjusted, ceiling)
+
+
+def get_target_delta(vix: float) -> float:
+    """Lower target delta when VIX is elevated — cheaper premiums, better risk/reward."""
+    if vix <= 15:
+        return 0.45
+    if vix >= 28:
+        return 0.30
+    return round(0.45 - (vix - 15) * (0.15 / 13), 2)
 
 # ── S7: Soft Time Stop ────────────────────────────────────────────────
 TIME_STOP = {
-    "min_age_minutes": 90,     # Don't cut before 90 min
-    "min_premium_drop_pct": 15.0,  # Only cut if premium dropped 15%+
+    "min_age_minutes": 60,     # Cut bleeding trades after 60 min
+    "min_premium_drop_pct": 10.0,  # Cut if premium dropped 10%+ (was 15%)
 }
 
 # ── Daily Profit Target ───────────────────────────────────────────────

@@ -13,7 +13,7 @@ Spec ref: Component 2 (lines 319-438)
 from __future__ import annotations
 
 import logging
-from datetime import datetime, date, time
+from datetime import datetime, date, time, timedelta
 from typing import Optional
 
 from v7.types import (
@@ -78,6 +78,23 @@ class Executor:
         self._vix: float = 0.0
         self._initialized = False
 
+    def _audit_gate(self, setup_id: str, symbol: str, gate: str, decision: str,
+                    ltp: float = 0.0, trigger: float = 0.0, detail: str = "") -> None:
+        """Append one row to data/v7/gate_audit.csv for EOD analysis."""
+        import csv, os
+        from datetime import datetime
+        path = "data/v7/gate_audit.csv"
+        new_file = not os.path.exists(path)
+        try:
+            with open(path, "a", newline="") as f:
+                w = csv.writer(f)
+                if new_file:
+                    w.writerow(["ts", "setup_id", "symbol", "gate", "decision", "ltp", "trigger", "detail"])
+                w.writerow([datetime.now().isoformat(timespec="seconds"), setup_id, symbol,
+                            gate, decision, f"{ltp:.2f}", f"{trigger:.2f}", detail])
+        except Exception as e:
+            logger.warning("gate_audit write failed: %s", e)
+
     def initialize(self) -> None:
         """Load persisted state. Called once at bot start or after restart."""
         self._playbook = self._state.load_playbook()
@@ -114,6 +131,11 @@ class Executor:
         if not self._initialized:
             self.initialize()
 
+        # STALE QUOTE GUARD: abort if Kite returns previous-day data (holiday/closed market)
+        if self._data.is_quote_stale():
+            logger.warning("STALE QUOTES DETECTED — aborting tick (market likely closed)")
+            return
+
         # 1. FETCH DATA
         self._fetch_data(now)
 
@@ -135,8 +157,12 @@ class Executor:
         if hasattr(self, '_theta_engine') and self._theta_engine:
             try:
                 self._theta_engine.tick()
+                self._theta_crash_alerted = False  # reset on success
             except Exception as e:
                 logger.error("Theta engine tick failed: %s", e)
+                if not getattr(self, "_theta_crash_alerted", False):
+                    self._theta_crash_alerted = True
+                    self._send_theta_crash_alert(str(e))
 
         # 5. EXCEPTION DETECTION (every tick)
         self._check_exceptions(now)
@@ -259,58 +285,80 @@ class Executor:
         elif setup.type in (SetupType.BREAKOUT_SHORT, SetupType.RESISTANCE_FADE):
             triggered = ltp < setup.trigger_level
         elif setup.type in (SetupType.CREDIT_SPREAD_BULL, SetupType.CREDIT_SPREAD_BEAR):
-            triggered = ltp > setup.trigger_level  # simplified
+            # Credit spreads: target/stoploss are PREMIUM amounts, not price levels.
+            # Fire when underlying is within 0.5% of trigger_level (price reached the zone).
+            # Strategist's instrument/strike_logic determines directional intent at strike-selection time.
+            proximity_pct = abs(ltp - setup.trigger_level) / setup.trigger_level if setup.trigger_level else 1.0
+            triggered = proximity_pct <= 0.005
 
         if not triggered:
             dist = abs(ltp - setup.trigger_level)
             dist_pct = dist / setup.trigger_level * 100 if setup.trigger_level else 0
             logger.info("TICK %s(%s): ltp=%.1f trigger=%.1f dist=%.1f(%.1f%%)",
                         setup.id, setup.symbol, ltp, setup.trigger_level, dist, dist_pct)
+            self._audit_gate(setup.id, setup.symbol, "trigger", "BLOCK", ltp, setup.trigger_level, f"type={setup.type.value} dist={dist:.1f}")
             return
 
         # Concentration guard: max 1 position per symbol
         if self._has_symbol_concentration(setup.symbol):
             logger.info("Setup %s: already holding %s — concentration guard", setup.id, setup.symbol)
+            self._audit_gate(setup.id, setup.symbol, "concentration", "BLOCK", ltp, setup.trigger_level, "already holding")
             return
 
         # Cooldown guard: symbol was health-exited today
         if self._is_symbol_cooled_down(setup.symbol):
             logger.info("Setup %s: %s cooled down today — skipping", setup.id, setup.symbol)
+            self._audit_gate(setup.id, setup.symbol, "cooldown", "BLOCK", ltp, setup.trigger_level, "health exit cooldown")
             return
 
         # S1: Same-symbol repeat blocker — don't re-enter a symbol that lost today
-        if self._symbol_lost_today(setup.symbol):
-            logger.info("Setup %s: %s already lost today — repeat blocker", setup.id, setup.symbol)
+        if self._symbol_lost_today(setup.symbol, setup.type.value):
+            logger.info("Setup %s: %s already lost today (same type: %s) — repeat blocker", setup.id, setup.symbol, setup.type.value)
+            self._audit_gate(setup.id, setup.symbol, "repeat_blocker", "BLOCK", ltp, setup.trigger_level, f"same type {setup.type.value} lost today")
             return
 
         # Playbook symbol/type bans (parsed from no_trade_conditions)
         if setup.symbol in self._daily.get("banned_symbols", []):
             logger.info("Setup %s: %s banned by playbook", setup.id, setup.symbol)
+            self._audit_gate(setup.id, setup.symbol, "banned_symbol", "BLOCK", ltp, setup.trigger_level, "")
             return
         if setup.type.value in self._daily.get("banned_types", []):
             logger.info("Setup %s: %s banned by playbook", setup.id, setup.type.value)
+            self._audit_gate(setup.id, setup.symbol, "banned_type", "BLOCK", ltp, setup.trigger_level, setup.type.value)
             return
 
         # S2: Afternoon entry guard — no new option buys after 1:00 PM
         if self._is_afternoon_cutoff(now, setup):
             logger.info("Setup %s: after 1PM cutoff for directional buys — skipping", setup.id)
+            self._audit_gate(setup.id, setup.symbol, "afternoon_cutoff", "BLOCK", ltp, setup.trigger_level, now.strftime("%H:%M"))
+            return
+
+        # Skip setups with missing levels (broken playbook data)
+        if setup.target == 0 or setup.stoploss == 0:
+            logger.warning("Setup %s: target=%.2f stoploss=%.2f — invalid levels, skipping", setup.id, setup.target, setup.stoploss)
+            self._audit_gate(setup.id, setup.symbol, "invalid_levels", "BLOCK", ltp, setup.trigger_level, f"tgt={setup.target} sl={setup.stoploss}")
             return
 
         # Skip if price already past target (would enter and exit same tick)
-        if setup.type in (SetupType.BREAKOUT_SHORT, SetupType.RESISTANCE_FADE):
-            if ltp < setup.target:
-                logger.info("Setup %s: price %.2f already past target %.2f — skipping stale trigger",
-                            setup.id, ltp, setup.target)
+        # NOTE: skip this check for credit spreads — their target/stoploss are premium amounts, not price levels
+        is_credit_spread = setup.type in (SetupType.CREDIT_SPREAD_BULL, SetupType.CREDIT_SPREAD_BEAR, SetupType.IRON_CONDOR)
+        if not is_credit_spread and setup.type in (SetupType.BREAKOUT_SHORT, SetupType.RESISTANCE_FADE):
+            tolerance = setup.target * 0.015  # 1.5% past target tolerance
+            if ltp < setup.target - tolerance:
+                logger.info("Setup %s: price %.2f already past target %.2f (tolerance %.2f) — skipping stale trigger",
+                            setup.id, ltp, setup.target, tolerance)
                 return
-        elif setup.type in (SetupType.BREAKOUT_LONG, SetupType.SUPPORT_BOUNCE):
-            if ltp > setup.target:
-                logger.info("Setup %s: price %.2f already past target %.2f — skipping stale trigger",
-                            setup.id, ltp, setup.target)
+        elif not is_credit_spread and setup.type in (SetupType.BREAKOUT_LONG, SetupType.SUPPORT_BOUNCE):
+            tolerance = setup.target * 0.015  # 1.5% past target tolerance
+            if ltp > setup.target + tolerance:
+                logger.info("Setup %s: price %.2f already past target %.2f (tolerance %.2f) — skipping stale trigger",
+                            setup.id, ltp, setup.target, tolerance)
                 return
 
         # S6: Max 2 directional option buys per day
         if self._is_directional_buy(setup) and self._daily.get("directional_buys_today", 0) >= 2:
             logger.info("Setup %s: max 2 directional buys reached today — skipping", setup.id)
+            self._audit_gate(setup.id, setup.symbol, "max_directional", "BLOCK", ltp, setup.trigger_level, f"count={self._daily.get('directional_buys_today',0)}")
             return
 
         # Daily profit target — stop directional when ahead
@@ -319,11 +367,25 @@ class Executor:
         target_amount = self._capital * (DAILY_PROFIT_TARGET["target_pct"] / 100)
         if daily_pnl >= target_amount and self._is_directional_buy(setup):
             logger.info("Setup %s: daily P&L %.0f >= target %.0f — protecting gains", setup.id, daily_pnl, target_amount)
+            self._audit_gate(setup.id, setup.symbol, "profit_protect", "BLOCK", ltp, setup.trigger_level, f"pnl={daily_pnl:.0f}")
             return
 
-        # Risk budget check
-        risk_amount = self._capital * (setup.max_risk_pct / 100)
+        # Risk budget check — log survival mode explicitly
+        if self._playbook.risk_budget.survival_mode and self._is_directional_buy(setup):
+            logger.info("Setup %s: SURVIVAL MODE active — directional blocked", setup.id)
+            self._audit_gate(setup.id, setup.symbol, "survival_mode", "BLOCK", ltp, setup.trigger_level, "")
+            return
+
+        # Clamp to remaining daily budget (strategist sometimes sets tiny per-trade caps)
+        rb = self._playbook.risk_budget
         current_risk = sum(p.risk_amount() for p in self._positions)
+        daily_cap = self._capital * (rb.max_capital_at_risk_today_pct / 100)
+        remaining_daily = max(0.0, daily_cap - current_risk)
+        requested_risk = self._capital * (setup.max_risk_pct / 100)
+        risk_amount = min(requested_risk, remaining_daily)
+        if risk_amount < requested_risk:
+            logger.info("Setup %s: risk clamped %.0f -> %.0f (daily remaining)",
+                        setup.id, requested_risk, risk_amount)
         if not self._playbook.risk_budget.can_enter_trade(
             new_risk=risk_amount,
             current_risk=current_risk,
@@ -333,12 +395,15 @@ class Executor:
             daily_pnl=self._daily.get("daily_pnl", 0),
         ):
             logger.info("Setup %s triggered but risk budget exhausted", setup.id)
+            self._audit_gate(setup.id, setup.symbol, "risk_budget", "BLOCK", ltp, setup.trigger_level,
+                             f"req={risk_amount:.0f} cur={current_risk:.0f} trades={self._daily.get('trades_today',0)}")
             return
 
         # F&O ban check, brokerage check would go here
 
         # ENTER
         logger.info("Setup %s TRIGGERED at %.2f (level=%.2f)", setup.id, ltp, setup.trigger_level)
+        self._audit_gate(setup.id, setup.symbol, "pre_entry_all", "PASS", ltp, setup.trigger_level, "all gates cleared")
         self._enter_position(setup, ltp, now)
 
     def _enter_position(self, setup: Setup, trigger_ltp: float, now: datetime) -> None:
@@ -349,6 +414,19 @@ class Executor:
         3. Place order with actual tradingsymbol and option premium
         """
         setup.fired = True
+
+        # INDEX-ONLY FILTER: Only trade NIFTY/BANKNIFTY for directional setups
+        # Stocks bleed on wind-down — RELIANCE alone lost ₹5,225 across 4 trades
+        INDEX_ONLY_SYMBOLS = {"NIFTY", "BANKNIFTY", "NIFTY BANK"}
+        if setup.symbol not in INDEX_ONLY_SYMBOLS and setup.type not in (
+            SetupType.CREDIT_SPREAD_BULL, SetupType.CREDIT_SPREAD_BEAR,
+            SetupType.IRON_CONDOR,
+        ):
+            logger.info("Setup %s: %s is not an index — INDEX-ONLY filter, skipping directional",
+                        setup.id, setup.symbol)
+            self._audit_gate(setup.id, setup.symbol, "index_only", "BLOCK", trigger_ltp, setup.trigger_level, "non-index directional")
+            setup.fired = False
+            return
 
         direction = "bullish" if setup.type in (
             SetupType.BREAKOUT_LONG, SetupType.SUPPORT_BOUNCE,
@@ -367,64 +445,184 @@ class Executor:
             chain = self._data.get_option_chain(setup.symbol, "current")
             if not chain:
                 logger.warning("Setup %s: no option chain for %s — skipping", setup.id, setup.symbol)
+                self._audit_gate(setup.id, setup.symbol, "no_chain", "BLOCK", trigger_ltp, setup.trigger_level, "")
                 setup.fired = False
                 return
         except Exception as e:
             logger.error("Setup %s: option chain fetch failed: %s", setup.id, e)
+            self._audit_gate(setup.id, setup.symbol, "chain_error", "BLOCK", trigger_ltp, setup.trigger_level, str(e)[:60])
             setup.fired = False
             return
 
-        from v7.strike_selector import select_directional_strike
-        selected = select_directional_strike(
-            chain=chain,
-            direction=direction,
-            spot=trigger_ltp,
-            risk_budget=risk_amount,
-            lot_size=lot_size,
-            symbol=setup.symbol,
-        )
+        is_spread = setup.type in (SetupType.CREDIT_SPREAD_BULL, SetupType.CREDIT_SPREAD_BEAR)
 
-        if not selected:
-            logger.warning("Setup %s: no suitable strike found for %s — skipping", setup.id, setup.symbol)
-            setup.fired = False
-            return
+        if is_spread:
+            # Credit spread: use 2-leg spread selector
+            from v7.strike_selector import select_spread_strikes
+            spread = select_spread_strikes(
+                chain=chain,
+                direction=direction,
+                spot=trigger_ltp,
+                risk_budget=risk_amount,
+                lot_size=lot_size,
+                symbol=setup.symbol,
+            )
+            if not spread:
+                logger.warning("Setup %s: no suitable spread found for %s — skipping", setup.id, setup.symbol)
+                self._audit_gate(setup.id, setup.symbol, "no_spread", "BLOCK", trigger_ltp, setup.trigger_level, f"risk={risk_amount:.0f}")
+                setup.fired = False
+                return
 
-        tradingsymbol = selected["tradingsymbol"]
-        option_premium = selected["premium"]
-        actual_lot_size = selected.get("lot_size", lot_size)
-        exchange = "NFO"
+            logger.info("Setup %s: SPREAD sell %s@%.2f, buy %s@%.2f, net_credit=%.2f, max_loss=%.0f",
+                         setup.id, spread["sell_tradingsymbol"], spread["sell_premium"],
+                         spread["buy_tradingsymbol"], spread["buy_premium"],
+                         spread["net_credit"], spread["max_loss"])
 
-        if not tradingsymbol:
-            logger.warning("Setup %s: strike selected but no tradingsymbol — skipping", setup.id)
-            setup.fired = False
-            return
+            # Premium filter on net credit
+            from v7.config_v7 import PREMIUM_FILTER
+            if spread["net_credit"] < PREMIUM_FILTER["min_premium"]:
+                logger.info("Setup %s: net_credit %.2f < min %.0f — skipping", setup.id, spread["net_credit"], PREMIUM_FILTER["min_premium"])
+                self._audit_gate(setup.id, setup.symbol, "spread_credit_low", "BLOCK", trigger_ltp, setup.trigger_level, f"credit={spread['net_credit']:.2f}")
+                setup.fired = False
+                return
 
-        logger.info("Setup %s: selected %s (strike=%s, delta=%.2f, premium=%.2f)",
-                     setup.id, tradingsymbol, selected["strike"], selected["delta"], option_premium)
+            # Place sell leg (credit), then buy leg (debit)
+            from v7.order_manager import OrderSide
+            actual_lot_size = spread.get("lot_size", lot_size)
+            quantity = actual_lot_size
+            exchange = "NFO"
 
-        # S4: Premium filter — avoid too cheap (slippage) or too expensive (capital risk)
-        from v7.config_v7 import PREMIUM_FILTER
-        if option_premium < PREMIUM_FILTER["min_premium"]:
-            logger.info("Setup %s: premium %.2f < min %.0f — skipping", setup.id, option_premium, PREMIUM_FILTER["min_premium"])
-            setup.fired = False
-            return
-        if option_premium > PREMIUM_FILTER["max_premium"]:
-            logger.info("Setup %s: premium %.2f > max %.0f — skipping", setup.id, option_premium, PREMIUM_FILTER["max_premium"])
-            setup.fired = False
-            return
+            # Sell leg
+            sell_result = self._orders.place_entry_order(
+                tradingsymbol=spread["sell_tradingsymbol"],
+                exchange=exchange,
+                side=OrderSide.SELL,
+                quantity=quantity,
+                limit_price=spread["sell_premium"] - 1.0,  # slight discount for fill
+            )
+            if not sell_result.filled:
+                logger.warning("Setup %s: sell leg did not fill — aborting spread", setup.id)
+                setup.fired = False
+                return
 
-        # Limit price: option premium + small buffer
-        limit_price = option_premium + 2.0
-        quantity = actual_lot_size
+            # Buy leg (protection)
+            buy_result = self._orders.place_entry_order(
+                tradingsymbol=spread["buy_tradingsymbol"],
+                exchange=exchange,
+                side=OrderSide.BUY,
+                quantity=quantity,
+                limit_price=spread["buy_premium"] + 1.0,  # slight premium for fill
+            )
+            if not buy_result.filled:
+                logger.warning("Setup %s: buy leg did not fill — sell leg orphaned! Closing sell.", setup.id)
+                # Emergency: close the sell leg
+                self._orders.place_entry_order(
+                    tradingsymbol=spread["sell_tradingsymbol"],
+                    exchange=exchange, side=OrderSide.BUY,
+                    quantity=quantity, limit_price=spread["sell_premium"] + 5.0,
+                )
+                setup.fired = False
+                return
 
-        from v7.order_manager import OrderSide
-        result = self._orders.place_entry_order(
-            tradingsymbol=tradingsymbol,
-            exchange=exchange,
-            side=OrderSide.BUY,
-            quantity=quantity,
-            limit_price=limit_price,
-        )
+            tradingsymbol = spread["sell_tradingsymbol"]
+            option_premium = spread["net_credit"]
+            result = sell_result  # use sell fill for position tracking
+
+        else:
+            # Directional: single-leg option buy
+            from v7.strike_selector import select_directional_strike
+            from v7.config_v7 import get_target_delta
+            vix_delta = get_target_delta(self._vix)
+            selected = select_directional_strike(
+                chain=chain,
+                direction=direction,
+                spot=trigger_ltp,
+                risk_budget=risk_amount,
+                lot_size=lot_size,
+                symbol=setup.symbol,
+                target_delta_override=vix_delta,
+            )
+
+            if not selected:
+                logger.warning("Setup %s: no suitable strike found for %s — skipping", setup.id, setup.symbol)
+                self._audit_gate(setup.id, setup.symbol, "no_strike", "BLOCK", trigger_ltp, setup.trigger_level, "")
+                setup.fired = False
+                return
+
+            tradingsymbol = selected["tradingsymbol"]
+            option_premium = selected["premium"]
+            actual_lot_size = selected.get("lot_size", lot_size)
+            exchange = "NFO"
+
+            if not tradingsymbol:
+                logger.warning("Setup %s: strike selected but no tradingsymbol — skipping", setup.id)
+                setup.fired = False
+                return
+
+            logger.info("Setup %s: selected %s (strike=%s, delta=%.2f, premium=%.2f)",
+                         setup.id, tradingsymbol, selected["strike"], selected["delta"], option_premium)
+
+            # STRIKE SANITY: reject strikes more than 3% away from spot (no lottery tickets)
+            # 3% allows delta-0.40 calls at low VIX (e.g. 24550 CE @ NIFTY 23969 = 2.42%)
+            strike_distance_pct = abs(selected["strike"] - trigger_ltp) / trigger_ltp * 100 if trigger_ltp else 0
+            if strike_distance_pct > 3.0:
+                logger.info("Setup %s: strike %s is %.2f%% from spot %.1f — too far OTM, skipping",
+                            setup.id, selected["strike"], strike_distance_pct, trigger_ltp)
+                self._audit_gate(setup.id, setup.symbol, "strike_too_far", "BLOCK", trigger_ltp, setup.trigger_level,
+                                 f"strike={selected['strike']} dist={strike_distance_pct:.1f}%")
+                setup.fired = False
+                return
+
+            # S4: Premium filter
+            from v7.config_v7 import PREMIUM_FILTER, get_max_premium
+            if option_premium < PREMIUM_FILTER["min_premium"]:
+                logger.info("Setup %s: premium %.2f < min %.0f — skipping", setup.id, option_premium, PREMIUM_FILTER["min_premium"])
+                self._audit_gate(setup.id, setup.symbol, "premium_min", "BLOCK", trigger_ltp, setup.trigger_level, f"prem={option_premium:.2f}")
+                setup.fired = False
+                return
+            max_prem = get_max_premium(self._vix)
+            if option_premium > max_prem:
+                logger.info("Setup %s: premium %.2f > max %.0f (VIX=%.1f) — skipping", setup.id, option_premium, max_prem, self._vix)
+                self._audit_gate(setup.id, setup.symbol, "premium_max", "BLOCK", trigger_ltp, setup.trigger_level, f"prem={option_premium:.2f} cap={max_prem:.0f} vix={self._vix:.1f}")
+                setup.fired = False
+                return
+
+            # S8: Same-day expiry guard — don't buy options expiring today (theta crush)
+            # Parse expiry from tradingsymbol (e.g. BAJFINANCE26MAR880CE → 26MAR → March 2026)
+            import re as _re
+            _exp_match = _re.search(r'(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)', tradingsymbol)
+            if _exp_match:
+                from datetime import date as _date
+                _month_map = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
+                              "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
+                _yy = int(_exp_match.group(1)) + 2000
+                _mm = _month_map[_exp_match.group(2)]
+                # Weekly expiry: last Thursday of month, or check chain for exact expiry
+                # Conservative: block if expiry month+year matches today AND option chain says current expiry
+                _chain_expiry = chain[0].get("expiryDate", "") if chain else ""
+                if _chain_expiry:
+                    try:
+                        from datetime import datetime as _dt
+                        _exp_date = _dt.strptime(str(_chain_expiry)[:10], "%Y-%m-%d").date()
+                        if _exp_date == now.date():
+                            logger.info("Setup %s: %s expires TODAY (%s) — same-day expiry guard, skipping",
+                                        setup.id, tradingsymbol, _exp_date)
+                            setup.fired = False
+                            return
+                    except (ValueError, TypeError):
+                        pass
+
+            limit_price = option_premium + 2.0
+            quantity = actual_lot_size
+
+            from v7.order_manager import OrderSide
+            result = self._orders.place_entry_order(
+                tradingsymbol=tradingsymbol,
+                exchange=exchange,
+                side=OrderSide.BUY,
+                quantity=quantity,
+                limit_price=limit_price,
+            )
 
         if not result.filled:
             logger.warning("Entry order for %s did not fill — will retry next boundary", setup.id)
@@ -492,7 +690,11 @@ class Executor:
             if underlying_ltp is not None:
                 # SL hit → EXIT immediately
                 if self._is_sl_hit(pos, underlying_ltp):
-                    exit_price = option_ltp if option_ltp is not None else 0
+                    if option_ltp is None or option_ltp <= 0:
+                        logger.warning("SL HIT but option_ltp unavailable for %s — deferring exit to next tick",
+                                       pos.instrument)
+                        continue
+                    exit_price = option_ltp
                     logger.info("SL HIT: %s underlying=%.2f (SL=%.2f), option=%s@%.2f",
                                 pos.instrument, underlying_ltp, pos.stoploss, pos.instrument, exit_price)
                     self._exit_position(pos, exit_price, "stoploss", now)
@@ -502,7 +704,11 @@ class Executor:
 
                 # Target hit → full exit
                 if self._is_target_hit(pos, underlying_ltp):
-                    exit_price = option_ltp if option_ltp is not None else 0
+                    if option_ltp is None or option_ltp <= 0:
+                        logger.warning("TARGET HIT but option_ltp unavailable for %s — deferring exit to next tick",
+                                       pos.instrument)
+                        continue
+                    exit_price = option_ltp
                     logger.info("TARGET HIT: %s underlying=%.2f (TGT=%.2f), option=%s@%.2f",
                                 pos.instrument, underlying_ltp, pos.target, pos.instrument, exit_price)
                     self._exit_position(pos, exit_price, "target", now)
@@ -678,7 +884,9 @@ class Executor:
         # Place exit order
         is_sl_exit = reason == "stoploss"
         side = OrderSide.SELL if pos.direction == "bullish" else OrderSide.BUY
-        limit_price = ltp - 0.50 if side == OrderSide.SELL else ltp + 0.50
+        # Floor: option price can never be negative (NSE min tick = 0.05)
+        ltp = max(ltp, 0.05)
+        limit_price = max(ltp - 0.50, 0.05) if side == OrderSide.SELL else ltp + 0.50
 
         result = self._orders.place_exit_order(
             tradingsymbol=pos.instrument,
@@ -1066,18 +1274,20 @@ class Executor:
         if not self._playbook or not self._playbook.no_trade_conditions:
             return False
 
+        # Rebuild banned lists fresh from current playbook each call
+        self._daily["banned_symbols"] = []
+        self._daily["banned_types"] = []
+
         for condition in self._playbook.no_trade_conditions:
             cond_lower = condition.lower()
             # Parse symbol bans: "DO NOT trade RELIANCE"
             if "do not trade" in cond_lower:
                 banned = cond_lower.split("do not trade")[-1].strip()
-                self._daily.setdefault("banned_symbols", [])
                 if banned.upper() not in self._daily["banned_symbols"]:
                     self._daily["banned_symbols"].append(banned.upper())
             # Parse type bans: "DO NOT initiate breakout_long"
             if "do not initiate" in cond_lower:
                 banned_type = cond_lower.split("do not initiate")[-1].strip().split()[0]
-                self._daily.setdefault("banned_types", [])
                 if banned_type not in self._daily["banned_types"]:
                     self._daily["banned_types"].append(banned_type)
             if "vix" in cond_lower:
@@ -1121,7 +1331,28 @@ class Executor:
         except Exception as e:
             logger.warning("No-trade alert failed: %s", e)
 
-    # ── Theta Engine Integration ──────────────────────────────────────
+    def _send_theta_crash_alert(self, error: str) -> None:
+        """Send ONE Telegram alert when theta engine starts crashing (not every tick)."""
+        try:
+            import os, requests
+            token = os.environ.get("DEAL_BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
+            chat = os.environ.get("TELEGRAM_FORUM_CHAT_ID") or os.environ.get("DEAL_BOT_CHAT_ID")
+            topic = os.environ.get("TELEGRAM_TOPIC_STOCKS")
+            if not token or not chat:
+                return
+            msg = (
+                f"<b>V7 THETA ENGINE CRASH</b>\n"
+                f"Error: <code>{error[:200]}</code>\n"
+                f"<i>Theta ticks will keep failing until this is fixed. No condor management.</i>"
+            )
+            data = {"chat_id": chat, "parse_mode": "HTML", "text": msg}
+            if topic:
+                data["message_thread_id"] = topic
+            requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data=data, timeout=5)
+        except Exception as e:
+            logger.warning("Theta crash alert failed: %s", e)
+
+        # ── Theta Engine Integration ──────────────────────────────────────
 
     def set_theta_engine(self, theta_engine) -> None:
         """Attach theta engine for integrated tick cycle."""
@@ -1143,10 +1374,13 @@ class Executor:
         return pos.entry_price + half_distance
 
     def _is_expiry_cutoff(self, now: datetime) -> bool:
-        """No new positions after 1:00 PM on expiry day."""
+        """No new positions after 2:30 PM on expiry day."""
         if not self._is_expiry_day(today=now.date()):
             return False
-        return now.hour >= 13
+        if now.hour > 14 or (now.hour == 14 and now.minute >= 30):
+            logger.info("Expiry day cutoff: no new positions after 2:30 PM")
+            return True
+        return False
 
     # ── Position Rolling ──────────────────────────────────────────────
 
@@ -1256,21 +1490,29 @@ class Executor:
         if trades_left <= 0:
             return
 
-        # Rate limit: once per hour
+        # Rate limit: once per 25 min (down from 60). Aggressive refresh = more trade opportunities.
         last_refresh = self._daily.get("last_stale_refresh")
         if last_refresh:
             from datetime import datetime as dt
             try:
                 last_dt = dt.fromisoformat(last_refresh)
-                if (now - last_dt).total_seconds() < 3600:
+                if (now - last_dt).total_seconds() < 1500:  # 25 min
                     return
             except (ValueError, TypeError):
                 pass
 
         active = self._playbook.active_setups()
+        trades_today = self._daily.get("trades_today", 0)
+        force_refresh = False
+        # Force refresh: zero trades taken past 10:30 AM = setups are bad, regenerate
+        if trades_today == 0 and now.hour >= 10 and (now.hour > 10 or now.minute >= 30):
+            force_refresh = True
+
         if not active:
-            # All setups fired/cancelled — need fresh setups
             logger.info("STALE: No active setups, %d trade slots left — requesting refresh", trades_left)
+        elif force_refresh:
+            logger.info("STALE: 0 trades taken by %s, %d active setups — forcing refresh",
+                        now.strftime("%H:%M"), len(active))
         else:
             # Check if all active triggers are far from current price
             all_stale = True
@@ -1337,22 +1579,40 @@ class Executor:
 
     # ── Structural Guards (S1-S6) ─────────────────────────────────────
 
-    def _symbol_lost_today(self, symbol: str) -> bool:
-        """S1: Check if symbol had a losing trade today."""
+    def _symbol_lost_today(self, symbol: str, setup_type: str = None) -> bool:
+        """S1: Check if symbol had a losing trade today with the SAME setup type."""
         closed = self._daily.get("closed_trades", [])
-        return any(t.get("symbol") == symbol and t.get("pnl", 0) < 0 for t in closed)
+        for t in closed:
+            if t.get("symbol") != symbol or t.get("pnl", 0) >= 0:
+                continue
+            # If setup_type provided, only block if same type (e.g., both support_bounce)
+            if setup_type and t.get("setup_type") != setup_type:
+                continue
+            return True
+        return False
 
     def _is_afternoon_cutoff(self, now, setup: Setup) -> bool:
-        """S2: No new directional option buys after 10:30 AM.
-        Research: 88.8% of ORB wins happen in first hour. After that,
-        theta decay + momentum fade kills option buying edge.
-        Spreads/condors allowed all day (they benefit from theta).
+        """S2: Directional entry timing guard.
+        Before 1:00 PM: all conviction levels allowed.
+        1:00 PM - 2:30 PM: only HIGH or MEDIUM conviction.
+        After 2:30 PM: no directional option buys (theta/spreads only).
+        Spreads/condors allowed all day.
         """
-        if now.hour < 10 or (now.hour == 10 and now.minute < 30):
-            return False
-        # Allow spread/condor entries in afternoon
+        # Allow spread/condor entries any time
         if setup.type in (SetupType.CREDIT_SPREAD_BULL, SetupType.CREDIT_SPREAD_BEAR, SetupType.IRON_CONDOR):
             return False
+        # Before 1:00 PM: all directional allowed
+        if now.hour < 13:
+            return False
+        # 1:00 PM - 2:30 PM: MEDIUM+ conviction only
+        if now.hour < 14 or (now.hour == 14 and now.minute < 30):
+            if setup.conviction in (Conviction.HIGH, Conviction.MEDIUM):
+                return False
+            logger.info("Setup %s: 1PM-2:30PM window, conviction=%s (need MEDIUM+) — blocking",
+                        setup.id, setup.conviction.value)
+            return True
+        # After 2:30 PM: block all directional
+        logger.info("Setup %s: after 2:30PM cutoff — no directional buys", setup.id)
         return True
 
     def _is_directional_buy(self, setup: Setup) -> bool:

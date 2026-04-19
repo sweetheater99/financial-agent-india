@@ -21,3 +21,8 @@ data/v7/cron.log
 data/v7/cron.log.old
 data/v7/weekly_review_*.json
 data/v7/monthly_report_*.json
+
+# Local debug backups
+*.bak
+*.bak.*
+*.bak_*

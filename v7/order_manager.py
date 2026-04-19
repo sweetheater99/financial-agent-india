@@ -420,6 +420,14 @@ class OrderManager:
 
     def _dry_order(self, price: float, quantity: int, prefix: str = "DRY_") -> OrderResult:
         self._dry_counter += 1
+        # Reject fills on nonsensical prices (negative, zero = market closed / no data)
+        if price <= 0:
+            logger.warning("DRY ORDER REJECTED: price=%.2f is invalid (market closed?)", price)
+            return OrderResult(
+                order_id=f"{prefix}{self._dry_counter}",
+                filled=False,
+                error="invalid price (market closed or no data)",
+            )
         return OrderResult(
             order_id=f"{prefix}{self._dry_counter}",
             filled=True,
